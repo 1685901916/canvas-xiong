@@ -6513,8 +6513,8 @@ function freeCompositorNotice(message){
 function openFreeCompositorFromSelection(){
     const adapter = window.canvasFreeCompositorAdapter;
     const items = adapter.getSelectedImages();
-    if(items.length < 2){
-        freeCompositorNotice('请先按 Ctrl/Cmd 多选至少两张图片');
+    if(items.length < 1){
+        freeCompositorNotice('请先选择至少一张图片');
         return;
     }
     if(!window.freeCompositor?.open){

@@ -87,7 +87,8 @@
         if(current.locked) return current;
         const handle = String(options.handle || 'se');
         const fromCenter = options.fromCenter === true;
-        const keepRatio = options.keepRatio === true || /^(nw|ne|sw|se)$/.test(handle);
+        const corner = /^(nw|ne|sw|se)$/.test(handle);
+        const keepRatio = options.keepRatio === true || (corner && options.freeRatio !== true);
         const dx = number(options.dx);
         const dy = number(options.dy);
         const horizontal = handle.includes('e') ? dx : handle.includes('w') ? -dx : 0;

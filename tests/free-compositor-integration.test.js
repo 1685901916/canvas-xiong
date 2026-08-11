@@ -1,6 +1,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'static', 'canvas.html'), 'utf8');
@@ -8,6 +9,14 @@ const canvas = fs.readFileSync(path.join(root, 'static', 'js', 'canvas.js'), 'ut
 const compositorCss = fs.readFileSync(path.join(root, 'static', 'css', 'free-compositor.css'), 'utf8');
 
 async function run(){
+  const compositorSource = fs.readFileSync(path.join(root, 'static', 'js', 'free-compositor.js'), 'utf8');
+  const openStart = canvas.indexOf('function openFreeCompositorFromSelection()');
+  const openEnd = canvas.indexOf('function videoFrameText', openStart);
+  const openFunction = canvas.slice(openStart, openEnd);
+  const compositorOpenStart = compositorSource.indexOf('async function open(items, nextAdapter)');
+  const compositorOpenEnd = compositorSource.indexOf('root.freeCompositor', compositorOpenStart);
+  const compositorOpenFunction = compositorSource.slice(compositorOpenStart, compositorOpenEnd);
+
   assert.match(html, /free-compositor\.css/);
   assert.match(html, /id="freeCompositorRoot"/);
   assert.match(html, /free-compositor-core\.js/);
@@ -19,6 +28,63 @@ async function run(){
   assert.match(canvas, /url:canvasDisplayMediaUrl\(node\.url, node\.name\)/);
   assert.match(canvas, /function freeCompositorNotice\(/);
   assert.doesNotMatch(canvas, /function openFreeCompositorFromSelection\(\)[^]*?\n}\n[^]*?toast\(/);
+  assert.ok(openStart >= 0 && openEnd > openStart, 'canvas compositor entry function should be available for source assertions');
+  assert.ok(compositorOpenStart >= 0 && compositorOpenEnd > compositorOpenStart, 'compositor open function should be available for source assertions');
+  assert.doesNotMatch(openFunction, /items\.length\s*<\s*2/);
+  assert.doesNotMatch(compositorOpenFunction, /items\.length\s*<\s*2/);
+
+  {
+    const notices = [];
+    const opens = [];
+    const windowState = {
+      canvasFreeCompositorAdapter:{getSelectedImages:() => [{id:'only', url:'/only.png'}]},
+      freeCompositor:{open:(items, adapter) => { opens.push({items, adapter}); return Promise.resolve(); }},
+    };
+    const openFromSelection = new Function('window', 'freeCompositorNotice', `${openFunction}; return openFreeCompositorFromSelection;`)(windowState, message => notices.push(message));
+    openFromSelection();
+    assert.strictEqual(opens.length, 1);
+    assert.deepStrictEqual(opens[0].items, [{id:'only', url:'/only.png'}]);
+    assert.deepStrictEqual(notices, []);
+
+    windowState.canvasFreeCompositorAdapter.getSelectedImages = () => [];
+    openFromSelection();
+    assert.strictEqual(opens.length, 1);
+    assert.deepStrictEqual(notices, ['请先选择至少一张图片']);
+  }
+
+  {
+    const classList = () => ({add(){}, remove(){}, toggle(){}});
+    const artboard = {style:{}};
+    const stage = {style:{}, innerHTML:'', querySelector:selector => selector === '.fc-artboard' ? artboard : null};
+    const generic = {style:{}, innerHTML:'', value:'', textContent:'', disabled:false};
+    const host = {
+      classList:classList(),
+      setAttribute(){},
+      addEventListener(){},
+      querySelector(selector){
+        if(selector === '.fc-stage') return stage;
+        if(selector === '.fc-viewport') return {...generic, clientWidth:1000, clientHeight:800};
+        return generic;
+      },
+      set innerHTML(value){ this.shell = value; },
+    };
+    class TestImage {
+      constructor(){ this.naturalWidth = 200; this.naturalHeight = 100; }
+      set src(value){ this._src = value; this.onload?.(); }
+    }
+    const browser = {
+      FreeCompositorCore:require(path.join(root, 'static', 'js', 'free-compositor-core.js')),
+      document:{getElementById:id => id === 'freeCompositorRoot' ? host : null, body:{classList:classList()}},
+      addEventListener(){},
+      requestAnimationFrame(){},
+      Image:TestImage,
+      URL:{createObjectURL(){ return 'blob:test'; }, revokeObjectURL(){}},
+    };
+    browser.window = browser;
+    vm.runInNewContext(compositorSource, browser, {filename:'free-compositor.js'});
+    await browser.freeCompositor.open([{id:'only', name:'only', url:'/only.png'}], {});
+    assert.match(stage.innerHTML, /width:200px;height:100px/);
+  }
 
   assert.match(compositorCss, /\.fc-viewport\.drop-active/);
   assert.match(compositorCss, /\.fc-drop-hint/);

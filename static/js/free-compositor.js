@@ -352,7 +352,7 @@
             next = snapped.layer;
             guides = snapped.guides;
         } else if(interaction.type === 'resize'){
-            next = core.resizeLayer(interaction.layer, {handle:interaction.handle, dx, dy, keepRatio:event.shiftKey, fromCenter:event.altKey});
+            next = core.resizeLayer(interaction.layer, {handle:interaction.handle, dx, dy, freeRatio:event.shiftKey, fromCenter:event.altKey});
         } else if(interaction.type === 'rotate'){
             const angle = Math.atan2(event.clientY - interaction.center.y, event.clientX - interaction.center.x) * 180 / Math.PI;
             let rotation = interaction.layer.rotation + angle - interaction.startAngle;
@@ -630,7 +630,7 @@
     });
 
     async function open(items, nextAdapter){
-        if(!Array.isArray(items) || items.length < 2) throw new Error('至少需要两张图片');
+        if(!Array.isArray(items) || items.length < 1) throw new Error('至少需要一张图片');
         adapter = nextAdapter;
         const prepared = await prepareItems(items);
         const background = prepared[0];

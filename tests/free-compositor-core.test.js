@@ -30,6 +30,14 @@ const core = require('../static/js/free-compositor-core.js');
 
 {
   const layer = core.normalizeLayer({ id: 'a', x: 100, y: 100, width: 200, height: 100 });
+  const cornerDefault = core.resizeLayer(layer, { handle: 'se', dx: 100, dy: 10 });
+  assert.strictEqual(cornerDefault.width, 300);
+  assert.strictEqual(cornerDefault.height, 150);
+
+  const freeRatio = core.resizeLayer(layer, { handle: 'se', dx: 100, dy: 10, freeRatio: true });
+  assert.strictEqual(freeRatio.width, 300);
+  assert.strictEqual(freeRatio.height, 110);
+
   const resized = core.resizeLayer(layer, { handle: 'se', dx: 100, dy: 2, keepRatio: true });
   assert.strictEqual(resized.width, 300);
   assert.strictEqual(resized.height, 150);
