@@ -33,40 +33,83 @@ async function run(){
   assert.doesNotMatch(openFunction, /items\.length\s*<\s*2/);
   assert.doesNotMatch(compositorOpenFunction, /items\.length\s*<\s*2/);
 
-  function createBrowserHarness({imageWidth=200, imageHeight=100}={}){
+  function createBrowserHarness({imageWidth=200, imageHeight=100, imageBehavior}={}){
     const hostListeners = {};
     const windowListeners = {};
-    const classList = () => ({add(){}, remove(){}, toggle(){}});
-    const artboard = {style:{}};
+    const createdUrls = [];
+    const classList = () => {
+      const values = new Set();
+      return {
+        add(...names){ names.forEach(name => values.add(name)); },
+        remove(...names){ names.forEach(name => values.delete(name)); },
+        toggle(name, force){
+          const next = force === undefined ? !values.has(name) : Boolean(force);
+          next ? values.add(name) : values.delete(name);
+          return next;
+        },
+        contains:name => values.has(name),
+      };
+    };
+    const artboard = {style:{}, getBoundingClientRect:() => ({left:0, top:0})};
     const stage = {style:{}, innerHTML:'', querySelector:selector => selector === '.fc-artboard' ? artboard : null};
-    const generic = {style:{}, innerHTML:'', value:'', textContent:'', disabled:false};
+    const generic = {style:{}, innerHTML:'', value:'', textContent:'', disabled:false, classList:classList()};
+    const viewport = {...generic, classList:classList(), clientWidth:1000, clientHeight:800};
     const host = {
       classList:classList(),
       setAttribute(){},
       addEventListener(type, listener){ hostListeners[type] = listener; },
       querySelector(selector){
         if(selector === '.fc-stage') return stage;
-        if(selector === '.fc-viewport') return {...generic, clientWidth:1000, clientHeight:800};
+        if(selector === '.fc-artboard') return artboard;
+        if(selector === '.fc-viewport') return viewport;
         return generic;
       },
       set innerHTML(value){ this.shell = value; },
     };
     class TestImage {
       constructor(){ this.naturalWidth = imageWidth; this.naturalHeight = imageHeight; }
-      set src(value){ this._src = value; this.onload?.(); }
+      set src(value){
+        this._src = value;
+        if(imageBehavior) imageBehavior(this, value);
+        else this.onload?.();
+      }
     }
+    const canvasElement = {
+      width:0,
+      height:0,
+      getContext:() => ({save(){}, restore(){}, translate(){}, rotate(){}, drawImage(){}, fillRect(){}, globalAlpha:1, fillStyle:''}),
+      toBlob:resolve => resolve({type:'image/png'}),
+    };
     const browser = {
       FreeCompositorCore:require(path.join(root, 'static', 'js', 'free-compositor-core.js')),
-      document:{getElementById:id => id === 'freeCompositorRoot' ? host : null, body:{classList:classList()}},
+      document:{getElementById:id => id === 'freeCompositorRoot' ? host : null, body:{classList:classList()}, createElement:tag => tag === 'canvas' ? canvasElement : {}},
       addEventListener(type, listener){ windowListeners[type] = listener; },
       requestAnimationFrame(){},
       Image:TestImage,
-      URL:{createObjectURL(){ return 'blob:test'; }, revokeObjectURL(){}},
+      URL:{createObjectURL(file){ createdUrls.push(file?.name); return `blob:${file?.name || 'test'}`; }, revokeObjectURL(){}},
     };
     browser.window = browser;
     vm.runInNewContext(compositorSource, browser, {filename:'free-compositor.js'});
-    return {browser, hostListeners, windowListeners, stage};
+    return {browser, host, hostListeners, windowListeners, stage, status:generic, createdUrls};
   }
+
+  function droppedFilesEvent(files){
+    const target = {closest:selector => selector === '.fc-viewport' ? target : null};
+    return {target, clientX:10, clientY:10, dataTransfer:{files, types:['Files'], dropEffect:''}, preventDefault(){}};
+  }
+
+  function clickAction(hostListeners, name){
+    const target = {
+      dataset:{fcAction:name},
+      closest(selector){
+        if(selector === '[data-fc-action]') return target;
+        return null;
+      },
+    };
+    hostListeners.click({target});
+  }
+
+  const flushAsync = () => new Promise(resolve => setImmediate(resolve));
 
   {
     const notices = [];
@@ -114,6 +157,73 @@ async function run(){
       assert.match(stage.innerHTML, /width:640px;height:960px/);
       assert.match(stage.innerHTML, new RegExp(`data-layer-id="${item.id}" style="left:0px;top:0px;width:640px;height:960px`));
     }
+  }
+
+  {
+    let pendingDropImage;
+    const commits = [];
+    const {browser, host, hostListeners, status} = createBrowserHarness({
+      imageBehavior(image, url){
+        if(url === 'blob:drop.png') pendingDropImage = image;
+        else image.onload?.();
+      },
+    });
+    await browser.freeCompositor.open([{id:'base', name:'base', url:'/base.png'}], {commitPngBlob:async (...args) => commits.push(args)});
+    const pendingDrop = hostListeners.drop(droppedFilesEvent([{name:'drop.png', type:'image/png'}]));
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(commits.length, 0);
+    assert.strictEqual(host.classList.contains('open'), true);
+    assert.strictEqual(status.textContent, '图片正在导入，请稍候');
+    pendingDropImage.onload();
+    await pendingDrop;
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(commits.length, 1);
+  }
+
+  {
+    let finishCommit;
+    const {browser, hostListeners, createdUrls} = createBrowserHarness();
+    await browser.freeCompositor.open([{id:'base', name:'base', url:'/base.png'}], {commitPngBlob:() => new Promise(resolve => { finishCommit = resolve; })});
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    await hostListeners.drop(droppedFilesEvent([{name:'late.png', type:'image/png'}]));
+    assert.deepStrictEqual(createdUrls, []);
+    finishCommit();
+    await flushAsync();
+  }
+
+  {
+    let slowAImage;
+    const adapterACommits = [];
+    const adapterBCommits = [];
+    const {browser, hostListeners, stage} = createBrowserHarness({
+      imageBehavior(image, url){
+        if(url === '/A.png'){
+          image.naturalWidth = 100;
+          image.naturalHeight = 50;
+          slowAImage = image;
+          return;
+        }
+        image.naturalWidth = 300;
+        image.naturalHeight = 150;
+        image.onload?.();
+      },
+    });
+    const openA = browser.freeCompositor.open([{id:'A', name:'A', url:'/A.png'}], {commitPngBlob:async (...args) => adapterACommits.push(args)});
+    const openB = browser.freeCompositor.open([{id:'B', name:'B', url:'/B.png'}], {commitPngBlob:async (...args) => adapterBCommits.push(args)});
+    await openB;
+    assert.match(stage.innerHTML, /data-layer-id="B"/);
+    slowAImage.onload();
+    await openA;
+    assert.match(stage.innerHTML, /data-layer-id="B"/);
+    assert.doesNotMatch(stage.innerHTML, /data-layer-id="A"/);
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(adapterACommits.length, 0);
+    assert.strictEqual(adapterBCommits.length, 1);
+    assert.strictEqual(adapterBCommits[0][1].width, 300);
   }
 
   {

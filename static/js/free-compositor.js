@@ -24,6 +24,9 @@
         const render = options.render || (() => {});
         const setStatus = options.setStatus || (() => {});
         const setActive = options.setActive || (() => {});
+        const canStartImport = options.canStartImport || (() => true);
+        const onImportStart = options.onImportStart || (() => {});
+        const onImportFinish = options.onImportFinish || (() => {});
 
         const acceptedImageFiles = files => Array.from(files || []).filter(file => acceptedTypes.has(file?.type));
         const hasExternalFiles = dataTransfer => Boolean(dataTransfer?.files?.length || Array.from(dataTransfer?.types || []).includes('Files'));
@@ -35,7 +38,7 @@
             revokeObjectURL(url);
         };
 
-        async function importDroppedFiles(files, event){
+        async function runImportDroppedFiles(files, event){
             const fileList = Array.from(files || []);
             const filesToImport = acceptedImageFiles(fileList);
             const session = cleanupSession;
@@ -88,6 +91,19 @@
             return imported;
         }
 
+        async function importDroppedFiles(files, event){
+            if(!canStartImport()){
+                setStatus('正在导出，请稍候', true);
+                return [];
+            }
+            onImportStart();
+            try {
+                return await runImportDroppedFiles(files, event);
+            } finally {
+                onImportFinish();
+            }
+        }
+
         return {
             acceptedImageFiles,
             onDragEnter(event){
@@ -136,6 +152,8 @@
     let interaction = null;
     let guides = [];
     let exporting = false;
+    let pendingImports = 0;
+    let openGeneration = 0;
     const imageCache = new Map();
     let dropController = null;
 
@@ -466,6 +484,7 @@
     }
 
     function close(){
+        openGeneration++;
         if(exporting) return;
         host.classList.remove('open');
         host.setAttribute('aria-hidden', 'true');
@@ -477,6 +496,10 @@
 
     async function exportPng(){
         if(exporting) return;
+        if(pendingImports > 0){
+            setStatus('图片正在导入，请稍候', true);
+            return;
+        }
         if(doc.width * doc.height > 64000000){
             setStatus('画板超过 6400 万像素，请缩小后再导出', true);
             return;
@@ -542,6 +565,9 @@
         render:renderWorkspace,
         setStatus,
         setActive:setDropActive,
+        canStartImport:() => !exporting,
+        onImportStart:() => { pendingImports++; },
+        onImportFinish:() => { pendingImports = Math.max(0, pendingImports - 1); },
     });
 
     host.addEventListener('pointerdown', event => {
@@ -639,9 +665,13 @@
 
     async function open(items, nextAdapter){
         if(!Array.isArray(items) || items.length < 1) throw new Error('至少需要一张图片');
-        adapter = nextAdapter;
+        const generation = ++openGeneration;
+        dropController?.cleanup();
         const prepared = await prepareItems(items);
+        if(generation !== openGeneration) return;
+        dropController?.cleanup();
         const background = prepared[0];
+        adapter = nextAdapter;
         doc = core.createDocument({width:background.naturalWidth, height:background.naturalHeight, layers:prepared});
         history = core.createHistory(doc, 50);
         zoom = 1;
