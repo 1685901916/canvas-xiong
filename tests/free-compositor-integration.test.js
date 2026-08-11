@@ -150,6 +150,17 @@ async function run(){
     assert.strictEqual(harness.active.at(-1), true);
   }
 
+  {
+    let resolveSlow;
+    const harness = createHarness({decode:() => new Promise(resolve => { resolveSlow = resolve; })});
+    const pendingA = harness.controller.onDrop(harness.eventFor([{name:'A.png', type:'image/png'}]));
+    harness.controller.onDragEnter(harness.eventFor([{name:'B.png', type:'image/png'}]));
+    assert.strictEqual(harness.active.at(-1), true);
+    resolveSlow({naturalWidth:20, naturalHeight:20});
+    await pendingA;
+    assert.strictEqual(harness.active.at(-1), true);
+  }
+
   console.log('free compositor integration tests passed');
 }
 

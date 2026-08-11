@@ -113,14 +113,9 @@
             },
             async onDrop(event){
                 if(!hasExternalFiles(event.dataTransfer)) return [];
-                const session = cleanupSession;
                 event.preventDefault();
                 clearActive();
-                try {
-                    return await importDroppedFiles(event.dataTransfer.files, event);
-                } finally {
-                    if(session === cleanupSession) clearActive();
-                }
+                return await importDroppedFiles(event.dataTransfer.files, event);
             },
             cleanup(){
                 cleanupSession++;
