@@ -96,11 +96,11 @@
                 setStatus('正在导出，请稍候', true);
                 return [];
             }
-            onImportStart();
+            const importToken = onImportStart();
             try {
                 return await runImportDroppedFiles(files, event);
             } finally {
-                onImportFinish();
+                onImportFinish(importToken);
             }
         }
 
@@ -152,7 +152,7 @@
     let interaction = null;
     let guides = [];
     let exporting = false;
-    let pendingImports = 0;
+    let pendingImportTokens = new Set();
     let openGeneration = 0;
     const imageCache = new Map();
     let dropController = null;
@@ -484,6 +484,7 @@
     }
 
     function close(){
+        pendingImportTokens = new Set();
         openGeneration++;
         if(exporting) return;
         host.classList.remove('open');
@@ -496,7 +497,7 @@
 
     async function exportPng(){
         if(exporting) return;
-        if(pendingImports > 0){
+        if(pendingImportTokens.size > 0){
             setStatus('图片正在导入，请稍候', true);
             return;
         }
@@ -566,8 +567,13 @@
         setStatus,
         setActive:setDropActive,
         canStartImport:() => !exporting,
-        onImportStart:() => { pendingImports++; },
-        onImportFinish:() => { pendingImports = Math.max(0, pendingImports - 1); },
+        onImportStart:() => {
+            const tokenSet = pendingImportTokens;
+            const token = Symbol('pending-import');
+            tokenSet.add(token);
+            return {tokenSet, token};
+        },
+        onImportFinish:importToken => { importToken?.tokenSet.delete(importToken.token); },
     });
 
     host.addEventListener('pointerdown', event => {
@@ -665,10 +671,12 @@
 
     async function open(items, nextAdapter){
         if(!Array.isArray(items) || items.length < 1) throw new Error('至少需要一张图片');
+        pendingImportTokens = new Set();
         const generation = ++openGeneration;
         dropController?.cleanup();
         const prepared = await prepareItems(items);
         if(generation !== openGeneration) return;
+        pendingImportTokens = new Set();
         dropController?.cleanup();
         const background = prepared[0];
         adapter = nextAdapter;

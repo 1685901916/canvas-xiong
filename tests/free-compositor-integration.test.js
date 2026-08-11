@@ -195,6 +195,79 @@ async function run(){
   }
 
   {
+    let oldDropImage;
+    const newCommits = [];
+    const {browser, hostListeners} = createBrowserHarness({
+      imageBehavior(image, url){
+        if(url === 'blob:old.png') oldDropImage = image;
+        else image.onload?.();
+      },
+    });
+    await browser.freeCompositor.open([{id:'old-base', name:'old-base', url:'/old-base.png'}], {commitPngBlob:async () => {}});
+    const oldDrop = hostListeners.drop(droppedFilesEvent([{name:'old.png', type:'image/png'}]));
+    browser.freeCompositor.close();
+    await browser.freeCompositor.open([{id:'new-base', name:'new-base', url:'/new-base.png'}], {commitPngBlob:async (...args) => newCommits.push(args)});
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(newCommits.length, 1);
+    oldDropImage.onload();
+    await oldDrop;
+  }
+
+  {
+    let oldDropImage;
+    let newDropImage;
+    const newCommits = [];
+    const {browser, host, hostListeners, status} = createBrowserHarness({
+      imageBehavior(image, url){
+        if(url === 'blob:old.png') oldDropImage = image;
+        else if(url === 'blob:new.png') newDropImage = image;
+        else image.onload?.();
+      },
+    });
+    await browser.freeCompositor.open([{id:'old-base', name:'old-base', url:'/old-base.png'}], {commitPngBlob:async () => {}});
+    const oldDrop = hostListeners.drop(droppedFilesEvent([{name:'old.png', type:'image/png'}]));
+    browser.freeCompositor.close();
+    await browser.freeCompositor.open([{id:'new-base', name:'new-base', url:'/new-base.png'}], {commitPngBlob:async (...args) => newCommits.push(args)});
+    const newDrop = hostListeners.drop(droppedFilesEvent([{name:'new.png', type:'image/png'}]));
+    oldDropImage.onload();
+    await oldDrop;
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(newCommits.length, 0);
+    assert.strictEqual(host.classList.contains('open'), true);
+    assert.strictEqual(status.textContent, '图片正在导入，请稍候');
+    newDropImage.onload();
+    await newDrop;
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(newCommits.length, 1);
+  }
+
+  {
+    let newBaseImage;
+    let transitionDropImage;
+    const newCommits = [];
+    const {browser, hostListeners} = createBrowserHarness({
+      imageBehavior(image, url){
+        if(url === '/new-base.png') newBaseImage = image;
+        else if(url === 'blob:transition.png') transitionDropImage = image;
+        else image.onload?.();
+      },
+    });
+    await browser.freeCompositor.open([{id:'old-base', name:'old-base', url:'/old-base.png'}], {commitPngBlob:async () => {}});
+    const openingNew = browser.freeCompositor.open([{id:'new-base', name:'new-base', url:'/new-base.png'}], {commitPngBlob:async (...args) => newCommits.push(args)});
+    const transitionDrop = hostListeners.drop(droppedFilesEvent([{name:'transition.png', type:'image/png'}]));
+    newBaseImage.onload();
+    await openingNew;
+    clickAction(hostListeners, 'export');
+    await flushAsync();
+    assert.strictEqual(newCommits.length, 1);
+    transitionDropImage.onload();
+    await transitionDrop;
+  }
+
+  {
     let slowAImage;
     const adapterACommits = [];
     const adapterBCommits = [];
