@@ -1,6 +1,130 @@
 (function(root){
     'use strict';
 
+    function createDropController(options={}){
+        const acceptedTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+        const trackedUrls = new Set();
+        let dragDepth = 0;
+        let fallbackSequence = 0;
+        let cleanupSession = 0;
+        const getDocument = options.getDocument || (() => null);
+        const getPoint = options.getPoint || (() => ({x:0, y:0}));
+        const createObjectURL = options.createObjectURL || (file => URL.createObjectURL(file));
+        const revokeObjectURL = options.revokeObjectURL || (url => URL.revokeObjectURL(url));
+        const deleteCachedUrl = options.deleteCachedUrl || (() => {});
+        const decode = options.decode || (async () => { throw new Error('缺少图片解码器'); });
+        const placeImportedLayers = options.placeImportedLayers || (() => []);
+        const nextId = options.nextId || (() => `imported-${Date.now().toString(36)}-${++fallbackSequence}`);
+        const commit = options.commit || (() => {});
+        const render = options.render || (() => {});
+        const setStatus = options.setStatus || (() => {});
+        const setActive = options.setActive || (() => {});
+
+        const acceptedImageFiles = files => Array.from(files || []).filter(file => acceptedTypes.has(file?.type));
+        const hasExternalFiles = dataTransfer => Boolean(dataTransfer?.files?.length || Array.from(dataTransfer?.types || []).includes('Files'));
+        const clearActive = () => { dragDepth = 0; setActive(false); };
+        const releaseObjectUrl = url => {
+            if(!trackedUrls.has(url)) return;
+            trackedUrls.delete(url);
+            deleteCachedUrl(url);
+            revokeObjectURL(url);
+        };
+
+        async function importDroppedFiles(files, event){
+            const fileList = Array.from(files || []);
+            const filesToImport = acceptedImageFiles(fileList);
+            const session = cleanupSession;
+            if(!filesToImport.length){
+                setStatus('没有可导入的图片', true);
+                return [];
+            }
+            const point = getPoint(event);
+            const decoded = await Promise.all(filesToImport.map(async (file, index) => {
+                let url = '';
+                try {
+                    url = createObjectURL(file);
+                    trackedUrls.add(url);
+                    const image = await decode({file, url, name:file.name});
+                    return {
+                        id:nextId(),
+                        name:file.name || `导入图片 ${index + 1}`,
+                        url,
+                        naturalWidth:image.naturalWidth,
+                        naturalHeight:image.naturalHeight,
+                        visible:true,
+                        locked:false,
+                        opacity:1,
+                    };
+                } catch(error){
+                    if(url) releaseObjectUrl(url);
+                    return null;
+                }
+            }));
+            const valid = decoded.filter(Boolean);
+            const skipped = fileList.length - valid.length;
+            if(session !== cleanupSession) return [];
+            if(!valid.length){
+                setStatus('没有可导入的图片', true);
+                return [];
+            }
+            const doc = getDocument();
+            const imported = placeImportedLayers(valid, doc, point, {maxRatio:.8, offset:24}).map(layer => ({
+                ...layer,
+                visible:true,
+                locked:false,
+                opacity:1,
+            }));
+            doc.layers.push(...imported);
+            doc.selectedId = imported.at(-1).id;
+            commit();
+            render();
+            setStatus(skipped ? `已导入 ${imported.length} 张，跳过 ${skipped} 个无效文件` : `已导入 ${imported.length} 张图片`, Boolean(skipped));
+            return imported;
+        }
+
+        return {
+            acceptedImageFiles,
+            onDragEnter(event){
+                if(!hasExternalFiles(event.dataTransfer)) return false;
+                event.preventDefault();
+                dragDepth++;
+                setActive(true);
+                return true;
+            },
+            onDragOver(event){
+                if(!hasExternalFiles(event.dataTransfer)) return false;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'copy';
+                setActive(true);
+                return true;
+            },
+            onDragLeave(event){
+                if(!hasExternalFiles(event.dataTransfer)) return false;
+                event.preventDefault();
+                dragDepth = Math.max(0, dragDepth - 1);
+                if(!dragDepth) setActive(false);
+                return true;
+            },
+            async onDrop(event){
+                if(!hasExternalFiles(event.dataTransfer)) return [];
+                event.preventDefault();
+                clearActive();
+                try {
+                    return await importDroppedFiles(event.dataTransfer.files, event);
+                } finally {
+                    clearActive();
+                }
+            },
+            cleanup(){
+                cleanupSession++;
+                clearActive();
+                [...trackedUrls].forEach(releaseObjectUrl);
+            },
+        };
+    }
+
+    root.createFreeCompositorDropController = createDropController;
+
     const core = root.FreeCompositorCore;
     const host = document.getElementById('freeCompositorRoot');
     if(!core || !host) return;
@@ -12,11 +136,8 @@
     let interaction = null;
     let guides = [];
     let exporting = false;
-    let dropDepth = 0;
-    let importSession = 0;
-    let importedLayerSequence = 0;
     const imageCache = new Map();
-    const importedObjectUrls = new Set();
+    let dropController = null;
 
     const html = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const num = (value, fallback=0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -163,33 +284,8 @@
         if(status){ status.textContent = message; status.classList.toggle('error', error); }
     }
 
-    function acceptedImageFiles(files){
-        const acceptedTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-        return Array.from(files || []).filter(file => acceptedTypes.has(file?.type));
-    }
-
-    function hasExternalFiles(dataTransfer){
-        return Boolean(dataTransfer?.files?.length || Array.from(dataTransfer?.types || []).includes('Files'));
-    }
-
     function setDropActive(active){
         host.querySelector('.fc-viewport')?.classList.toggle('drop-active', active);
-    }
-
-    function clearDropActive(){
-        dropDepth = 0;
-        setDropActive(false);
-    }
-
-    function releaseImportedObjectUrl(url){
-        if(!importedObjectUrls.has(url)) return;
-        importedObjectUrls.delete(url);
-        imageCache.delete(url);
-        URL.revokeObjectURL(url);
-    }
-
-    function releaseImportedObjectUrls(){
-        [...importedObjectUrls].forEach(releaseImportedObjectUrl);
     }
 
     function importPoint(event){
@@ -199,56 +295,6 @@
             x:core.clamp((event.clientX - rect.left) / zoom, 0, doc.width),
             y:core.clamp((event.clientY - rect.top) / zoom, 0, doc.height),
         };
-    }
-
-    async function importDroppedFiles(files, event){
-        const fileList = Array.from(files || []);
-        const filesToImport = acceptedImageFiles(fileList);
-        const point = importPoint(event);
-        const session = importSession;
-        if(!filesToImport.length){
-            setStatus('没有可导入的图片', true);
-            return;
-        }
-        const decoded = await Promise.all(filesToImport.map(async (file, index) => {
-            let url = '';
-            try {
-                url = URL.createObjectURL(file);
-                importedObjectUrls.add(url);
-                const image = await loadImage({url, name:file.name});
-                return {
-                    id:`imported-${Date.now().toString(36)}-${++importedLayerSequence}`,
-                    name:file.name || `导入图片 ${index + 1}`,
-                    url,
-                    naturalWidth:image.naturalWidth,
-                    naturalHeight:image.naturalHeight,
-                    visible:true,
-                    locked:false,
-                    opacity:1,
-                };
-            } catch(error){
-                if(url) releaseImportedObjectUrl(url);
-                return null;
-            }
-        }));
-        if(session !== importSession || !host.classList.contains('open')) return;
-        const valid = decoded.filter(Boolean);
-        const skipped = fileList.length - valid.length;
-        if(!valid.length){
-            setStatus('没有可导入的图片', true);
-            return;
-        }
-        const imported = core.placeImportedLayers(valid, doc, point, {maxRatio:.8, offset:24}).map(layer => ({
-            ...layer,
-            visible:true,
-            locked:false,
-            opacity:1,
-        }));
-        doc.layers.push(...imported);
-        doc.selectedId = imported.at(-1).id;
-        commit();
-        renderWorkspace();
-        setStatus(skipped ? `已导入 ${imported.length} 张，跳过 ${skipped} 个无效文件` : `已导入 ${imported.length} 张图片`, Boolean(skipped));
     }
 
     function syncHistoryButtons(){
@@ -418,9 +464,7 @@
         document.body.classList.remove('free-compositor-open');
         interaction = null;
         guides = [];
-        importSession++;
-        clearDropActive();
-        releaseImportedObjectUrls();
+        dropController?.cleanup();
     }
 
     async function exportPng(){
@@ -475,6 +519,23 @@
         if(name === 'export') exportPng();
     }
 
+    dropController = createDropController({
+        getDocument:() => doc,
+        getPoint:importPoint,
+        createObjectURL:file => URL.createObjectURL(file),
+        revokeObjectURL:url => URL.revokeObjectURL(url),
+        deleteCachedUrl:url => imageCache.delete(url),
+        decode:async item => {
+            const image = await loadImage(item);
+            return {naturalWidth:image.naturalWidth, naturalHeight:image.naturalHeight};
+        },
+        placeImportedLayers:(layers, documentState, point, options) => core.placeImportedLayers(layers, documentState, point, options),
+        commit,
+        render:renderWorkspace,
+        setStatus,
+        setActive:setDropActive,
+    });
+
     host.addEventListener('pointerdown', event => {
         const handle = event.target.closest('[data-fc-handle]');
         if(handle){ startHandle(event, handle.dataset.fcHandle); return; }
@@ -514,35 +575,26 @@
     });
 
     host.addEventListener('dragenter', event => {
-        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
-        event.preventDefault();
-        dropDepth++;
-        setDropActive(true);
+        if(!event.target.closest('.fc-viewport')) return;
+        dropController.onDragEnter(event);
     });
 
     host.addEventListener('dragover', event => {
-        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
-        event.preventDefault();
-        event.dataTransfer.dropEffect = 'copy';
-        setDropActive(true);
+        if(!event.target.closest('.fc-viewport')) return;
+        dropController.onDragOver(event);
     });
 
     host.addEventListener('dragleave', event => {
-        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
-        event.preventDefault();
-        dropDepth = Math.max(0, dropDepth - 1);
-        if(!dropDepth) setDropActive(false);
+        if(!event.target.closest('.fc-viewport')) return;
+        dropController.onDragLeave(event);
     });
 
     host.addEventListener('drop', async event => {
-        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
-        event.preventDefault();
+        if(!event.target.closest('.fc-viewport')) return;
         try {
-            await importDroppedFiles(event.dataTransfer.files, event);
+            await dropController.onDrop(event);
         } catch(error){
             setStatus(error?.message || '导入图片失败', true);
-        } finally {
-            clearDropActive();
         }
     });
 
