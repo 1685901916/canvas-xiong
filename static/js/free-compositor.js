@@ -12,7 +12,11 @@
     let interaction = null;
     let guides = [];
     let exporting = false;
+    let dropDepth = 0;
+    let importSession = 0;
+    let importedLayerSequence = 0;
     const imageCache = new Map();
+    const importedObjectUrls = new Set();
 
     const html = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     const num = (value, fallback=0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -62,6 +66,7 @@
                     <div class="fc-layer-list"></div>
                 </aside>
                 <main class="fc-viewport">
+                    <div class="fc-drop-hint" aria-hidden="true"><strong>松开以放置图片</strong><span>PNG/JPG/WEBP/GIF 成为独立图层</span></div>
                     <div class="fc-stage"></div>
                 </main>
                 <aside class="fc-panel fc-properties-panel"></aside>
@@ -156,6 +161,94 @@
     function setStatus(message, error=false){
         const status = host.querySelector('[data-fc-status]');
         if(status){ status.textContent = message; status.classList.toggle('error', error); }
+    }
+
+    function acceptedImageFiles(files){
+        const acceptedTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+        return Array.from(files || []).filter(file => acceptedTypes.has(file?.type));
+    }
+
+    function hasExternalFiles(dataTransfer){
+        return Boolean(dataTransfer?.files?.length || Array.from(dataTransfer?.types || []).includes('Files'));
+    }
+
+    function setDropActive(active){
+        host.querySelector('.fc-viewport')?.classList.toggle('drop-active', active);
+    }
+
+    function clearDropActive(){
+        dropDepth = 0;
+        setDropActive(false);
+    }
+
+    function releaseImportedObjectUrl(url){
+        if(!importedObjectUrls.has(url)) return;
+        importedObjectUrls.delete(url);
+        imageCache.delete(url);
+        URL.revokeObjectURL(url);
+    }
+
+    function releaseImportedObjectUrls(){
+        [...importedObjectUrls].forEach(releaseImportedObjectUrl);
+    }
+
+    function importPoint(event){
+        const rect = host.querySelector('.fc-artboard')?.getBoundingClientRect();
+        if(!rect) return {x:doc.width / 2, y:doc.height / 2};
+        return {
+            x:core.clamp((event.clientX - rect.left) / zoom, 0, doc.width),
+            y:core.clamp((event.clientY - rect.top) / zoom, 0, doc.height),
+        };
+    }
+
+    async function importDroppedFiles(files, event){
+        const fileList = Array.from(files || []);
+        const filesToImport = acceptedImageFiles(fileList);
+        const point = importPoint(event);
+        const session = importSession;
+        if(!filesToImport.length){
+            setStatus('没有可导入的图片', true);
+            return;
+        }
+        const decoded = await Promise.all(filesToImport.map(async (file, index) => {
+            let url = '';
+            try {
+                url = URL.createObjectURL(file);
+                importedObjectUrls.add(url);
+                const image = await loadImage({url, name:file.name});
+                return {
+                    id:`imported-${Date.now().toString(36)}-${++importedLayerSequence}`,
+                    name:file.name || `导入图片 ${index + 1}`,
+                    url,
+                    naturalWidth:image.naturalWidth,
+                    naturalHeight:image.naturalHeight,
+                    visible:true,
+                    locked:false,
+                    opacity:1,
+                };
+            } catch(error){
+                if(url) releaseImportedObjectUrl(url);
+                return null;
+            }
+        }));
+        if(session !== importSession || !host.classList.contains('open')) return;
+        const valid = decoded.filter(Boolean);
+        const skipped = fileList.length - valid.length;
+        if(!valid.length){
+            setStatus('没有可导入的图片', true);
+            return;
+        }
+        const imported = core.placeImportedLayers(valid, doc, point, {maxRatio:.8, offset:24}).map(layer => ({
+            ...layer,
+            visible:true,
+            locked:false,
+            opacity:1,
+        }));
+        doc.layers.push(...imported);
+        doc.selectedId = imported.at(-1).id;
+        commit();
+        renderWorkspace();
+        setStatus(skipped ? `已导入 ${imported.length} 张，跳过 ${skipped} 个无效文件` : `已导入 ${imported.length} 张图片`, Boolean(skipped));
     }
 
     function syncHistoryButtons(){
@@ -325,6 +418,9 @@
         document.body.classList.remove('free-compositor-open');
         interaction = null;
         guides = [];
+        importSession++;
+        clearDropActive();
+        releaseImportedObjectUrls();
     }
 
     async function exportPng(){
@@ -415,6 +511,39 @@
             renderWorkspace();
         }
         if(event.target.dataset.fcDoc === 'backgroundColor') changeDocumentProperty(event.target);
+    });
+
+    host.addEventListener('dragenter', event => {
+        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        dropDepth++;
+        setDropActive(true);
+    });
+
+    host.addEventListener('dragover', event => {
+        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'copy';
+        setDropActive(true);
+    });
+
+    host.addEventListener('dragleave', event => {
+        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        dropDepth = Math.max(0, dropDepth - 1);
+        if(!dropDepth) setDropActive(false);
+    });
+
+    host.addEventListener('drop', async event => {
+        if(!event.target.closest('.fc-viewport') || !hasExternalFiles(event.dataTransfer)) return;
+        event.preventDefault();
+        try {
+            await importDroppedFiles(event.dataTransfer.files, event);
+        } catch(error){
+            setStatus(error?.message || '导入图片失败', true);
+        } finally {
+            clearDropActive();
+        }
     });
 
     window.addEventListener('pointermove', onPointerMove);
