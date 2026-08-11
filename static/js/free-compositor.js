@@ -159,10 +159,16 @@
     async function prepareItems(items){
         return Promise.all(items.map(async (item, index) => {
             const image = await loadImage(item);
+            const naturalWidth = num(item.naturalWidth);
+            const naturalHeight = num(item.naturalHeight);
+            const width = num(item.width);
+            const height = num(item.height);
             return {
                 ...item,
-                naturalWidth:num(item.naturalWidth, image.naturalWidth),
-                naturalHeight:num(item.naturalHeight, image.naturalHeight),
+                naturalWidth:naturalWidth > 0 ? naturalWidth : image.naturalWidth,
+                naturalHeight:naturalHeight > 0 ? naturalHeight : image.naturalHeight,
+                width:width > 0 ? width : undefined,
+                height:height > 0 ? height : undefined,
                 role:index === 0 ? 'background' : '',
             };
         }));

@@ -33,6 +33,41 @@ async function run(){
   assert.doesNotMatch(openFunction, /items\.length\s*<\s*2/);
   assert.doesNotMatch(compositorOpenFunction, /items\.length\s*<\s*2/);
 
+  function createBrowserHarness({imageWidth=200, imageHeight=100}={}){
+    const hostListeners = {};
+    const windowListeners = {};
+    const classList = () => ({add(){}, remove(){}, toggle(){}});
+    const artboard = {style:{}};
+    const stage = {style:{}, innerHTML:'', querySelector:selector => selector === '.fc-artboard' ? artboard : null};
+    const generic = {style:{}, innerHTML:'', value:'', textContent:'', disabled:false};
+    const host = {
+      classList:classList(),
+      setAttribute(){},
+      addEventListener(type, listener){ hostListeners[type] = listener; },
+      querySelector(selector){
+        if(selector === '.fc-stage') return stage;
+        if(selector === '.fc-viewport') return {...generic, clientWidth:1000, clientHeight:800};
+        return generic;
+      },
+      set innerHTML(value){ this.shell = value; },
+    };
+    class TestImage {
+      constructor(){ this.naturalWidth = imageWidth; this.naturalHeight = imageHeight; }
+      set src(value){ this._src = value; this.onload?.(); }
+    }
+    const browser = {
+      FreeCompositorCore:require(path.join(root, 'static', 'js', 'free-compositor-core.js')),
+      document:{getElementById:id => id === 'freeCompositorRoot' ? host : null, body:{classList:classList()}},
+      addEventListener(type, listener){ windowListeners[type] = listener; },
+      requestAnimationFrame(){},
+      Image:TestImage,
+      URL:{createObjectURL(){ return 'blob:test'; }, revokeObjectURL(){}},
+    };
+    browser.window = browser;
+    vm.runInNewContext(compositorSource, browser, {filename:'free-compositor.js'});
+    return {browser, hostListeners, windowListeners, stage};
+  }
+
   {
     const notices = [];
     const opens = [];
@@ -53,37 +88,35 @@ async function run(){
   }
 
   {
-    const classList = () => ({add(){}, remove(){}, toggle(){}});
-    const artboard = {style:{}};
-    const stage = {style:{}, innerHTML:'', querySelector:selector => selector === '.fc-artboard' ? artboard : null};
-    const generic = {style:{}, innerHTML:'', value:'', textContent:'', disabled:false};
-    const host = {
-      classList:classList(),
-      setAttribute(){},
-      addEventListener(){},
-      querySelector(selector){
-        if(selector === '.fc-stage') return stage;
-        if(selector === '.fc-viewport') return {...generic, clientWidth:1000, clientHeight:800};
-        return generic;
-      },
-      set innerHTML(value){ this.shell = value; },
-    };
-    class TestImage {
-      constructor(){ this.naturalWidth = 200; this.naturalHeight = 100; }
-      set src(value){ this._src = value; this.onload?.(); }
-    }
-    const browser = {
-      FreeCompositorCore:require(path.join(root, 'static', 'js', 'free-compositor-core.js')),
-      document:{getElementById:id => id === 'freeCompositorRoot' ? host : null, body:{classList:classList()}},
-      addEventListener(){},
-      requestAnimationFrame(){},
-      Image:TestImage,
-      URL:{createObjectURL(){ return 'blob:test'; }, revokeObjectURL(){}},
-    };
-    browser.window = browser;
-    vm.runInNewContext(compositorSource, browser, {filename:'free-compositor.js'});
+    const {browser, stage} = createBrowserHarness();
     await browser.freeCompositor.open([{id:'only', name:'only', url:'/only.png'}], {});
     assert.match(stage.innerHTML, /width:200px;height:100px/);
+  }
+
+  {
+    const {browser, stage} = createBrowserHarness({imageWidth:640, imageHeight:960});
+    await browser.freeCompositor.open([{id:'zero-size', name:'zero-size', url:'/zero-size.png', naturalWidth:0, naturalHeight:0, width:0, height:0}], {});
+    assert.match(stage.innerHTML, /width:640px;height:960px/);
+    assert.match(stage.innerHTML, /data-layer-id="zero-size" style="left:0px;top:0px;width:640px;height:960px/);
+  }
+
+  {
+    const {browser, hostListeners, windowListeners, stage} = createBrowserHarness();
+    await browser.freeCompositor.open([{id:'only', name:'only', url:'/only.png'}], {});
+    const handle = {dataset:{fcHandle:'se'}, closest:selector => selector === '[data-fc-handle]' ? handle : null};
+    const pointerDown = options => hostListeners.pointerdown({button:0, clientX:0, clientY:0, target:handle, preventDefault(){}, stopPropagation(){}, ...options});
+    pointerDown();
+    windowListeners.pointermove({clientX:100, clientY:10, shiftKey:true, altKey:false});
+    assert.match(stage.innerHTML, /width:300px;height:110px/);
+  }
+
+  {
+    const {browser, hostListeners, windowListeners, stage} = createBrowserHarness();
+    await browser.freeCompositor.open([{id:'only', name:'only', url:'/only.png'}], {});
+    const handle = {dataset:{fcHandle:'se'}, closest:selector => selector === '[data-fc-handle]' ? handle : null};
+    hostListeners.pointerdown({button:0, clientX:0, clientY:0, target:handle, preventDefault(){}, stopPropagation(){}});
+    windowListeners.pointermove({clientX:100, clientY:10, shiftKey:false, altKey:true});
+    assert.match(stage.innerHTML, /left:-100px;top:-50px;width:400px;height:200px/);
   }
 
   assert.match(compositorCss, /\.fc-viewport\.drop-active/);
