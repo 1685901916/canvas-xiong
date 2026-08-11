@@ -6461,6 +6461,71 @@ async function uploadImageBlobs(blobs){
     const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r=>r.json());
     return data.files || [];
 }
+
+window.canvasFreeCompositorAdapter = {
+    getSelectedImages(){
+        return nodes
+            .filter(node => selected.has(node.id) && node.type === 'image' && node.url && mediaKindForNode(node) === 'image' && !isMissingAssetUrl(node.url))
+            .map(node => ({
+                id:node.id,
+                name:node.name || outputImageName(node.url) || '图层',
+                url:canvasDisplayMediaUrl(node.url, node.name),
+                canvasX:Number(node.x) || 0,
+                canvasY:Number(node.y) || 0,
+                naturalWidth:Number(node.natural_w || node.naturalWidth || 0),
+                naturalHeight:Number(node.natural_h || node.naturalHeight || 0),
+            }));
+    },
+    async commitPngBlob(blob, meta={}){
+        if(!(blob instanceof Blob)) throw new Error('合成结果无效');
+        const sourceIds = [...selected].filter(id => nodes.some(node => node.id === id));
+        const bounds = sourceIds.length ? nodeBounds(sourceIds) : {x:0, y:0, w:320, h:320};
+        const safeName = String(meta.name || '自由合成.png').replace(/[\\/:*?"<>|]+/g, '-');
+        const file = await uploadCroppedBlob(blob, safeName.toLowerCase().endsWith('.png') ? safeName : `${safeName}.png`);
+        if(!file?.url) throw new Error('上传合成图片失败');
+        pushUndo();
+        const next = {
+            id:uid('img'),
+            type:'image',
+            x:bounds.x + bounds.w + 80,
+            y:bounds.y,
+            url:file.url,
+            name:file.name || safeName,
+            mediaKind:'image',
+            natural_w:Number(meta.width) || 0,
+            natural_h:Number(meta.height) || 0,
+            compositorSourceIds:sourceIds,
+        };
+        nodes.push(next);
+        selected.clear();
+        selected.add(next.id);
+        render();
+        scheduleSave();
+        return next;
+    },
+};
+
+function freeCompositorNotice(message){
+    if(typeof setStatus === 'function') setStatus(String(message || ''));
+    else console.warn('[free-compositor]', message);
+}
+
+function openFreeCompositorFromSelection(){
+    const adapter = window.canvasFreeCompositorAdapter;
+    const items = adapter.getSelectedImages();
+    if(items.length < 1){
+        freeCompositorNotice('请先选择至少一张图片');
+        return;
+    }
+    if(!window.freeCompositor?.open){
+        freeCompositorNotice('自由合成器加载失败，请刷新页面');
+        return;
+    }
+    window.freeCompositor.open(items, adapter).catch(error => {
+        console.error('[free-compositor] open failed', error);
+        freeCompositorNotice(`自由合成器打开失败：${error?.message || error}`);
+    });
+}
 function videoFrameText(key, zh, en){
     const translated = tr(key);
     if(translated && translated !== key) return translated;
