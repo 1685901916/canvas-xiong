@@ -86,4 +86,46 @@ const core = require('../static/js/free-compositor-core.js');
   assert.deepStrictEqual(core.renderList(layers).map(item => item.id), ['bottom', 'top']);
 }
 
+{
+  const placed = core.placeImportedLayer(
+    { id: 'small', naturalWidth: 200, naturalHeight: 100 },
+    { width: 1000, height: 1600 },
+    { x: 500, y: 800 },
+  );
+  assert.deepStrictEqual(placed, {
+    ...core.normalizeLayer({ id: 'small', naturalWidth: 200, naturalHeight: 100 }),
+    x: 400,
+    y: 750,
+    width: 200,
+    height: 100,
+  });
+}
+
+{
+  const placed = core.placeImportedLayer(
+    { id: 'large', naturalWidth: 2000, naturalHeight: 1000 },
+    { width: 1000, height: 1600 },
+    { x: 500, y: 800 },
+  );
+  assert.strictEqual(placed.x, 100);
+  assert.strictEqual(placed.y, 600);
+  assert.strictEqual(placed.width, 800);
+  assert.strictEqual(placed.height, 400);
+}
+
+{
+  const placed = core.placeImportedLayers(
+    [
+      { id: 'one', naturalWidth: 100, naturalHeight: 100 },
+      { id: 'two', naturalWidth: 100, naturalHeight: 100 },
+    ],
+    { width: 1000, height: 1600 },
+    { x: 300, y: 400 },
+  );
+  assert.deepStrictEqual(placed.map(layer => ({ x: layer.x, y: layer.y })), [
+    { x: 250, y: 350 },
+    { x: 274, y: 374 },
+  ]);
+}
+
 console.log('free compositor core tests passed');

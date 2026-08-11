@@ -192,6 +192,29 @@
         return {layer:{...current, x:current.x + (bestX?.delta || 0), y:current.y + (bestY?.delta || 0)}, guides};
     }
 
+    function placeImportedLayer(layer, documentState, point, options={}){
+        const source = normalizeLayer(layer);
+        const documentWidth = Math.max(1, number(documentState?.width, 1));
+        const documentHeight = Math.max(1, number(documentState?.height, 1));
+        const maxRatio = clamp(number(options.maxRatio, 0.8), 0.1, 1);
+        const scale = Math.min(1, documentWidth * maxRatio / source.naturalWidth, documentHeight * maxRatio / source.naturalHeight);
+        const width = source.naturalWidth * scale;
+        const height = source.naturalHeight * scale;
+        const x = number(point?.x, documentWidth / 2);
+        const y = number(point?.y, documentHeight / 2);
+        return normalizeLayer({...source, width, height, x:x - width / 2, y:y - height / 2});
+    }
+
+    function placeImportedLayers(layers, documentState, point, options={}){
+        const offset = number(options.offset, 24);
+        return (layers || []).map((layer, index) => placeImportedLayer(
+            layer,
+            documentState,
+            {x:number(point?.x) + index * offset, y:number(point?.y) + index * offset},
+            options,
+        ));
+    }
+
     function renderList(layers){
         return (layers || []).filter(item => item.visible !== false).map(item => ({...item}));
     }
@@ -210,6 +233,8 @@
         snapshot,
         createHistory,
         snapLayer,
+        placeImportedLayer,
+        placeImportedLayers,
         renderList,
     };
 });
