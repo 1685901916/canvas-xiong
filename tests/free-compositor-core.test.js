@@ -53,6 +53,20 @@ const core = require('../static/js/free-compositor-core.js');
   const minimum = core.resizeLayer(layer, { handle: 'nw', dx: 500, dy: 500 });
   assert.ok(minimum.width >= 8);
   assert.ok(minimum.height >= 8);
+
+  const ratioMinimum = core.resizeLayer(layer, { handle: 'se', dx: -196, dy: -98 });
+  assert.strictEqual(ratioMinimum.width, 16);
+  assert.strictEqual(ratioMinimum.height, 8);
+
+  const centeredRatioMinimum = core.resizeLayer(layer, { handle: 'se', dx: -98, dy: -49, fromCenter: true });
+  assert.strictEqual(centeredRatioMinimum.width, 16);
+  assert.strictEqual(centeredRatioMinimum.height, 8);
+  assert.strictEqual(centeredRatioMinimum.x, 192);
+  assert.strictEqual(centeredRatioMinimum.y, 146);
+
+  const freeRatioMinimum = core.resizeLayer(layer, { handle: 'se', dx: -196, dy: -98, freeRatio: true });
+  assert.strictEqual(freeRatioMinimum.width, 8);
+  assert.strictEqual(freeRatioMinimum.height, 8);
 }
 
 {

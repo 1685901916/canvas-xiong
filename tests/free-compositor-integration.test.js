@@ -101,6 +101,22 @@ async function run(){
   }
 
   {
+    const invalidDimensionGroups = [
+      {id:'partial-natural', naturalWidth:320, naturalHeight:0},
+      {id:'nan-natural', naturalWidth:NaN, naturalHeight:960},
+      {id:'negative-natural', naturalWidth:-1, naturalHeight:960},
+      {id:'missing-natural'},
+      {id:'partial-size', naturalWidth:0, naturalHeight:0, width:320, height:0},
+    ];
+    for(const item of invalidDimensionGroups){
+      const {browser, stage} = createBrowserHarness({imageWidth:640, imageHeight:960});
+      await browser.freeCompositor.open([{...item, name:item.id, url:`/${item.id}.png`}], {});
+      assert.match(stage.innerHTML, /width:640px;height:960px/);
+      assert.match(stage.innerHTML, new RegExp(`data-layer-id="${item.id}" style="left:0px;top:0px;width:640px;height:960px`));
+    }
+  }
+
+  {
     const {browser, hostListeners, windowListeners, stage} = createBrowserHarness();
     await browser.freeCompositor.open([{id:'only', name:'only', url:'/only.png'}], {});
     const handle = {dataset:{fcHandle:'se'}, closest:selector => selector === '[data-fc-handle]' ? handle : null};

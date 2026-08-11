@@ -99,9 +99,17 @@
             const ratio = current.width / current.height;
             if(Math.abs(horizontal) >= Math.abs(vertical * ratio)) height = width / ratio;
             else width = height * ratio;
+            if(width <= 0 || height <= 0){
+                width = Math.max(MIN_SIZE, MIN_SIZE * ratio);
+                height = width / ratio;
+            }
+            const scale = Math.max(1, MIN_SIZE / width, MIN_SIZE / height);
+            width *= scale;
+            height *= scale;
+        } else {
+            width = Math.max(MIN_SIZE, width);
+            height = Math.max(MIN_SIZE, height);
         }
-        width = Math.max(MIN_SIZE, width);
-        height = Math.max(MIN_SIZE, height);
         let x = current.x;
         let y = current.y;
         if(fromCenter){

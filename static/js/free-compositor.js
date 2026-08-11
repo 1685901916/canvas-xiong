@@ -163,12 +163,14 @@
             const naturalHeight = num(item.naturalHeight);
             const width = num(item.width);
             const height = num(item.height);
+            const hasNaturalSize = naturalWidth > 0 && naturalHeight > 0;
+            const hasSize = width > 0 && height > 0;
             return {
                 ...item,
-                naturalWidth:naturalWidth > 0 ? naturalWidth : image.naturalWidth,
-                naturalHeight:naturalHeight > 0 ? naturalHeight : image.naturalHeight,
-                width:width > 0 ? width : undefined,
-                height:height > 0 ? height : undefined,
+                naturalWidth:hasNaturalSize ? naturalWidth : image.naturalWidth,
+                naturalHeight:hasNaturalSize ? naturalHeight : image.naturalHeight,
+                width:hasSize ? width : undefined,
+                height:hasSize ? height : undefined,
                 role:index === 0 ? 'background' : '',
             };
         }));
