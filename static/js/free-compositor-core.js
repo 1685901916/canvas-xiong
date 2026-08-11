@@ -202,15 +202,17 @@
         const height = source.naturalHeight * scale;
         const x = number(point?.x, documentWidth / 2);
         const y = number(point?.y, documentHeight / 2);
-        return normalizeLayer({...source, width, height, x:x - width / 2, y:y - height / 2});
+        return {...normalizeLayer({...source, width, height, x:x - width / 2, y:y - height / 2}), width, height, x:x - width / 2, y:y - height / 2};
     }
 
     function placeImportedLayers(layers, documentState, point, options={}){
         const offset = number(options.offset, 24);
+        const x = number(point?.x, Math.max(1, number(documentState?.width, 1)) / 2);
+        const y = number(point?.y, Math.max(1, number(documentState?.height, 1)) / 2);
         return (layers || []).map((layer, index) => placeImportedLayer(
             layer,
             documentState,
-            {x:number(point?.x) + index * offset, y:number(point?.y) + index * offset},
+            {x:x + index * offset, y:y + index * offset},
             options,
         ));
     }

@@ -128,4 +128,30 @@ const core = require('../static/js/free-compositor-core.js');
   ]);
 }
 
+{
+  const placed = core.placeImportedLayer(
+    { id: 'pixel', naturalWidth: 1, naturalHeight: 1 },
+    { width: 1000, height: 1600 },
+    { x: 500, y: 800 },
+  );
+  assert.strictEqual(placed.width, 1);
+  assert.strictEqual(placed.height, 1);
+  assert.strictEqual(placed.x, 499.5);
+  assert.strictEqual(placed.y, 799.5);
+}
+
+{
+  const placed = core.placeImportedLayers(
+    [
+      { id: 'one', naturalWidth: 100, naturalHeight: 100 },
+      { id: 'two', naturalWidth: 100, naturalHeight: 100 },
+    ],
+    { width: 1000, height: 1600 },
+  );
+  assert.deepStrictEqual(placed.map(layer => ({ x: layer.x, y: layer.y })), [
+    { x: 450, y: 750 },
+    { x: 474, y: 774 },
+  ]);
+}
+
 console.log('free compositor core tests passed');
