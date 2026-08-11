@@ -1,4 +1,8 @@
-(function(root){
+(function(root, factory){
+    const api = factory(root);
+    if(typeof module === 'object' && module.exports) module.exports = api;
+    root.createFreeCompositorDropController = api.createFreeCompositorDropController;
+})(typeof window !== 'undefined' ? window : globalThis, function(root){
     'use strict';
 
     function createDropController(options={}){
@@ -7,6 +11,7 @@
         let dragDepth = 0;
         let fallbackSequence = 0;
         let cleanupSession = 0;
+        let latestRequestId = 0;
         const getDocument = options.getDocument || (() => null);
         const getPoint = options.getPoint || (() => ({x:0, y:0}));
         const createObjectURL = options.createObjectURL || (file => URL.createObjectURL(file));
@@ -34,8 +39,9 @@
             const fileList = Array.from(files || []);
             const filesToImport = acceptedImageFiles(fileList);
             const session = cleanupSession;
+            const requestId = ++latestRequestId;
             if(!filesToImport.length){
-                setStatus('没有可导入的图片', true);
+                if(requestId === latestRequestId) setStatus('没有可导入的图片', true);
                 return [];
             }
             const point = getPoint(event);
@@ -64,7 +70,7 @@
             const skipped = fileList.length - valid.length;
             if(session !== cleanupSession) return [];
             if(!valid.length){
-                setStatus('没有可导入的图片', true);
+                if(requestId === latestRequestId) setStatus('没有可导入的图片', true);
                 return [];
             }
             const doc = getDocument();
@@ -75,10 +81,10 @@
                 opacity:1,
             }));
             doc.layers.push(...imported);
-            doc.selectedId = imported.at(-1).id;
+            if(requestId === latestRequestId) doc.selectedId = imported.at(-1).id;
             commit();
             render();
-            setStatus(skipped ? `已导入 ${imported.length} 张，跳过 ${skipped} 个无效文件` : `已导入 ${imported.length} 张图片`, Boolean(skipped));
+            if(requestId === latestRequestId) setStatus(skipped ? `已导入 ${imported.length} 张，跳过 ${skipped} 个无效文件` : `已导入 ${imported.length} 张图片`, Boolean(skipped));
             return imported;
         }
 
@@ -107,12 +113,13 @@
             },
             async onDrop(event){
                 if(!hasExternalFiles(event.dataTransfer)) return [];
+                const session = cleanupSession;
                 event.preventDefault();
                 clearActive();
                 try {
                     return await importDroppedFiles(event.dataTransfer.files, event);
                 } finally {
-                    clearActive();
+                    if(session === cleanupSession) clearActive();
                 }
             },
             cleanup(){
@@ -123,11 +130,9 @@
         };
     }
 
-    root.createFreeCompositorDropController = createDropController;
-
     const core = root.FreeCompositorCore;
-    const host = document.getElementById('freeCompositorRoot');
-    if(!core || !host) return;
+    const host = root.document?.getElementById('freeCompositorRoot');
+    if(!core || !host) return {createFreeCompositorDropController:createDropController};
 
     let doc = null;
     let history = null;
@@ -645,4 +650,5 @@
     }
 
     root.freeCompositor = {open, close};
-})(window);
+    return {createFreeCompositorDropController:createDropController};
+});

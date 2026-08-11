@@ -1,12 +1,10 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 
 const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'static', 'canvas.html'), 'utf8');
 const canvas = fs.readFileSync(path.join(root, 'static', 'js', 'canvas.js'), 'utf8');
-const compositor = fs.readFileSync(path.join(root, 'static', 'js', 'free-compositor.js'), 'utf8');
 const compositorCss = fs.readFileSync(path.join(root, 'static', 'css', 'free-compositor.css'), 'utf8');
 
 async function run(){
@@ -22,18 +20,12 @@ async function run(){
   assert.match(canvas, /function freeCompositorNotice\(/);
   assert.doesNotMatch(canvas, /function openFreeCompositorFromSelection\(\)[^]*?\n}\n[^]*?toast\(/);
 
-  assert.match(compositor, /acceptedImageFiles/);
-  assert.match(compositor, /importDroppedFiles/);
-  assert.match(compositor, /dataTransfer\.files/);
-  assert.match(compositor, /core\.placeImportedLayers/);
-  assert.match(compositor, /URL\.createObjectURL/);
-  assert.match(compositor, /doc\.selectedId\s*=\s*imported\.at\(-1\)\.id/);
   assert.match(compositorCss, /\.fc-viewport\.drop-active/);
   assert.match(compositorCss, /\.fc-drop-hint/);
 
-  const runtime = {window:{}, document:{getElementById:() => null}};
-  vm.runInNewContext(compositor, runtime);
-  const createDropController = runtime.window.createFreeCompositorDropController;
+  let compositorApi;
+  assert.doesNotThrow(() => { compositorApi = require(path.join(root, 'static', 'js', 'free-compositor.js')); });
+  const {createFreeCompositorDropController:createDropController} = compositorApi;
   assert.strictEqual(typeof createDropController, 'function');
 
   function createHarness({decode, files, documentState}={}){
@@ -46,6 +38,7 @@ async function run(){
     const active = [];
     let commits = 0;
     let renders = 0;
+    let idSequence = 0;
     const controller = createDropController({
       getDocument:() => doc,
       getPoint:() => ({x:300, y:400}),
@@ -61,14 +54,14 @@ async function run(){
         placed.push({layers, state, point, options});
         return layers.map((layer, index) => ({...layer, x:index, y:index}));
       },
-      nextId:() => `import-${decoded.length}`,
+      nextId:() => `import-${++idSequence}`,
       commit:() => { commits++; },
       render:() => { renders++; },
       setStatus:(message, error) => statuses.push({message, error}),
       setActive:value => active.push(value),
     });
-    const event = {dataTransfer:{files:files || [], types:['Files'], dropEffect:''}, prevented:false, preventDefault(){ this.prevented = true; }};
-    return {controller, doc, decoded, placed, statuses, revoked, cacheDeletes, active, event, commits:() => commits, renders:() => renders};
+    const eventFor = eventFiles => ({dataTransfer:{files:eventFiles || [], types:['Files'], dropEffect:''}, prevented:false, preventDefault(){ this.prevented = true; }});
+    return {controller, doc, decoded, placed, statuses, revoked, cacheDeletes, active, event:eventFor(files), eventFor, commits:() => commits, renders:() => renders};
   }
 
   {
@@ -122,6 +115,39 @@ async function run(){
     harness.controller.cleanup();
     assert.deepStrictEqual(harness.revoked, ['blob:cleanup.webp']);
     assert.deepStrictEqual(harness.cacheDeletes, ['blob:cleanup.webp']);
+  }
+
+  {
+    let resolveSlow;
+    const harness = createHarness({
+      decode:item => item.file.name === 'A.png'
+        ? new Promise(resolve => { resolveSlow = resolve; })
+        : {naturalWidth:20, naturalHeight:20},
+    });
+    const pendingA = harness.controller.onDrop(harness.eventFor([{name:'A.png', type:'image/png'}]));
+    const pendingB = harness.controller.onDrop(harness.eventFor([{name:'B.png', type:'image/png'}, {name:'note.txt', type:'text/plain'}]));
+    await pendingB;
+    assert.strictEqual(harness.commits(), 1);
+    assert.strictEqual(harness.doc.selectedId, 'import-1');
+    assert.strictEqual(harness.statuses.at(-1).message, '已导入 1 张，跳过 1 个无效文件');
+    resolveSlow({naturalWidth:20, naturalHeight:20});
+    await pendingA;
+    assert.strictEqual(harness.commits(), 2);
+    assert.deepStrictEqual(harness.doc.layers.map(layer => layer.name), [undefined, 'B.png', 'A.png']);
+    assert.strictEqual(harness.doc.selectedId, 'import-1');
+    assert.strictEqual(harness.statuses.at(-1).message, '已导入 1 张，跳过 1 个无效文件');
+  }
+
+  {
+    let resolveSlow;
+    const harness = createHarness({decode:() => new Promise(resolve => { resolveSlow = resolve; })});
+    const pendingA = harness.controller.onDrop(harness.eventFor([{name:'A.png', type:'image/png'}]));
+    harness.controller.cleanup();
+    harness.controller.onDragEnter(harness.eventFor([{name:'B.png', type:'image/png'}]));
+    assert.strictEqual(harness.active.at(-1), true);
+    resolveSlow({naturalWidth:20, naturalHeight:20});
+    await pendingA;
+    assert.strictEqual(harness.active.at(-1), true);
   }
 
   console.log('free compositor integration tests passed');
