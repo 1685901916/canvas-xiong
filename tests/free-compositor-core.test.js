@@ -141,6 +141,25 @@ const core = require('../static/js/free-compositor-core.js');
 }
 
 {
+  const pixel = core.placeImportedLayer(
+    { id: 'pixel', naturalWidth: 1, naturalHeight: 1 },
+    { width: 1000, height: 1600 },
+    { x: 124, y: 457 },
+  );
+  const moved = core.moveLayer(pixel, 10, -5);
+  const rotated = core.rotateLayer(pixel, 45);
+  const snapped = core.snapLayer(pixel, { width: 1000, height: 1600 }, [], 0).layer;
+  assert.deepStrictEqual(
+    [moved, rotated, snapped].map(layer => ({ x: layer.x, y: layer.y, width: layer.width, height: layer.height })),
+    [
+      { x: 133.5, y: 451.5, width: 1, height: 1 },
+      { x: 123.5, y: 456.5, width: 1, height: 1 },
+      { x: 123.5, y: 456.5, width: 1, height: 1 },
+    ],
+  );
+}
+
+{
   const placed = core.placeImportedLayers(
     [
       { id: 'one', naturalWidth: 100, naturalHeight: 100 },

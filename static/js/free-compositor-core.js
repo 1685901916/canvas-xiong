@@ -21,8 +21,8 @@
     }
 
     function normalizeLayer(layer={}, index=0){
-        const width = Math.max(MIN_SIZE, number(layer.width, number(layer.naturalWidth, 100)));
-        const height = Math.max(MIN_SIZE, number(layer.height, number(layer.naturalHeight, 100)));
+        const width = Math.max(1, number(layer.width, number(layer.naturalWidth, 100)));
+        const height = Math.max(1, number(layer.height, number(layer.naturalHeight, 100)));
         return {
             id:String(layer.id || `layer-${index + 1}`),
             name:String(layer.name || layer.id || `图层 ${index + 1}`),
