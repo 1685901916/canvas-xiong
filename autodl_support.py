@@ -345,26 +345,36 @@ def build_request_body(
         normalized_audios,
         "构造请求体",
     )
-    if not str(resolution or "").strip():
-        raise AutoDLValidationError("AutoDL H3 请求缺少分辨率")
+    normalized_resolution = str(resolution or "").strip().replace("P", "p")
+    resolution_match = re.fullmatch(r"(480p|768p|1080p)(横|竖|1:1)", normalized_resolution)
+    if not resolution_match:
+        raise AutoDLValidationError("AutoDL H3 分辨率必须是 480p/768p/1080p 与横/竖/1:1的组合")
+    resolution_base, orientation = resolution_match.groups()
+    resolution_rank = {"480p": 1, "768p": 2, "1080p": 3}
+    if resolution_rank[resolution_base] > resolution_rank[definition.max_resolution]:
+        raise AutoDLValidationError(
+            f"{definition.name} 最高支持 {definition.max_resolution}"
+        )
+    if orientation == "1:1" and not definition.supports_square:
+        raise AutoDLValidationError(f"{definition.name} 不支持 1:1 比例")
 
     if workflow_id == "minimax_h3_lightx2v_no_pic":
         return {
             "prompt": str(prompt),
             "duration": normalized_duration,
-            "resolution": str(resolution),
+            "resolution": normalized_resolution,
         }
     if workflow_id == "minimax_h3_lightx2v":
         return {
             "prompt": str(prompt),
             "duration": normalized_duration,
-            "resolution": str(resolution),
+            "resolution": normalized_resolution,
             "first_frame": normalized_images[0],
             "last_frame": normalized_images[1],
         }
     if workflow_id == "minimax_h3_image_audio_to_video":
         return {
-            "resolution": str(resolution),
+            "resolution": normalized_resolution,
             "ref_image_0": normalized_images[0],
             "ref_audio_0": normalized_audios[0],
             "audio_duration": normalized_duration,
@@ -373,7 +383,7 @@ def build_request_body(
     body: dict[str, Any] = {
         "prompt": str(prompt),
         "duration": normalized_duration,
-        "resolution": str(resolution),
+        "resolution": normalized_resolution,
     }
     if seed is not None:
         body["seed"] = int(seed)

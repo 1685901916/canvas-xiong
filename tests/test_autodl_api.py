@@ -162,6 +162,67 @@ class AutoDLAPITests(unittest.TestCase):
         self.assertEqual(1, downloader.await_count)
         self.assertEqual(["task-123", "task-123"], fake.queries)
 
+    def test_cloud_media_path_accepts_audio_files(self):
+        assets_dir = Path(self.temp_dir.name) / "assets"
+        uploads_dir = assets_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = uploads_dir / "voice.wav"
+        audio_path.write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+        with mock.patch.multiple(
+            main,
+            ASSETS_DIR=str(assets_dir),
+            OUTPUT_DIR=str(Path(self.temp_dir.name) / "output"),
+        ):
+            resolved = main.local_media_path_for_cloud_upload(
+                "/assets/uploads/voice.wav"
+            )
+        self.assertEqual(str(audio_path), resolved)
+
+    def test_local_media_without_public_mapping_fails_before_submit(self):
+        payload = self.request(
+            images=[main.AIReference(url="/assets/uploads/reference.png")]
+        )
+        client_factory = mock.Mock()
+        with mock.patch.object(
+            main, "local_asset_public_url", return_value=""
+        ), mock.patch.object(
+            main.autodl, "client_from_environment", client_factory
+        ):
+            with self.assertRaises(main.HTTPException) as raised:
+                asyncio.run(main.autodl_submit_task(payload))
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertIn("公网", str(raised.exception.detail))
+        client_factory.assert_not_called()
+
+    def test_public_media_base_mapping_is_used_without_uploading(self):
+        fake = FakeAutoDLClient(
+            submit_result={
+                "code": "Success",
+                "data": {"task_id": "task-public", "status": "QUEUED"},
+            }
+        )
+        payload = self.request(
+            prompt="角色说话并对口型",
+            images=[main.AIReference(url="/assets/uploads/reference.png")],
+            audios=["/assets/uploads/voice.wav"],
+        )
+        mappings = {
+            "/assets/uploads/reference.png": "https://media.example/reference.png",
+            "/assets/uploads/voice.wav": "https://media.example/voice.wav",
+        }
+        with mock.patch.object(
+            main, "local_asset_public_url", side_effect=lambda url: mappings.get(url, "")
+        ), mock.patch.object(
+            main.autodl, "client_from_environment", return_value=fake
+        ):
+            asyncio.run(main.autodl_submit_task(payload))
+
+        _, body = fake.submissions[0]
+        self.assertEqual(
+            "https://media.example/reference.png", body["ref_image_0"]
+        )
+        self.assertEqual("https://media.example/voice.wav", body["ref_audio_0"])
+
 
 if __name__ == "__main__":
     unittest.main()

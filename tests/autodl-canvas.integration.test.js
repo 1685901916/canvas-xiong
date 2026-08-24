@@ -51,5 +51,13 @@ const resumeEnd = canvasJs.indexOf('\nfunction ', resumeStart + 10);
 const resumeSource = canvasJs.slice(resumeStart, resumeEnd < 0 ? undefined : resumeEnd);
 assert.doesNotMatch(resumeSource, /method\s*:\s*['"]POST['"]/);
 assert.doesNotMatch(resumeSource, /runAutoDLVideoNode\s*\(/);
+assert.match(canvasJs, /\['image','video','audio'\]\.includes\(mediaKindForRef\(ref\)\)/);
+assert.match(canvasJs, /没有需要上传的本地图片、视频或音频/);
+
+const autoRunStart = canvasJs.indexOf('async function runAutoDLVideoNode');
+const autoRunEnd = canvasJs.indexOf('async function runVideoNode', autoRunStart);
+const autoRunSource = canvasJs.slice(autoRunStart, autoRunEnd);
+assert.doesNotMatch(autoRunSource, /uploadCanvasMediaRefToCloud/);
+assert.doesNotMatch(autoRunSource, /\/api\/cloud-video\/upload/);
 
 console.log('autodl canvas integration tests passed');

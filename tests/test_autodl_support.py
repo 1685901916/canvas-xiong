@@ -155,6 +155,7 @@ class AutoDLWorkflowTests(unittest.TestCase):
                 )
             ),
         )
+
         self.assertEqual(
             {"prompt", "duration", "resolution", "first_frame", "last_frame"},
             set(
@@ -168,6 +169,7 @@ class AutoDLWorkflowTests(unittest.TestCase):
                 )
             ),
         )
+
         for workflow_id in (
             "minimax_h3_image_audio_to_video_v2",
             "minimax_h3_image_audio_to_video_v2_15s",
@@ -208,6 +210,35 @@ class AutoDLWorkflowTests(unittest.TestCase):
                 )
             ),
         )
+
+    def test_body_rejects_unsupported_resolution_and_square_ratio(self):
+        with self.assertRaises(support.AutoDLValidationError):
+            support.build_request_body(
+                "minimax_h3_lightx2v_v5_15s",
+                "move",
+                12,
+                "1080p横",
+                ["https://example.test/reference.png"],
+                [],
+            )
+        with self.assertRaises(support.AutoDLValidationError):
+            support.build_request_body(
+                "minimax_h3_lightx2v_no_pic",
+                "move",
+                8,
+                "768p1:1",
+                [],
+                [],
+            )
+        with self.assertRaises(support.AutoDLValidationError):
+            support.build_request_body(
+                "minimax_h3_lightx2v_v5",
+                "move",
+                8,
+                "720p横",
+                ["https://example.test/reference.png"],
+                [],
+            )
 
     def test_discover_token_and_sanitize_errors(self):
         token, source = support.discover_token(

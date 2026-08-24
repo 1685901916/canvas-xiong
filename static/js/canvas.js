@@ -4552,7 +4552,7 @@ function manualVideoUrlForNode(node){
 }
 function currentCanvasMediaLinks(node){
     const refs = orderedSources(node, generatorSources(node)).flatMap(src => src.refs || [])
-        .filter(ref => ref?.url && ['image','video'].includes(mediaKindForRef(ref)));
+        .filter(ref => ref?.url && ['image','video','audio'].includes(mediaKindForRef(ref)));
     return refs.map(ref => {
         const uploaded = tempShUploadedUrlForNode(node, ref.url);
         return uploaded && uploaded !== ref.url ? uploaded : '';
@@ -4620,10 +4620,10 @@ async function uploadCanvasVideosToCloud(nodeId){
     const node = nodes.find(n => n.id === nodeId);
     if(!node) return [];
     const refs = orderedSources(node, generatorSources(node)).flatMap(src => src.refs || [])
-        .filter(ref => ref?.url && ['image','video'].includes(mediaKindForRef(ref)));
+        .filter(ref => ref?.url && ['image','video','audio'].includes(mediaKindForRef(ref)));
     const localRefs = refs.filter(ref => ref?.url && !isRemoteVideoReferenceUrl(ref.url));
     if(!localRefs.length){
-        showErrorModal('没有需要上传的本地图片或视频', '上传云端');
+        showErrorModal('没有需要上传的本地图片、视频或音频', '上传云端');
         return [];
     }
     node.tempShUploading = true;
@@ -10323,7 +10323,7 @@ function renderVideoBody(node){
             <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Media</div>
             <div class="video-input-actions">
                 <button type="button" class="tool-btn" data-video-manual-url title="手动输入视频 URL"><i data-lucide="link" class="w-4 h-4"></i><span>输入网址</span></button>
-                <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
+                <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入媒体到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
             </div>
         </div>
         <div class="input-list video-img-list"></div>

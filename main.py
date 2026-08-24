@@ -11354,20 +11354,20 @@ def volcengine_public_asset_url(url: str) -> str:
         return public
     return "ERR:火山要求素材是公网可访问的 http/https URL；本地画布文件需配置 PUBLIC_BASE_URL/PUBLIC_MEDIA_BASE_URL 暴露为公网地址。"
 
-def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", "video/")) -> str:
+def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", "video/", "audio/")) -> str:
     ref_url = str(ref_url or "").strip()
     if not ref_url:
         raise HTTPException(status_code=400, detail="没有可上传的媒体文件")
     if ref_url.startswith("http://") or ref_url.startswith("https://"):
         return ""
     if not (ref_url.startswith("/output/") or ref_url.startswith("/assets/")):
-        raise HTTPException(status_code=400, detail="云端上传只支持画布里的本地图片或视频文件")
+        raise HTTPException(status_code=400, detail="云端上传只支持画布里的本地图片、视频或音频文件")
     path = output_file_from_url(ref_url)
     if not path:
         raise HTTPException(status_code=404, detail="本地媒体文件不存在或已被删除")
     ct = content_type_for_path(path)
     if not any(ct.startswith(prefix) for prefix in allowed_prefixes):
-        raise HTTPException(status_code=400, detail="请选择图片或视频文件再上传云端")
+        raise HTTPException(status_code=400, detail="请选择图片、视频或音频文件再上传云端")
     max_bytes = int(os.getenv("TEMP_SH_MAX_BYTES", str(4 * 1024 * 1024 * 1024)))
     size = os.path.getsize(path)
     if size > max_bytes:
@@ -14730,16 +14730,50 @@ def resolve_autodl_canvas_request(payload: AutoDLTaskRequest) -> autodl.Resolved
     )
 
 
+def public_autodl_media_url(value: str, kind: str) -> str:
+    text = str(value or "").strip()
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme in {"http", "https"}:
+        host = str(parsed.hostname or "").lower()
+        is_private = host in {"127.0.0.1", "localhost", "::1"} or bool(
+            re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host)
+        )
+        if not is_private:
+            return text
+        local_path = urllib.parse.unquote(parsed.path or "")
+        mapped = local_asset_public_url(local_path)
+        if mapped:
+            return mapped
+    elif text.startswith(("/output/", "/assets/")):
+        mapped = local_asset_public_url(text)
+        if mapped:
+            return mapped
+    raise autodl.AutoDLValidationError(
+        f"AutoDL 的{kind}必须是公网可访问的 http/https URL；"
+        "请点击“上传云端”，或配置 PUBLIC_MEDIA_BASE_URL"
+    )
+
+
 def build_autodl_canvas_request_body(
     payload: AutoDLTaskRequest, resolved: autodl.ResolvedWorkflow
 ) -> Dict[str, Any]:
+    public_images = [
+        public_autodl_media_url(item.url, "参考图片")
+        for item in payload.images
+        if item.url
+    ]
+    public_audios = [
+        public_autodl_media_url(item, "参考音频")
+        for item in payload.audios
+        if item
+    ]
     return autodl.build_request_body(
         resolved.workflow_id,
         payload.prompt,
         payload.duration,
         autodl_resolution_value(payload.resolution, payload.aspect_ratio),
-        [item.url for item in payload.images if item.url],
-        [item for item in payload.audios if item],
+        public_images,
+        public_audios,
         seed=payload.seed,
     )
 
