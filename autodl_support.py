@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import asdict
 import os
 from pathlib import Path
 import re
@@ -585,3 +586,51 @@ def collect_result_urls(payload: Any) -> list[str]:
         data = payload.get("data")
         visit(data.get("results") if isinstance(data, dict) else None)
     return urls
+
+
+def public_workflows() -> list[dict[str, Any]]:
+    """Return deterministic browser-safe workflow metadata."""
+    return [asdict(item) for item in _WORKFLOW_ITEMS]
+
+
+async def doctor_safe() -> dict[str, Any]:
+    """Run the non-billing probe and return no credential material."""
+    try:
+        client = client_from_environment()
+    except AutoDLError as exc:
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "authenticated": False,
+            "message": safe_error(exc),
+            "paid_task_submitted": False,
+        }
+    try:
+        report = await client.doctor()
+        return {"configured": True, **report}
+    except AutoDLError as exc:
+        return {
+            "status": "error",
+            "configured": True,
+            "authenticated": False,
+            "message": safe_error(exc, client.token),
+            "paid_task_submitted": False,
+        }
+
+
+def public_submission(
+    payload: Mapping[str, Any], resolved: ResolvedWorkflow
+) -> dict[str, Any]:
+    data = payload.get("data")
+    data = data if isinstance(data, Mapping) else {}
+    task_id = validate_task_id(str(data.get("task_id") or ""))
+    status = str(data.get("status") or "QUEUED").upper()
+    return {
+        "provider_id": "autodl",
+        "provider_name": "AutoDL",
+        "workflow_id": resolved.workflow_id,
+        "workflow_name": resolved.name,
+        "workflow_reason": resolved.reason,
+        "task_id": task_id,
+        "status": status,
+    }

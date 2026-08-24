@@ -1,0 +1,167 @@
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import main
+
+
+class FakeAutoDLClient:
+    def __init__(self, *, submit_result=None, query_result=None):
+        self.submit_result = submit_result
+        self.query_result = query_result
+        self.submissions = []
+        self.queries = []
+
+    async def submit(self, workflow_id, body):
+        self.submissions.append((workflow_id, body))
+        return self.submit_result
+
+    async def query(self, task_id):
+        self.queries.append(task_id)
+        return self.query_result
+
+
+class AutoDLAPITests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.output_dir = Path(self.temp_dir.name) / "assets" / "output"
+        self.output_dir.mkdir(parents=True)
+
+    @staticmethod
+    def request(**changes):
+        values = {
+            "prompt": "角色向前走",
+            "duration": 8,
+            "aspect_ratio": "9:16",
+            "resolution": "768p",
+            "images": [
+                main.AIReference(
+                    url="https://example.test/reference.png",
+                    role="reference_image",
+                )
+            ],
+            "audios": [],
+            "videos": [],
+            "workflow_mode": "auto",
+        }
+        values.update(changes)
+        return main.AutoDLTaskRequest(**values)
+
+    def test_routes_are_registered_with_expected_methods(self):
+        routes = {
+            route.path: set(route.methods or ())
+            for route in main.app.routes
+            if hasattr(route, "methods")
+        }
+        self.assertIn("GET", routes["/api/autodl/workflows"])
+        self.assertIn("GET", routes["/api/autodl/status"])
+        self.assertIn("POST", routes["/api/autodl/tasks"])
+        self.assertIn("GET", routes["/api/autodl/tasks/{task_id}"])
+
+    def test_builtin_provider_and_workflows_expose_no_token_fields(self):
+        provider = next(
+            item for item in main.default_api_providers() if item["id"] == "autodl"
+        )
+        self.assertEqual("autodl", provider["protocol"])
+        self.assertEqual(7, len(provider["video_models"]))
+
+        result = asyncio.run(main.autodl_workflows())
+        self.assertEqual("minimax_h3_lightx2v_v5", result["default"])
+        self.assertEqual(7, len(result["workflows"]))
+        self.assertFalse(
+            {"token", "api_key", "authorization"}
+            & {key.lower() for key in repr(result).split()}
+        )
+        self.assertNotIn("secret-token", repr(result))
+
+    def test_status_sanitizes_configuration_and_authentication_failures(self):
+        with mock.patch.object(
+            main.autodl,
+            "doctor_safe",
+            new=mock.AsyncMock(
+                return_value={
+                    "status": "error",
+                    "authenticated": False,
+                    "configured": True,
+                    "message": "AutoDL 鉴权失败",
+                    "paid_task_submitted": False,
+                }
+            ),
+        ):
+            result = asyncio.run(main.autodl_status())
+        self.assertFalse(result["authenticated"])
+        self.assertNotIn("secret-token", repr(result))
+        self.assertFalse(result["paid_task_submitted"])
+
+    def test_submission_returns_resolved_workflow_and_task_id(self):
+        fake = FakeAutoDLClient(
+            submit_result={
+                "code": "Success",
+                "data": {"task_id": "task-123", "status": "QUEUED"},
+            }
+        )
+        with mock.patch.object(
+            main.autodl, "client_from_environment", return_value=fake
+        ):
+            result = asyncio.run(main.autodl_submit_task(self.request()))
+
+        self.assertEqual("task-123", result["task_id"])
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual("autodl", result["provider_id"])
+        self.assertEqual("minimax_h3_lightx2v_v5", result["workflow_id"])
+        self.assertEqual(1, len(fake.submissions))
+        workflow_id, body = fake.submissions[0]
+        self.assertEqual("minimax_h3_lightx2v_v5", workflow_id)
+        self.assertEqual(
+            {
+                "prompt",
+                "duration",
+                "resolution",
+                "ref_image_0",
+            },
+            set(body),
+        )
+
+    def test_success_poll_downloads_once_and_reuses_local_result(self):
+        fake = FakeAutoDLClient(
+            query_result={
+                "code": "Success",
+                "data": {
+                    "task_id": "task-123",
+                    "status": "SUCCESS",
+                    "results": ["https://cdn.test/result.mp4"],
+                },
+            }
+        )
+
+        async def fake_download(url, destination):
+            self.assertEqual("https://cdn.test/result.mp4", url)
+            Path(destination).write_bytes(b"\x00\x00\x00\x18ftypisom")
+
+        with mock.patch.multiple(
+            main,
+            OUTPUT_OUTPUT_DIR=str(self.output_dir),
+        ), mock.patch.object(
+            main.autodl, "client_from_environment", return_value=fake
+        ), mock.patch.object(
+            main,
+            "download_autodl_video",
+            new=mock.AsyncMock(side_effect=fake_download),
+        ) as downloader:
+            first = asyncio.run(main.autodl_task_status("task-123"))
+            second = asyncio.run(main.autodl_task_status("task-123"))
+
+        self.assertEqual("SUCCESS", first["status"])
+        self.assertEqual(
+            ["/assets/output/autodl_task-123.mp4"], first["videos"]
+        )
+        self.assertEqual(first["videos"], second["videos"])
+        self.assertEqual(1, downloader.await_count)
+        self.assertEqual(["task-123", "task-123"], fake.queries)
+
+
+if __name__ == "__main__":
+    unittest.main()

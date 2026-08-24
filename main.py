@@ -32,6 +32,7 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple, Literal
 from threading import BoundedSemaphore, Lock, Thread
 import httpx
+import autodl_support as autodl
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -288,7 +289,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "autodl"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -781,6 +782,22 @@ def default_api_providers():
     # 独立入口平台强制保留，其他平台均可自定义增删
     return [
         {
+            "id": "autodl",
+            "name": "AutoDL",
+            "base_url": autodl.DEFAULT_BASE_URL,
+            "protocol": "autodl",
+            "image_request_mode": "openai",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
+            "enabled": True,
+            "primary": False,
+            "image_models": [],
+            "chat_models": [],
+            "video_models": list(autodl.WORKFLOWS),
+            "ms_loras": [],
+            "ms_defaults_version": 0,
+        },
+        {
             "id": "modelscope",
             "name": "ModelScope",
             "base_url": MODELSCOPE_CHAT_BASE_URL,
@@ -851,6 +868,18 @@ def default_api_providers():
 
 def merge_default_api_providers(providers, inject_missing=True):
     merged = [dict(item) for item in providers]
+    autodl_default = next((d for d in default_api_providers() if d["id"] == "autodl"), None)
+    if autodl_default:
+        current = next((item for item in merged if item.get("id") == "autodl"), None)
+        if not current:
+            merged.insert(0, autodl_default)
+        else:
+            current.update({
+                "name": "AutoDL",
+                "base_url": autodl.DEFAULT_BASE_URL,
+                "protocol": "autodl",
+                "video_models": list(autodl.WORKFLOWS),
+            })
     # 强制保留独立入口平台（不再强制 comfly）
     ms_default = next((d for d in default_api_providers() if d["id"] == "modelscope"), None)
     if ms_default:
@@ -1305,6 +1334,9 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
+    if provider_id == "autodl":
+        protocol = "autodl"
+        base_url = autodl.DEFAULT_BASE_URL
     locked_rule = locked_recommended_provider_rule(provider_id, name, base_url)
     if locked_rule:
         protocol = locked_rule["protocol"]
@@ -1370,6 +1402,18 @@ def public_provider(provider):
             provider = runninghub_provider_with_workflow_store(provider)
         except Exception:
             pass
+    if provider.get("id") == "autodl":
+        try:
+            autodl.discover_token()
+            autodl_configured = True
+        except autodl.AutoDLError:
+            autodl_configured = False
+        return {
+            **provider,
+            "has_key": autodl_configured,
+            "key_preview": "",
+            "key_env": "AUTODL_TOKEN",
+        }
     key = provider_env_key_value(provider["id"])
     is_local_cli = is_gemini_cli_provider(provider)
     local_cli_available = bool(gemini_cli_executable()) if is_local_cli else False
@@ -2717,6 +2761,19 @@ class CanvasVideoRequest(BaseModel):
     generate_audio: bool = False
     multimodal: bool = False
     trusted_asset: bool = False
+
+class AutoDLTaskRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
+    duration: int = Field(default=5, ge=1, le=15)
+    aspect_ratio: str = "16:9"
+    resolution: str = "768p"
+    seed: Optional[int] = None
+    images: List[AIReference] = []
+    videos: List[str] = []
+    audios: List[str] = []
+    first_last: bool = False
+    workflow_mode: Literal["auto", "manual"] = "auto"
+    workflow_id: str = ""
 
 class TempShUploadRequest(BaseModel):
     url: str = ""
@@ -14648,6 +14705,168 @@ async def temp_sh_upload(payload: TempShUploadRequest, request: Request):
     ensure_same_origin_request(request)
     return await upload_local_video_to_cloud(payload.url, "auto")
 
+AUTODL_DOWNLOAD_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def autodl_resolution_value(resolution: str, aspect_ratio: str) -> str:
+    value = str(resolution or "768p").strip()
+    if value.endswith(("横", "竖", "1:1")):
+        return value
+    ratio = str(aspect_ratio or "16:9").strip()
+    suffix = "竖" if ratio in {"9:16", "3:4", "2:3"} else "1:1" if ratio == "1:1" else "横"
+    return f"{value}{suffix}"
+
+
+def resolve_autodl_canvas_request(payload: AutoDLTaskRequest) -> autodl.ResolvedWorkflow:
+    return autodl.resolve_workflow(
+        prompt=payload.prompt,
+        duration=payload.duration,
+        images=[item.url for item in payload.images if item.url],
+        audios=[item for item in payload.audios if item],
+        videos=[item for item in payload.videos if item],
+        first_last=payload.first_last,
+        mode=payload.workflow_mode,
+        workflow_id=payload.workflow_id,
+    )
+
+
+def build_autodl_canvas_request_body(
+    payload: AutoDLTaskRequest, resolved: autodl.ResolvedWorkflow
+) -> Dict[str, Any]:
+    return autodl.build_request_body(
+        resolved.workflow_id,
+        payload.prompt,
+        payload.duration,
+        autodl_resolution_value(payload.resolution, payload.aspect_ratio),
+        [item.url for item in payload.images if item.url],
+        [item for item in payload.audios if item],
+        seed=payload.seed,
+    )
+
+
+def valid_autodl_video_file(path: str) -> bool:
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 12:
+            return False
+        with open(path, "rb") as stream:
+            header = stream.read(12)
+        return b"ftyp" in header
+    except OSError:
+        return False
+
+
+async def download_autodl_video(url: str, destination: str) -> None:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise autodl.AutoDLValidationError("AutoDL 返回了无效的视频地址")
+    destination = os.path.abspath(destination)
+    output_root = os.path.abspath(OUTPUT_OUTPUT_DIR)
+    if os.path.commonpath([output_root, destination]) != output_root:
+        raise autodl.AutoDLValidationError("AutoDL 输出路径无效")
+    os.makedirs(output_root, exist_ok=True)
+    fd, stage_path = tempfile.mkstemp(prefix=".autodl-", suffix=".part", dir=output_root)
+    os.close(fd)
+    try:
+        timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream(
+                "GET",
+                str(url),
+                headers={"Accept": "video/mp4,video/*,application/octet-stream"},
+            ) as response:
+                response.raise_for_status()
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
+                    raise autodl.AutoDLError("AutoDL 视频下载返回了非视频内容")
+                with open(stage_path, "wb") as output:
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+        if not valid_autodl_video_file(stage_path):
+            raise autodl.AutoDLError("AutoDL 视频下载内容不是有效的 MP4 文件")
+        os.replace(stage_path, destination)
+    finally:
+        try:
+            if os.path.exists(stage_path):
+                os.remove(stage_path)
+        except OSError:
+            pass
+
+
+async def finalize_autodl_result(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    safe_task_id = autodl.validate_task_id(task_id)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data if isinstance(data, dict) else {}
+    status = str(data.get("status") or "UNKNOWN").upper()
+    result = {
+        "provider_id": "autodl",
+        "task_id": safe_task_id,
+        "status": status,
+        "videos": [],
+    }
+    if status == "FAILED":
+        detail = data.get("message") or data.get("error") or "AutoDL 视频任务失败"
+        result["error"] = autodl.safe_error(RuntimeError(str(detail)))
+        return result
+    if status != "SUCCESS":
+        return result
+    urls = autodl.collect_result_urls(payload)
+    if not urls:
+        raise HTTPException(status_code=502, detail="AutoDL 任务成功但没有返回视频地址")
+
+    lock = AUTODL_DOWNLOAD_LOCKS.setdefault(safe_task_id, asyncio.Lock())
+    async with lock:
+        local_urls = []
+        for index, url in enumerate(urls):
+            suffix = "" if index == 0 else f"_{index + 1}"
+            filename = f"autodl_{safe_task_id}{suffix}.mp4"
+            path = os.path.join(OUTPUT_OUTPUT_DIR, filename)
+            if not valid_autodl_video_file(path):
+                await download_autodl_video(url, path)
+            local_urls.append(f"/assets/output/{filename}")
+    result["videos"] = local_urls
+    return result
+
+
+@app.get("/api/autodl/workflows")
+async def autodl_workflows():
+    return {"workflows": autodl.public_workflows(), "default": autodl.DEFAULT_WORKFLOW}
+
+
+@app.get("/api/autodl/status")
+async def autodl_status():
+    return await autodl.doctor_safe()
+
+
+@app.post("/api/autodl/tasks")
+async def autodl_submit_task(payload: AutoDLTaskRequest):
+    try:
+        resolved = resolve_autodl_canvas_request(payload)
+        body = build_autodl_canvas_request_body(payload, resolved)
+        upstream = await autodl.client_from_environment().submit(
+            resolved.workflow_id, body
+        )
+        return autodl.public_submission(upstream, resolved)
+    except autodl.AutoDLValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except autodl.AutoDLError as exc:
+        raise HTTPException(status_code=502, detail=autodl.safe_error(exc)) from exc
+
+
+@app.get("/api/autodl/tasks/{task_id}")
+async def autodl_task_status(task_id: str):
+    try:
+        safe_task_id = autodl.validate_task_id(task_id)
+        upstream = await autodl.client_from_environment().query(safe_task_id)
+        return await finalize_autodl_result(safe_task_id, upstream)
+    except autodl.AutoDLValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except autodl.AutoDLError as exc:
+        raise HTTPException(status_code=502, detail=autodl.safe_error(exc)) from exc
+
+
 @app.post("/api/cloud-video/upload")
 async def cloud_video_upload(payload: CloudVideoUploadRequest, request: Request):
     ensure_same_origin_request(request)
@@ -15315,7 +15534,7 @@ async def save_providers(payload: List[ApiProviderPayload]):
         providers.append(provider)
         key_env = provider_key_env(provider["id"])
         # Antigravity 的 OAuth 只归 agy/keyring 管理，Provider 保存接口不接收任何伪 API Key。
-        if not is_gemini_cli_provider(provider):
+        if not is_gemini_cli_provider(provider) and provider["id"] != "autodl":
             if item.clear_key:
                 env_updates[key_env] = ""
             elif item.api_key is not None and item.api_key.strip():
