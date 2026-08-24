@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
+import os
+from pathlib import Path
 import re
-from typing import Mapping, Sequence
+from types import MappingProxyType
+from typing import Any, Mapping, MutableMapping, Sequence
+from urllib.parse import quote
+
+import httpx
 
 
 DEFAULT_WORKFLOW = "minimax_h3_lightx2v_v5"
+DEFAULT_BASE_URL = "https://autodl.art"
+PROBE_TASK_ID = "00000000-0000-0000-0000-000000000000"
+VIDEO_TIMEOUT = 60.0
+QUERY_TIMEOUT = 30.0
 
 
 class AutoDLValidationError(ValueError):
     """Raised before submission when canvas inputs cannot fit an H3 workflow."""
+
+
+class AutoDLError(RuntimeError):
+    """Raised for safe AutoDL configuration, transport, or response failures."""
 
 
 @dataclass(frozen=True)
@@ -304,3 +317,271 @@ def resolve_workflow(
         normalized_audios,
         reason,
     )
+
+
+def build_request_body(
+    workflow_id: str,
+    prompt: str,
+    duration: int,
+    resolution: str,
+    images: Sequence[str],
+    audios: Sequence[str],
+    *,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Build only fields declared by the selected AutoDL online API panel."""
+    definition = WORKFLOWS.get(workflow_id)
+    if definition is None:
+        raise AutoDLValidationError("未知的 AutoDL H3 工作流")
+    normalized_images = list(images or ())
+    normalized_audios = list(audios or ())
+    normalized_duration = int(duration)
+    validate_resolved(
+        workflow_id,
+        prompt,
+        normalized_duration,
+        normalized_images,
+        normalized_audios,
+        "构造请求体",
+    )
+    if not str(resolution or "").strip():
+        raise AutoDLValidationError("AutoDL H3 请求缺少分辨率")
+
+    if workflow_id == "minimax_h3_lightx2v_no_pic":
+        return {
+            "prompt": str(prompt),
+            "duration": normalized_duration,
+            "resolution": str(resolution),
+        }
+    if workflow_id == "minimax_h3_lightx2v":
+        return {
+            "prompt": str(prompt),
+            "duration": normalized_duration,
+            "resolution": str(resolution),
+            "first_frame": normalized_images[0],
+            "last_frame": normalized_images[1],
+        }
+    if workflow_id == "minimax_h3_image_audio_to_video":
+        return {
+            "resolution": str(resolution),
+            "ref_image_0": normalized_images[0],
+            "ref_audio_0": normalized_audios[0],
+            "audio_duration": normalized_duration,
+        }
+
+    body: dict[str, Any] = {
+        "prompt": str(prompt),
+        "duration": normalized_duration,
+        "resolution": str(resolution),
+    }
+    if seed is not None:
+        body["seed"] = int(seed)
+    for index, image in enumerate(normalized_images):
+        body[f"ref_image_{index}"] = image
+    if workflow_id in {
+        "minimax_h3_image_audio_to_video_v2",
+        "minimax_h3_image_audio_to_video_v2_15s",
+    }:
+        for index, audio in enumerate(normalized_audios):
+            body[f"ref_audio_{index}"] = audio
+    return body
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key:
+            values.setdefault(key, value)
+    return values
+
+
+def discover_token(
+    *,
+    environ: MutableMapping[str, str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    explicit_path: Path | str | None = None,
+) -> tuple[str, str]:
+    """Find the token without exposing it to browser-managed provider settings."""
+    target = environ if environ is not None else os.environ
+    current_dir = (cwd or Path.cwd()).resolve()
+    home_dir = (home or Path.home()).resolve()
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    configured = target.get("AUTODL_ENV_FILE")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    existing = str(target.get("AUTODL_TOKEN") or "").strip()
+    if existing:
+        return existing, "process environment"
+    for current in (current_dir, *current_dir.parents):
+        candidates.append(current / ".env.autodl")
+    candidates.append(home_dir / ".codex" / "secrets" / "autodl.env")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        marker = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if not candidate.is_file():
+            continue
+        token = str(_read_env_file(candidate).get("AUTODL_TOKEN") or "").strip()
+        if token:
+            return token, str(candidate.resolve())
+    raise AutoDLError(
+        "AUTODL_TOKEN 未配置；请使用环境变量、.env.autodl 或用户 secrets 文件"
+    )
+
+
+def safe_error(error: BaseException, token: str = "") -> str:
+    message = str(error) or error.__class__.__name__
+    if token:
+        message = message.replace(token, "[REDACTED]")
+    message = re.sub(
+        r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
+        r"\1[REDACTED]",
+        message,
+    )
+    return message
+
+
+def validate_task_id(task_id: str) -> str:
+    value = str(task_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", value):
+        raise AutoDLValidationError("AutoDL task_id 格式无效")
+    return value
+
+
+def _parse_response(
+    response: httpx.Response,
+    *,
+    require_success: bool = True,
+    require_task_id: bool = False,
+) -> dict[str, Any]:
+    if response.status_code in {401, 403}:
+        raise AutoDLError(f"AutoDL 鉴权失败：HTTP {response.status_code}")
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise AutoDLError(f"AutoDL HTTP {response.status_code}") from exc
+    except ValueError as exc:
+        raise AutoDLError("AutoDL 返回了无效 JSON") from exc
+    if not isinstance(payload, dict):
+        raise AutoDLError("AutoDL 返回格式无效")
+    if require_success and payload.get("code") != "Success":
+        raise AutoDLError(str(payload.get("msg") or "AutoDL 请求失败"))
+    if require_task_id:
+        task_id = str((payload.get("data") or {}).get("task_id") or "")
+        if not task_id:
+            raise AutoDLError("AutoDL 响应缺少 data.task_id")
+    return payload
+
+
+class AutoDLClient:
+    def __init__(
+        self,
+        token: str,
+        base_url: str = DEFAULT_BASE_URL,
+        client_factory=httpx.AsyncClient,
+    ) -> None:
+        normalized_token = str(token or "").strip()
+        if not normalized_token:
+            raise AutoDLError("AUTODL_TOKEN 为空")
+        self.token = normalized_token
+        self.base_url = str(base_url or DEFAULT_BASE_URL).rstrip("/")
+        self.client_factory = client_factory
+
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": self.token, "Content-Type": "application/json"}
+
+    async def submit(self, workflow_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        if workflow_id not in WORKFLOWS:
+            raise AutoDLValidationError("未知的 AutoDL H3 工作流")
+        safe_id = quote(workflow_id, safe="_.-")
+        url = f"{self.base_url}/api/v1/comfyui/comfyui_workflow/{safe_id}"
+        try:
+            async with self.client_factory(
+                timeout=VIDEO_TIMEOUT, follow_redirects=True
+            ) as client:
+                response = await client.post(url, headers=self.headers(), json=dict(body))
+            return _parse_response(response, require_task_id=True)
+        except (httpx.HTTPError, AutoDLError) as exc:
+            raise AutoDLError(safe_error(exc, self.token)) from exc
+
+    async def query(self, task_id: str) -> dict[str, Any]:
+        safe_id = quote(validate_task_id(task_id), safe="_.-")
+        url = f"{self.base_url}/api/v1/comfyui/comfyui_workflow/result/{safe_id}"
+        try:
+            async with self.client_factory(
+                timeout=QUERY_TIMEOUT, follow_redirects=True
+            ) as client:
+                response = await client.get(url, headers=self.headers())
+            return _parse_response(response)
+        except (httpx.HTTPError, AutoDLError) as exc:
+            raise AutoDLError(safe_error(exc, self.token)) from exc
+
+    async def doctor(self) -> dict[str, Any]:
+        url = (
+            f"{self.base_url}/api/v1/comfyui/comfyui_workflow/result/"
+            f"{PROBE_TASK_ID}"
+        )
+        try:
+            async with self.client_factory(
+                timeout=QUERY_TIMEOUT, follow_redirects=True
+            ) as client:
+                response = await client.get(url, headers=self.headers())
+            payload = _parse_response(response, require_success=False)
+        except (httpx.HTTPError, AutoDLError) as exc:
+            raise AutoDLError(safe_error(exc, self.token)) from exc
+        return {
+            "status": "ok",
+            "authenticated": True,
+            "base_url": self.base_url,
+            "default_workflow": DEFAULT_WORKFLOW,
+            "api_code": payload.get("code"),
+            "api_message": payload.get("msg"),
+            "paid_task_submitted": False,
+        }
+
+
+def client_from_environment(
+    *,
+    environ: MutableMapping[str, str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    client_factory=httpx.AsyncClient,
+) -> AutoDLClient:
+    target = environ if environ is not None else os.environ
+    token, _ = discover_token(environ=target, cwd=cwd, home=home)
+    base_url = str(target.get("AUTODL_BASE_URL") or DEFAULT_BASE_URL)
+    return AutoDLClient(token, base_url=base_url, client_factory=client_factory)
+
+
+def collect_result_urls(payload: Any) -> list[str]:
+    urls: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            if value.startswith(("https://", "http://")) and value not in urls:
+                urls.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        visit(data.get("results") if isinstance(data, dict) else None)
+    return urls
