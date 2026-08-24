@@ -464,6 +464,7 @@ let assetManagerTab = 'assets';
 let managerSelectedAssetIds = new Set();
 let managerSelectedPromptIds = new Set();
 const activeCanvasTaskPolls = new Set();
+const activeAutoDLVideoPolls = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
 let undoStack = [];
@@ -1708,8 +1709,9 @@ function refreshOutputTimer(){
 }
 function serializableCanvasPendingItems(items=[]){
     return activePendingItems(items || []).map(item => {
-        const taskId = item.canvasTaskId || item.task_id || item.id || '';
-        if(!taskId) return null;
+        const isAutoDLVideo = item.canvasTaskType === 'autodl-video';
+        const taskId = item.canvasTaskId || item.task_id || (isAutoDLVideo ? '' : item.id) || '';
+        if(!taskId && !isAutoDLVideo) return null;
         const copy = {};
         [
             'id',
@@ -1717,6 +1719,13 @@ function serializableCanvasPendingItems(items=[]){
             'canvasTaskId',
             'canvasTaskType',
             'canvasTaskStatus',
+            'task_id',
+            'provider_id',
+            'workflow_id',
+            'workflow_name',
+            'workflow_reason',
+            'failed',
+            'recoverTaskId',
             'created_at',
             'started_at',
             'finished_at',
@@ -1733,7 +1742,7 @@ function serializableCanvasPendingItems(items=[]){
         ].forEach(key => {
             if(item[key] !== undefined) copy[key] = item[key];
         });
-        copy.canvasTaskId = String(taskId);
+        if(taskId) copy.canvasTaskId = String(taskId);
         copy.canvasTaskType = copy.canvasTaskType || item.type || 'online-image';
         copy.canvasTaskStatus = copy.canvasTaskStatus || item.status || 'queued';
         try { return JSON.parse(JSON.stringify(copy)); }
@@ -2647,6 +2656,7 @@ async function openCanvas(id){
         render();
         refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
+        resumeAutoDLVideoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
@@ -2687,6 +2697,7 @@ function applyRemoteCanvasData(remote){
         render();
         refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
+        resumeAutoDLVideoTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -12792,6 +12803,160 @@ async function runGeneratorLegacy(genId, opts={}){
         showErrorModal(err.message || tr('canvas.generationFailed'), tr('canvas.apiFailed'));
     }
 }
+async function pollAutoDLTask(node, out, pending, opts={}){
+    const taskId = String(pending?.task_id || pending?.canvasTaskId || '').trim();
+    if(!taskId) return 'unknown_submission';
+    if(activeAutoDLVideoPolls.has(taskId)) return 'RUNNING';
+    activeAutoDLVideoPolls.add(taskId);
+    try {
+        while(true){
+            const latest = pendingById(out, pending.id);
+            if(!latest) return 'missing';
+            const response = await fetch(`/api/autodl/tasks/${encodeURIComponent(taskId)}`);
+            if(!response.ok) throw new Error(await responseErrorMessage(response, 'AutoDL 任务查询失败'));
+            const result = await response.json();
+            const status = String(result.status || '').toUpperCase();
+            latest.status = status.toLowerCase();
+            latest.canvasTaskStatus = latest.status;
+            latest.message = status === 'QUEUED' ? 'AutoDL 排队中' : status === 'RUNNING' ? 'AutoDL 生成中' : '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(status === 'QUEUED' || status === 'RUNNING'){
+                await sleep(2000);
+                continue;
+            }
+            if(status === 'SUCCESS'){
+                const videos = (result.videos || []).map(item => ({
+                    url:outputUrlValue(item),
+                    kind:'video',
+                    provider_id:'autodl',
+                    status:'SUCCESS'
+                })).filter(item => item.url);
+                if(!videos.length) throw new Error('AutoDL 任务成功但未返回本地视频');
+                const meta = collectRunMeta(out, latest.id);
+                meta.run.request = {
+                    ...(meta.run.request || {}),
+                    provider_id:'autodl',
+                    provider_name:'AutoDL',
+                    workflow_id:latest.workflow_id || '',
+                    workflow_name:latest.workflow_name || '',
+                    workflow_reason:latest.workflow_reason || '',
+                    task_id:taskId,
+                    status:'SUCCESS'
+                };
+                out._pending = (out._pending || []).filter(item => item.id !== latest.id);
+                appendOutputImages(out, videos, meta.run?.refs?.[0], [{...meta, kind:'video'}]);
+                mergeGeneratedOutputs(node, videos, Boolean(opts.cascade));
+                addGenerationLog({run:meta.run, outputs:videos, runMs:meta.runMs || 0});
+                node.runStatus = 'done';
+                node.runError = '';
+                node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                return 'SUCCESS';
+            }
+            if(status === 'FAILED'){
+                const message = result.error || 'AutoDL 视频任务失败';
+                latest.failed = true;
+                latest.error = message;
+                latest.recoverTaskId = taskId;
+                node.runStatus = 'failed';
+                node.runError = message;
+                node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                if(opts.cascade) throw new Error(message);
+                return 'FAILED';
+            }
+            throw new Error(`AutoDL 返回未知任务状态：${status || 'UNKNOWN'}`);
+        }
+    } catch(err) {
+        const latest = pendingById(out, pending.id);
+        if(latest){
+            latest.failed = true;
+            latest.error = err.message || 'AutoDL 任务查询失败';
+            latest.recoverTaskId = taskId;
+            latest.canvasTaskStatus = 'failed';
+        }
+        node.runStatus = 'failed';
+        node.runError = err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw err;
+        return 'FAILED';
+    } finally {
+        activeAutoDLVideoPolls.delete(taskId);
+    }
+}
+
+async function runAutoDLVideoNode(node, snapshot, out, pending, opts={}){
+    pending.provider_id = 'autodl';
+    pending.canvasTaskType = 'autodl-video';
+    pending.canvasTaskStatus = 'submitting';
+    pending.status = 'submitting';
+    pending.workflow_id = node.workflowMode === 'manual' ? (node.workflowId || '') : (node.resolvedWorkflowId || '');
+    await saveCanvas();
+    try {
+        const videoUrls = manualVideoUrlForNode(node)
+            ? [manualVideoUrlForNode(node)]
+            : snapshot.videoRefs.map(ref => tempShUploadedUrlForNode(node, ref.url)).filter(Boolean);
+        const response = await fetch('/api/autodl/tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                prompt:snapshot.prompt,
+                duration:Number(node.duration || 5),
+                aspect_ratio:node.aspectRatio || '16:9',
+                resolution:node.resolution || '768p',
+                seed:Number.isFinite(Number(node.seed)) ? Number(node.seed) : null,
+                images:snapshot.refs,
+                videos:videoUrls,
+                audios:snapshot.audioRefs.map(ref => tempShUploadedUrlForNode(node, ref.url)).filter(Boolean),
+                first_last:Boolean(node.useFrameRoles),
+                workflow_mode:node.workflowMode || 'auto',
+                workflow_id:node.workflowMode === 'manual' ? (node.workflowId || '') : ''
+            })
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'AutoDL 视频提交失败'));
+        const submission = await response.json();
+        if(!submission.task_id) throw new Error('AutoDL 提交成功但没有返回 task_id');
+        pending.task_id = submission.task_id;
+        pending.canvasTaskId = submission.task_id;
+        pending.status = String(submission.status || 'QUEUED').toLowerCase();
+        pending.canvasTaskStatus = pending.status;
+        pending.workflow_id = submission.workflow_id || pending.workflow_id;
+        pending.workflow_name = submission.workflow_name || '';
+        pending.workflow_reason = submission.workflow_reason || '';
+        pending.run.request = {
+            ...(pending.run.request || {}),
+            provider_id:'autodl',
+            provider_name:'AutoDL',
+            workflow_id:pending.workflow_id,
+            workflow_name:pending.workflow_name,
+            workflow_reason:pending.workflow_reason,
+            task_id:submission.task_id,
+            status:submission.status || 'QUEUED'
+        };
+        await saveCanvas();
+        return pollAutoDLTask(node, out, pending, opts);
+    } catch(err) {
+        if(!pending.task_id){
+            pending.failed = true;
+            pending.status = 'unknown_submission';
+            pending.canvasTaskStatus = 'unknown_submission';
+            pending.error = `提交状态未知，为避免重复扣费不会自动重试：${err.message || String(err)}`;
+        }
+        node.runStatus = 'failed';
+        node.runError = pending.error || err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw err;
+        return 'unknown_submission';
+    }
+}
+
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
@@ -12812,6 +12977,10 @@ async function runVideoNode(nodeId, opts={}){
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs, cascadeTargetId})];
     if(!opts.cascade){ node.running = true; refreshRunNodes(node, out); }
     else refreshRunNodes(node, out);
+    if(isAutoDLVideoProvider(node.apiProvider)){
+        const pending = pendingById(out, pendingId);
+        return runAutoDLVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
+    }
     try {
         const result = await cascadeFetch('/api/canvas-video', {
             method:'POST',
@@ -14679,7 +14848,7 @@ async function queryRecoverPendingOutput(pendingId){
     const out = findOutputByPendingId(pendingId);
     const pending = pendingById(out, pendingId);
     if(!out || !pending || pending.querying) return;
-    const taskId = pending.recoverTaskId || extractUpstreamTaskId(pending.error || '');
+    const taskId = pending.recoverTaskId || pending.task_id || pending.canvasTaskId || extractUpstreamTaskId(pending.error || '');
     if(!taskId){
         showErrorModal('没有任务 ID，无法查询结果', tr('canvas.apiFailed'));
         return;
@@ -14687,6 +14856,20 @@ async function queryRecoverPendingOutput(pendingId){
     pending.querying = true;
     pending.recoverTaskId = taskId;
     refreshNodes([out.id]);
+    if(pending.canvasTaskType === 'autodl-video'){
+        const node = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+        pending.failed = false;
+        pending.querying = false;
+        pending.error = '';
+        if(node){
+            node.running = true;
+            node.runStatus = 'running';
+            await pollAutoDLTask(node, out, pending, {resume:true});
+        }
+        refreshNodes([out.id]);
+        scheduleSave();
+        return;
+    }
     try {
         const res = await fetch('/api/image-task-query', {
             method:'POST',
@@ -14898,6 +15081,40 @@ function resumeCanvasImageTasks(){
         if(out._pending.length !== before) changed = true;
         (out._pending || []).forEach(p => {
             if(p.canvasTaskType === 'online-image' && p.canvasTaskId && !p.failed) pollCanvasImageTask(p.canvasTaskId, {cascadeTargetId:p.cascadeTargetId || ''});
+        });
+    });
+    if(changed){
+        refreshRunNodes();
+        scheduleSave();
+    }
+}
+function resumeAutoDLVideoTasks(){
+    let changed = false;
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.canvasTaskType !== 'autodl-video' || pending.failed) return;
+            const node = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+            const taskId = String(pending.task_id || pending.canvasTaskId || '').trim();
+            if(!taskId){
+                pending.failed = true;
+                pending.status = 'unknown_submission';
+                pending.canvasTaskStatus = 'unknown_submission';
+                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                if(node){
+                    node.running = false;
+                    node.runStatus = 'failed';
+                    node.runError = pending.error;
+                }
+                changed = true;
+                return;
+            }
+            pending.task_id = taskId;
+            pending.canvasTaskId = taskId;
+            if(node){
+                node.running = true;
+                node.runStatus = pending.canvasTaskStatus || pending.status || 'queued';
+            }
+            pollAutoDLTask(node, out, pending, {resume:true});
         });
     });
     if(changed){

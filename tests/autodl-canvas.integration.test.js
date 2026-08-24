@@ -33,4 +33,23 @@ assert.match(settingsHtml, /id=["']autodlStatus["']/);
 assert.match(settingsHtml, /AUTODL_TOKEN/);
 assert.doesNotMatch(settingsHtml, /<input[^>]+(?:autodl|AUTODL_TOKEN)/i);
 
+assert.match(canvasJs, /async function runAutoDLVideoNode\s*\(/);
+assert.match(canvasJs, /fetch\(['"]\/api\/autodl\/tasks['"]/);
+assert.match(canvasJs, /pending\.task_id\s*=\s*submission\.task_id/);
+assert.match(canvasJs, /await saveCanvas\(\)[\s\S]{0,500}pollAutoDLTask/);
+assert.match(canvasJs, /async function pollAutoDLTask\s*\(/);
+assert.match(canvasJs, /\/api\/autodl\/tasks\/\$\{encodeURIComponent\(taskId\)\}/);
+assert.match(canvasJs, /['"]QUEUED['"]/);
+assert.match(canvasJs, /['"]RUNNING['"]/);
+assert.match(canvasJs, /['"]SUCCESS['"]/);
+assert.match(canvasJs, /['"]FAILED['"]/);
+assert.match(canvasJs, /function resumeAutoDLVideoTasks\s*\(/);
+assert.match(canvasJs, /unknown_submission/);
+
+const resumeStart = canvasJs.indexOf('function resumeAutoDLVideoTasks');
+const resumeEnd = canvasJs.indexOf('\nfunction ', resumeStart + 10);
+const resumeSource = canvasJs.slice(resumeStart, resumeEnd < 0 ? undefined : resumeEnd);
+assert.doesNotMatch(resumeSource, /method\s*:\s*['"]POST['"]/);
+assert.doesNotMatch(resumeSource, /runAutoDLVideoNode\s*\(/);
+
 console.log('autodl canvas integration tests passed');
