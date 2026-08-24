@@ -400,6 +400,7 @@ let models = {gpt:'gpt-image-2', nano:'nano-banana-pro'};
 let imageModels = ['gpt-image-2', 'nano-banana-pro'];
 let chatModels = ['gpt-4o-mini'];
 let videoModels = [];
+let autodlWorkflows = [];
 let msChatModels = [];
 let apiProviders = [];
 let comfyBackendCount = 1;
@@ -940,10 +941,28 @@ function providerVideoModels(providerId){
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.video_models || []);
 }
+function isAutoDLVideoProvider(providerId){
+    return String(providerId || '').trim().toLowerCase() === 'autodl';
+}
+function autodlWorkflowOptions(node){
+    const mode = node?.workflowMode === 'manual' ? 'manual' : 'auto';
+    const selected = mode === 'manual' ? String(node?.workflowId || '') : '';
+    const automatic = `<option value="" ${selected ? '' : 'selected'}>自动选择</option>`;
+    const options = (window.AutoDLVideo?.workflowOptions(autodlWorkflows) || []).map(option =>
+        `<option value="${escapeHtml(option.value)}" ${option.value === selected ? 'selected' : ''}>${escapeHtml(option.label)}</option>`
+    ).join('');
+    return automatic + options;
+}
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
     node.apiProvider = resolveVideoProviderId(node.apiProvider || 'comfly');
     const models = providerVideoModels(node.apiProvider);
+    if(isAutoDLVideoProvider(node.apiProvider)){
+        node.workflowMode = node.workflowMode === 'manual' ? 'manual' : 'auto';
+        node.workflowId = node.workflowMode === 'manual' ? String(node.workflowId || '') : '';
+        node.model = node.resolvedWorkflowId || node.workflowId || node.model || 'minimax_h3_lightx2v_v5';
+        return;
+    }
     if(!models.length) node.model = '';
     else if(!models.includes(node.model)) node.model = models[0] || '';
 }
@@ -2008,6 +2027,15 @@ async function loadConfig(){
         msChatModels = cfg.ms_chat_models?.length ? cfg.ms_chat_models : msChatModels;
         comfyBackendCount = Math.max(1, (cfg.comfy_instances || []).length || 1);
         apiProviders = Array.isArray(cfg.api_providers) && cfg.api_providers.length ? cfg.api_providers : defaultApiProviders();
+        try {
+            const autodlConfig = await fetch('/api/autodl/workflows').then(r => {
+                if(!r.ok) throw new Error('AutoDL workflow metadata unavailable');
+                return r.json();
+            });
+            autodlWorkflows = Array.isArray(autodlConfig.workflows) ? autodlConfig.workflows : [];
+        } catch(_) {
+            autodlWorkflows = [];
+        }
         refreshGeminiCliAccountModels().then(() => {
             (nodes || []).forEach(node => sanitizeImageNodeProviderModel(node));
             if(canvas && typeof render === 'function') render();
@@ -3410,18 +3438,22 @@ function addMsGenNode(point){
 }
 function addVideoNode(point){
     const p = point || defaultPoint(160, 0);
-    const providerId = videoApiProviders()[0]?.id || 'comfly';
+    const providerId = 'autodl';
     const models = providerVideoModels(providerId);
     return addNode({
         id:uid('vid'),
         type:'video',
         x:p.x,
         y:p.y,
-        apiProvider:providerId,
-        model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
+        apiProvider:'autodl',
+        model:models[0] || 'minimax_h3_lightx2v_v5',
+        workflowMode:'auto',
+        workflowId:'',
+        resolvedWorkflowId:'minimax_h3_lightx2v_v5',
+        resolvedWorkflowReason:'默认多图参考工作流',
         duration:5,
         aspectRatio:'16:9',
-        resolution:'',
+        resolution:'768p',
         enhancePrompt:false,
         enableUpsample:false,
         watermark:false,
@@ -10240,7 +10272,40 @@ function renderVideoBody(node){
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
     sanitizeVideoNodeProviderModel(node);
-    node.model = node.model || 'veo3-fast';
+    const isAutoDL = isAutoDLVideoProvider(node.apiProvider) && window.AutoDLVideo;
+    const autodlRefs = ordered.flatMap(src => src.refs || []).filter(ref => ref?.url);
+    const autodlImages = autodlRefs.filter(ref => mediaKindForRef(ref) === 'image').map(ref => ref.url);
+    const autodlAudios = autodlRefs.filter(ref => mediaKindForRef(ref) === 'audio').map(ref => ref.url);
+    const autodlVideos = autodlRefs.filter(ref => mediaKindForRef(ref) === 'video').map(ref => ref.url);
+    const autodlPrompt = ordered.map(src => src.prompt).filter(Boolean).join('\n\n');
+    const autodlResolutionBase = String(node.resolution || '768p').replace(/(横|竖|1:1)$/, '');
+    const autodlResolved = isAutoDL ? window.AutoDLVideo.resolveWorkflow({
+        prompt:autodlPrompt,
+        duration:Number(node.duration || 5),
+        images:autodlImages,
+        audios:autodlAudios,
+        videos:autodlVideos,
+        firstLast:Boolean(node.useFrameRoles),
+        mode:node.workflowMode || 'auto',
+        workflowId:node.workflowId || ''
+    }, autodlWorkflows) : null;
+    const autodlWorkflow = autodlWorkflows.find(item => item.workflow_id === autodlResolved?.workflowId) || null;
+    const autodlResolution = isAutoDL && autodlWorkflow
+        ? window.AutoDLVideo.resolutionValue(autodlResolutionBase, node.aspectRatio || '16:9', autodlWorkflow)
+        : {value:'', adjusted:false, reason:'', error:''};
+    if(isAutoDL && autodlResolved){
+        node.resolvedWorkflowId = autodlResolved.workflowId || 'minimax_h3_lightx2v_v5';
+        node.resolvedWorkflowReason = autodlResolved.reason || '';
+        node.model = node.resolvedWorkflowId;
+        if(autodlResolution.adjusted && autodlResolution.value){
+            node.resolution = autodlResolution.value.replace(/(横|竖|1:1)$/, '');
+        }
+    } else {
+        node.model = node.model || 'veo3-fast';
+    }
+    const durationMax = isAutoDL && node.workflowMode === 'manual' ? Number(autodlResolved?.maxDuration || 15) : (isAutoDL ? 15 : 60);
+    const workflowReason = [autodlResolved?.reason, autodlResolution.reason].filter(Boolean).join(' · ');
+    const workflowError = autodlResolved?.error || autodlResolution.error || '';
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
         <div class="video-input-head">
@@ -10254,19 +10319,26 @@ function renderVideoBody(node){
         <div class="gen-settings">
             <div class="gen-settings-row">
                 <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider)}</select>
-                <select class="select-lite video-model" style="flex:2">${videoModelOptions(node.model, node.apiProvider)}</select>
+                <label class="field" style="flex:2;min-width:0">
+                    <div class="setting-title video-model-title">${isAutoDL ? '工作流' : '模型'}</div>
+                    <select class="select-lite video-model">${isAutoDL ? autodlWorkflowOptions(node) : videoModelOptions(node.model, node.apiProvider)}</select>
+                </label>
             </div>
+            ${isAutoDL ? `<div class="autodl-workflow-summary">
+                <div class="autodl-workflow-reason ${workflowError ? 'is-error' : ''}">${escapeHtml(workflowError || workflowReason || '自动选择会根据素材与时长切换工作流')}</div>
+                <div class="autodl-media-counts">图片 ${autodlImages.length}/9 · 音频 ${autodlAudios.length}/3 · 视频 ${autodlVideos.length}/0 · 当前 ${escapeHtml(autodlResolved?.name || node.resolvedWorkflowId || '')}</div>
+            </div>` : ''}
             <div class="gen-settings-row">
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoDuration')}</div>
-                    <input class="setting-input video-duration" type="number" min="1" max="60" step="1" value="${Number(node.duration || 5)}">
+                    <input class="setting-input video-duration" type="number" min="1" max="${durationMax}" step="1" value="${Number(node.duration || 5)}">
                 </label>
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoAspect')}</div>
                     <select class="select-lite video-aspect compact-select">
                         <option value="16:9">16:9</option>
                         <option value="9:16">9:16</option>
-                        <option value="1:1">1:1</option>
+                        <option value="1:1" ${isAutoDL && autodlResolved && !autodlResolved.supportsSquare ? 'disabled' : ''}>1:1</option>
                         <option value="4:3">4:3</option>
                         <option value="3:4">3:4</option>
                         <option value="21:9">21:9</option>
@@ -10278,15 +10350,18 @@ function renderVideoBody(node){
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoResolution')}</div>
                     <select class="select-lite video-resolution compact-select">
-                        <option value="">Auto</option>
+                        ${isAutoDL ? '' : '<option value="">Auto</option>'}
                         <option value="480p">480p</option>
-                        <option value="720p">720p</option>
-                        <option value="1080p">1080p</option>
-                        <option value="780P">780P</option>
+                        ${isAutoDL ? '<option value="768p">768p</option>' : '<option value="720p">720p</option>'}
+                        <option value="1080p" ${isAutoDL && autodlResolved?.maxResolution !== '1080p' ? 'disabled' : ''}>1080p</option>
+                        ${isAutoDL ? '' : '<option value="780P">780P</option>'}
                     </select>
                 </label>
             </div>
             <div class="gen-settings-row" style="flex-wrap:wrap">
+                ${isAutoDL ? `
+                <button type="button" class="setting-check ${node.useFrameRoles ? 'active' : ''}" data-video-toggle="useFrameRoles"><span class="check-dot"></span>${tr('canvas.videoFirstLastFrames')}</button>
+                ` : `
                 <button type="button" class="setting-check ${node.enhancePrompt ? 'active' : ''}" data-video-toggle="enhancePrompt"><span class="check-dot"></span>${tr('canvas.videoEnhancePrompt')}</button>
                 <button type="button" class="setting-check ${node.enableUpsample ? 'active' : ''}" data-video-toggle="enableUpsample"><span class="check-dot"></span>${tr('canvas.videoUpsample')}</button>
                 <button type="button" class="setting-check ${node.watermark ? 'active' : ''}" data-video-toggle="watermark"><span class="check-dot"></span>${tr('canvas.videoWatermark')}</button>
@@ -10294,6 +10369,7 @@ function renderVideoBody(node){
                 <button type="button" class="setting-check ${node.generateAudio ? 'active' : ''}" data-video-toggle="generateAudio"><span class="check-dot"></span>${tr('canvas.videoGenerateAudio')}</button>
                 <button type="button" class="setting-check ${node.multimodal ? 'active' : ''}" data-video-toggle="multimodal"><span class="check-dot"></span>${tr('canvas.videoMultimodal')}</button>
                 <button type="button" class="setting-check ${node.useFrameRoles ? 'active' : ''}" data-video-toggle="useFrameRoles"><span class="check-dot"></span>${tr('canvas.videoFirstLastFrames')}</button>
+                `}
             </div>
         </div>
         <div class="gen-run-row">
@@ -10319,15 +10395,32 @@ function renderVideoBody(node){
         e.stopPropagation();
         node.apiProvider = e.target.value;
         const models = providerVideoModels(node.apiProvider);
-        if(!models.includes(node.model)) node.model = models[0] || node.model;
-        modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
+        if(isAutoDLVideoProvider(node.apiProvider)){
+            node.workflowMode = 'auto';
+            node.workflowId = '';
+            node.resolvedWorkflowId = 'minimax_h3_lightx2v_v5';
+            node.resolvedWorkflowReason = '默认多图参考工作流';
+            node.model = 'minimax_h3_lightx2v_v5';
+            node.resolution = node.resolution || '768p';
+        } else if(!models.includes(node.model)) node.model = models[0] || node.model;
+        render();
         scheduleSave();
     };
-    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); };
-    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
-    durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(60, Number(node.duration || 5)))); };
-    aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; scheduleSave(); };
-    resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; scheduleSave(); };
+    modelSelect.onchange = e => {
+        e.stopPropagation();
+        if(isAutoDLVideoProvider(node.apiProvider)){
+            node.workflowId = e.target.value;
+            if(node.workflowId) node.workflowMode = 'manual';
+            else node.workflowMode = 'auto';
+        } else node.model = e.target.value;
+        render();
+        scheduleSave();
+    };
+    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(durationMax, Number(e.target.value || 5))); scheduleSave(); };
+    durationSelect.onchange = () => { if(isAutoDLVideoProvider(node.apiProvider)) render(); };
+    durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(durationMax, Number(node.duration || 5)))); };
+    aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; if(isAutoDLVideoProvider(node.apiProvider)) render(); scheduleSave(); };
+    resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; if(isAutoDLVideoProvider(node.apiProvider)) render(); scheduleSave(); };
     wrap.querySelectorAll('[data-video-toggle]').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = e => {

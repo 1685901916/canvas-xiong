@@ -25,7 +25,7 @@ assert.match(css, /\.canvas-video-capture/);
 assert.match(css, /\.canvas-video-capture-menu/);
 assert.match(i18nLoader, /2026\.07\.17\.media-tools\.3/);
 assert.match(html, /canvas\.css\?v=2026\.07\.17-media-tools-3/);
-assert.match(html, /canvas\.js\?v=2026\.07\.21-api-defaults-1/);
+assert.match(html, /canvas\.js\?v=2026\.08\.24-autodl-h3-1/);
 
 for(const key of [
   'canvas.captureVideoFrame',

@@ -64,6 +64,7 @@ let rhWorkflowEditorZoom = document.getElementById('rhWorkflowEditorZoom');
 const imageModelList = document.getElementById('imageModelList');
 const chatModelList = document.getElementById('chatModelList');
 const videoModelList = document.getElementById('videoModelList');
+const autodlStatus = document.getElementById('autodlStatus');
 const msLoraBlock = document.getElementById('msLoraBlock');
 const msLoraList = document.getElementById('msLoraList');
 const recommendApiOverlay = document.getElementById('recommendApiOverlay');
@@ -2527,6 +2528,7 @@ function handleProviderDragEnd(){
 function renderEditor(){
     const item = provider();
     if(!item) return;
+    const isAutoDL = item.id === 'autodl';
     editorTitle.textContent = item.name || item.id;
     nameInput.value = item.name || '';
     idInput.value = item.id || '';
@@ -2550,6 +2552,8 @@ function renderEditor(){
         imageEditRouteInput.value = normalizeImageEditRoute(item.image_edit_route);
         imageEditRouteInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
     }
+    const apiKeyField = document.querySelector('.api-key-field');
+    if(apiKeyField) apiKeyField.hidden = isAutoDL;
     keyInput.value = '';
     keyInput.placeholder = item.has_key ? `${tr('api.keepCurrentKey')} ${item.key_preview || ''}` : tr('api.enterKey');
     keyHint.textContent = item.has_key ? `${tr('api.keySaved')}${item.key_env || 'API/.env'}` : tr('api.noKey');
@@ -2560,6 +2564,13 @@ function renderEditor(){
     const isJimeng = String(protocolInput?.value || item.protocol || '').toLowerCase() === 'jimeng';
     const isCodex = String(protocolInput?.value || item.protocol || '').toLowerCase() === 'codex';
     const isGeminiCli = String(protocolInput?.value || item.protocol || '').toLowerCase() === 'gemini-cli';
+    if(isAutoDL){
+        item.base_url = 'https://autodl.art';
+        item.protocol = 'autodl';
+        keyInput.value = '';
+        keyInput.placeholder = 'AutoDL Token 仅由后端环境读取';
+        keyHint.textContent = '请配置 AUTODL_TOKEN 或 .env.autodl；页面不会接收或回显 Token';
+    }
     if(isRunningHub){
         item.image_models = unique([...(item.image_models || []), ...RH_DEFAULT_IMAGE_MODELS]);
         ensureRunningHubLists(item);
@@ -3767,10 +3778,28 @@ async function loadProviders(){
         providers = data.providers || [];
         selectedId = sortedProviders()[0]?.id || '';
         renderEditor();
+        await loadAutoDLStatus();
         openRecommendApi();
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));
+    }
+}
+async function loadAutoDLStatus(){
+    if(!autodlStatus) return;
+    autodlStatus.textContent = '正在检查连接…';
+    try {
+        const data = await fetch('/api/autodl/status').then(async response => {
+            if(!response.ok) throw new Error('status request failed');
+            return response.json();
+        });
+        autodlStatus.textContent = data.authenticated
+            ? '已连接（检查未提交付费任务）'
+            : data.configured
+            ? '鉴权失败，请检查后端 AUTODL_TOKEN 配置'
+            : '未配置，请在后端设置 AUTODL_TOKEN 或 .env.autodl';
+    } catch(_) {
+        autodlStatus.textContent = '连接检查失败';
     }
 }
 async function saveProviders(){
@@ -3778,7 +3807,9 @@ async function saveProviders(){
     providers.forEach(item => {
         item.id = normalizeId(item.id);
         applyLockedRecommendedProtocol(item);
-        item.protocol = item.id === 'runninghub'
+        item.protocol = item.id === 'autodl'
+            ? 'autodl'
+            : item.id === 'runninghub'
             ? 'runninghub'
             : item.id === 'volcengine'
             ? 'volcengine'
@@ -3845,7 +3876,7 @@ async function saveProviders(){
                 id:item.id,
                 name:item.name,
                 base_url:item.base_url,
-                protocol:(item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : (item.protocol || 'openai'),
+                protocol:item.id === 'autodl' ? 'autodl' : (item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : (item.protocol || 'openai'),
                 image_request_mode:item.image_request_mode || 'openai',
                 image_edit_route:item.image_edit_route || 'general',
                 image_generation_endpoint:item.image_generation_endpoint || '',
@@ -3866,9 +3897,9 @@ async function saveProviders(){
                 volcengine_region:item.id === 'volcengine' ? (item.volcengine_region || VOLCENGINE_DEFAULT_REGION) : '',
                 volcengine_access_key_id:item.volcengine_access_key_id || undefined,
                 volcengine_secret_access_key:item.volcengine_secret_access_key || undefined,
-                api_key:item.api_key || undefined,
+                api_key:item.id === 'autodl' ? undefined : (item.api_key || undefined),
                 wallet_api_key:item.wallet_api_key || undefined,
-                clear_key:item._clearKey === true,
+                clear_key:item.id === 'autodl' ? false : item._clearKey === true,
                 clear_wallet_key:item._clearWalletKey === true,
                 clear_volcengine_access_key_id:item._clearVolcengineAccessKey === true,
                 clear_volcengine_secret_access_key:item._clearVolcengineSecretKey === true

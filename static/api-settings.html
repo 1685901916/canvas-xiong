@@ -323,6 +323,17 @@
                         </div>
                     </section>
 
+                    <section class="block autodl-status-block">
+                        <div class="block-head">
+                            <div>
+                                <div class="block-title">AutoDL 视频生成</div>
+                                <div class="block-desc">凭证仅从后端环境变量 <span class="inline-code">AUTODL_TOKEN</span> 或 <span class="inline-code">.env.autodl</span> 读取，页面不会显示或保存 Token。</div>
+                            </div>
+                            <button class="action-btn" type="button" onclick="loadAutoDLStatus()"><i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i><span>检查连接</span></button>
+                        </div>
+                        <div id="autodlStatus" class="block-desc">正在检查连接…</div>
+                    </section>
+
                     <div id="modelsHead" class="block models-toolbar">
                         <div>
                             <div class="block-title" data-i18n="api.modelsTitle">模型列表</div>
