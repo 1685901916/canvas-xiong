@@ -12,13 +12,15 @@ assert.match(html, /id="outputVideoCaptureMenu"/);
 assert.match(html, /data-lightbox-video-frame-mode="first"/);
 assert.match(html, /data-lightbox-video-frame-mode="last"/);
 assert.match(html, /data-lightbox-video-frame-mode="current"/);
+assert.match(html, /data-lightbox-video-timeline-reference/);
 assert.match(canvas, /videoFrameBlob\(node, mode, card, explicitVideo=null\)/);
 assert.match(canvas, /explicitVideo \|\| card\?\.querySelector\('video'\)/);
 assert.match(canvas, /video:outputLightboxVideo/);
 assert.match(canvas, /sourceUrl:currentOutputLightboxUrl/);
+assert.match(canvas, /createVideoTimelineReference\(sourceNode, outputVideoCaptureBtn/);
 assert.match(canvas, /outputVideoCaptureWrap\.style\.display = videoMode && hasSource/);
 assert.match(canvas, /syncOutputMediaToolVisibility\(false, null, ''\)/);
-assert.match(canvas, /kind:'frameCapture'/);
+assert.doesNotMatch(canvas, /connections\.push\([^\n]+kind:'frameCapture'/);
 assert.match(css, /\.output-action-menu/);
 
 console.log('video lightbox frame capture tests passed');

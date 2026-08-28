@@ -143,7 +143,9 @@
   function workflowOptions(workflows) {
     return list(workflows).map((workflow) => ({
       value: workflow.workflow_id,
-      label: workflow.name || workflow.workflow_id,
+      label: workflow.name
+        ? `${workflow.name} · ${workflow.workflow_id}`
+        : workflow.workflow_id,
       workflow,
     }));
   }

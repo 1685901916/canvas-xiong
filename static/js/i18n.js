@@ -1,5 +1,5 @@
 (function(){
-    const VERSION = '2026.07.17.media-tools.3';
+    const VERSION = '2026.08.27.timeline-storyboard.2';
     const scripts = [
         '/static/js/i18n-core.js',
         '/static/js/i18n/common.js',

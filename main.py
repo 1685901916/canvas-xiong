@@ -33,7 +33,7 @@ from typing import List, Dict, Any, Optional, Tuple, Literal
 from threading import BoundedSemaphore, Lock, Thread
 import httpx
 import autodl_support as autodl
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
 from fastapi.exceptions import RequestValidationError
@@ -188,6 +188,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
+CANVAS_RUNTIME_VERSION = "2026.08.27-autodl-err-fix-6"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -289,7 +290,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "autodl"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "autodl", "minimax"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -385,11 +386,36 @@ RUNNINGHUB_DEFAULT_IMAGE_MODELS = [
     "nano-banana/edit-official-stable",
 ]
 RUNNINGHUB_DEFAULT_VIDEO_MODELS = [
-    "google/veo3.1-fast/text-to-video-channel-low-price",
-    "sora-2/text-to-video-official-stable",
-    "seedance-2.0-global/text-to-video",
-    "seedance-2.0-global/image-to-video",
+    "rhart-video/sparkvideo-2.0/multimodal-video",
+    "bytedance/seedance-2.5-global-token/multimodal-video",
+    "bytedance/seedance-2.5-token/image-to-video",
+    "minimax/hailuo-h3/multimodal-to-video",
+    "minimax/hailuo-h3/image-to-video",
+    "minimax/hailuo-h3/text-to-video",
+    "kling-v3.0-pro/image-to-video",
+    "kling-v3.0-pro/text-to-video",
+    "kling-video-o3-pro/reference-to-video",
+    "vidu/start-end-to-video-q3-pro",
+    "vidu/reference-to-video-q3",
+    "rhart-video-v3.1-fast-official/text-to-video",
+    "rhart-video-v3.1-pro-official/text-to-video",
 ]
+RUNNINGHUB_DEFAULT_VIDEO_MODEL_NAMES = {
+    "rhart-video-v3.1-fast-official/text-to-video": "Google Veo 3.1 Fast · 文生视频",
+    "rhart-video-v3.1-pro-official/text-to-video": "Google Veo 3.1 Pro · 文生视频",
+    "kling-v3.0-pro/text-to-video": "可灵 3.0 Pro · 文生视频",
+    "kling-v3.0-pro/image-to-video": "可灵 3.0 Pro · 图生视频",
+    "minimax/hailuo-h3/text-to-video": "MiniMax H3 · 文生视频",
+    "minimax/hailuo-h3/image-to-video": "MiniMax H3 · 首尾帧",
+    "minimax/hailuo-h3/multimodal-to-video": "MiniMax H3 · 多模态参考生视频",
+    "bytedance/seedance-2.5-global-token/multimodal-video": "Seedance 2.5 · 多模态生视频",
+    "bytedance/seedance-2.5-token/image-to-video": "Seedance 2.5 · 图生视频",
+    "bytedance/seedance-2.0-global/multimodal-video": "Seedance 2.0 · 多模态生视频",
+    "rhart-video/sparkvideo-2.0/multimodal-video": "Seedance 2.0 · 多模态生视频",
+    "vidu/start-end-to-video-q3-pro": "Vidu Q3 Pro · 首尾帧",
+    "kling-video-o3-pro/reference-to-video": "可灵 O3 Pro · 参考生视频",
+    "vidu/reference-to-video-q3": "Vidu Q3 · 参考生视频",
+}
 RUNNINGHUB_MODEL_ENDPOINT_ALIASES = {
     "gpt-image-2.0/text-to-image-channel-low-price": "rhart-image-g-2/text-to-image",
     "gpt-image-2/text-to-image-channel-low-price": "rhart-image-g-2/text-to-image",
@@ -579,6 +605,8 @@ MODELSCOPE_DEFAULT_LORAS = [
 ]
 MODELSCOPE_DEFAULTS_VERSION = 3
 APIMART_DEFAULT_BASE_URL = "https://api.apimart.ai"
+MINIMAX_DEFAULT_BASE_URL = "https://api.minimaxi.com"
+MINIMAX_DEFAULT_VIDEO_MODELS = ["MiniMax-H3"]
 APIMART_DEFAULT_IMAGE_MODELS = [
     "gpt-4o-image",
     "gpt-image-2",
@@ -705,6 +733,8 @@ def provider_key_env(provider_id):
         return "RUNNINGHUB_API_KEY"
     if provider_id == "volcengine":
         return "ARK_API_KEY"
+    if provider_id == "minimax":
+        return "MINIMAX_API_KEY"
     return f"API_PROVIDER_{re.sub(r'[^A-Za-z0-9]', '_', provider_id).upper()}_KEY"
 
 def runninghub_wallet_key_env():
@@ -798,6 +828,22 @@ def default_api_providers():
             "ms_defaults_version": 0,
         },
         {
+            "id": "minimax",
+            "name": "MiniMax 官方",
+            "base_url": MINIMAX_DEFAULT_BASE_URL,
+            "protocol": "minimax",
+            "image_request_mode": "openai",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
+            "enabled": True,
+            "primary": False,
+            "image_models": [],
+            "chat_models": [],
+            "video_models": list(MINIMAX_DEFAULT_VIDEO_MODELS),
+            "ms_loras": [],
+            "ms_defaults_version": 0,
+        },
+        {
             "id": "modelscope",
             "name": "ModelScope",
             "base_url": MODELSCOPE_CHAT_BASE_URL,
@@ -825,7 +871,7 @@ def default_api_providers():
             "primary": False,
             "image_models": [],
             "chat_models": [],
-            "video_models": [],
+            "video_models": list(RUNNINGHUB_DEFAULT_VIDEO_MODELS),
             "ms_loras": [],
             "ms_defaults_version": 0,
             "rh_apps": RUNNINGHUB_DEFAULT_APPS,
@@ -880,6 +926,18 @@ def merge_default_api_providers(providers, inject_missing=True):
                 "protocol": "autodl",
                 "video_models": list(autodl.WORKFLOWS),
             })
+    minimax_default = next((d for d in default_api_providers() if d["id"] == "minimax"), None)
+    if minimax_default:
+        current = next((item for item in merged if item.get("id") == "minimax"), None)
+        if not current:
+            merged.insert(1, minimax_default)
+        else:
+            current.update({
+                "name": "MiniMax 官方",
+                "base_url": MINIMAX_DEFAULT_BASE_URL,
+                "protocol": "minimax",
+                "video_models": list(MINIMAX_DEFAULT_VIDEO_MODELS),
+            })
     # 强制保留独立入口平台（不再强制 comfly）
     ms_default = next((d for d in default_api_providers() if d["id"] == "modelscope"), None)
     if ms_default:
@@ -910,9 +968,10 @@ def merge_default_api_providers(providers, inject_missing=True):
                 current["base_url"] = rh_default["base_url"]
             if not current.get("protocol") or current.get("protocol") == "openai":
                 current["protocol"] = "runninghub"
-            current["image_models"] = model_list_from_values(current.get("image_models") or [])
+            current["image_models"] = model_list_from_values([*RUNNINGHUB_DEFAULT_IMAGE_MODELS, *(current.get("image_models") or [])])
             current["chat_models"] = model_list_from_values(current.get("chat_models") or [])
-            current["video_models"] = model_list_from_values(current.get("video_models") or [])
+            current["video_models"] = model_list_from_values([*RUNNINGHUB_DEFAULT_VIDEO_MODELS, *(current.get("video_models") or [])])
+            current["model_names"] = normalize_model_name_map({**RUNNINGHUB_DEFAULT_VIDEO_MODEL_NAMES, **(current.get("model_names") or {})})
             current["rh_apps"] = merge_runninghub_system_entries(rh_default.get("rh_apps") or [], current.get("rh_apps") or [], "app")
             current["rh_workflows"] = merge_runninghub_system_entries(rh_default.get("rh_workflows") or [], current.get("rh_workflows") or [], "workflow")
     volc_default = next((d for d in default_api_providers() if d["id"] == "volcengine"), None)
@@ -1334,6 +1393,9 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
+    if provider_id == "minimax":
+        protocol = "minimax"
+        base_url = base_url or MINIMAX_DEFAULT_BASE_URL
     if provider_id == "autodl":
         protocol = "autodl"
         base_url = autodl.DEFAULT_BASE_URL
@@ -1784,6 +1846,21 @@ def sync_static_html_versions():
                 print(f"同步静态页面版本号失败({name}): {e}")
     except Exception as e:
         print(f"同步静态页面版本号失败: {e}")
+    canvas_path = os.path.join(STATIC_DIR, "canvas.html")
+    try:
+        with open(canvas_path, "r", encoding="utf-8") as f:
+            canvas_html = f.read()
+        canvas_version = urllib.parse.quote(CANVAS_RUNTIME_VERSION, safe="._-")
+        for asset in ("/static/css/canvas.css", "/static/js/autodl-video.js", "/static/js/canvas.js"):
+            canvas_html = re.sub(
+                rf'({re.escape(asset)}\?v=)[^"\'`\s<>)]*',
+                rf'\g<1>{canvas_version}',
+                canvas_html,
+            )
+        with open(canvas_path, "w", encoding="utf-8", newline="") as f:
+            f.write(canvas_html)
+    except Exception as e:
+        print(f"同步画布运行时版本号失败: {e}")
 
 def static_html_response(filename: str):
     path = os.path.join(STATIC_DIR, filename)
@@ -5923,6 +6000,11 @@ def is_volcengine_provider(provider):
 def is_runninghub_provider(provider):
     return provider_protocol(provider) == "runninghub" or str((provider or {}).get("id") or "").strip().lower() == "runninghub"
 
+def is_minimax_provider(provider):
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return provider_protocol(provider) == "minimax" or provider_id == "minimax" or "api.minimaxi.com" in base_url
+
 def is_jimeng_provider(provider):
     return provider_protocol(provider) == "jimeng" or str((provider or {}).get("id") or "").strip().lower() == "jimeng"
 
@@ -8570,6 +8652,239 @@ def media_preview_cache_paths(path: str, width: int):
 def is_video_preview_file(path: str) -> bool:
     return os.path.splitext(str(path or "").split("?", 1)[0])[1].lower() in {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv"}
 
+
+class VideoTimelineReferenceRequest(BaseModel):
+    url: str
+    interval: float = Field(default=1.0, ge=0.25, le=10.0)
+
+
+def timeline_reference_timestamps(duration: float, interval: float = 1.0) -> List[float]:
+    """Return whole-interval samples plus a frame close to the real video tail."""
+    duration = max(0.0, float(duration or 0.0))
+    interval = max(0.25, min(10.0, float(interval or 1.0)))
+    if duration <= 0.05:
+        return [0.0]
+    samples = []
+    cursor = 0.0
+    # A five-minute clip at one frame per second is already a large reference table.
+    while cursor < duration and len(samples) < 301:
+        samples.append(round(cursor, 3))
+        cursor += interval
+    tail = round(max(0.0, duration - 0.05), 3)
+    if tail - samples[-1] >= 0.025:
+        samples.append(tail)
+    return samples
+
+
+def timeline_reference_time_label(seconds: float) -> str:
+    return f"{max(0.0, float(seconds or 0.0)) + 1e-9:.1f}s"
+
+
+def timeline_reference_cache_key(path: str, interval: float = 1.0) -> str:
+    stat_result = os.stat(path)
+    seed = f"{os.path.abspath(path)}|{stat_result.st_mtime_ns}|{stat_result.st_size}|{float(interval):.3f}|v3-compact-storyboard"
+    return hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()
+
+
+def build_timeline_reference_storyboard(
+    frame_paths: List[str], labels: List[str], output_path: str
+) -> Dict[str, int]:
+    """Compose every extracted frame into one chronological, seconds-labelled image."""
+    if not frame_paths:
+        raise ValueError("时间参考表没有可拼接的帧")
+    images = []
+    try:
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as source:
+                images.append(ImageOps.exif_transpose(source).convert("RGB").copy())
+        count = len(images)
+        if count <= 25:
+            target_long = 320
+            # Near-square grid keeps thumbnails readable inside the node while
+            # a padded final row removes the large empty block for prime counts.
+            columns = max(1, math.ceil(math.sqrt(count)))
+        elif count <= 100:
+            target_long, columns = 220, min(8, count)
+        else:
+            target_long, columns = 140, min(10, count)
+        source_width, source_height = images[0].size
+        scale = target_long / max(1, max(source_width, source_height))
+        image_width = max(1, round(source_width * scale))
+        image_height = max(1, round(source_height * scale))
+        padding, gap, margin = 8, 12, 16
+        panel_width = image_width + padding * 2
+        panel_height = image_height + padding * 2
+        rows = math.ceil(count / columns)
+        padded_count = rows * columns
+        canvas_width = margin * 2 + columns * panel_width + max(0, columns - 1) * gap
+        canvas_height = margin * 2 + rows * panel_height + max(0, rows - 1) * gap
+        storyboard = Image.new("RGB", (canvas_width, canvas_height), "#eef2f7")
+        draw = ImageDraw.Draw(storyboard)
+        try:
+            font = ImageFont.load_default(size=max(14, min(24, round(target_long * 0.07))))
+        except TypeError:
+            font = ImageFont.load_default()
+        for index in range(padded_count):
+            row, column = divmod(index, columns)
+            x = margin + column * (panel_width + gap)
+            y = margin + row * (panel_height + gap)
+            fill = "#0f172a"
+            if index >= count:
+                # Neutral placeholder so the composition reads as one continuous
+                # board instead of leaving a blank gap in the final row.
+                fill = "#111a2b"
+            draw.rounded_rectangle(
+                (x, y, x + panel_width - 1, y + panel_height - 1),
+                radius=10,
+                fill=fill,
+            )
+            if index >= count:
+                continue
+            image = images[index]
+            resized = image.resize((image_width, image_height), Image.Resampling.LANCZOS)
+            storyboard.paste(resized, (x + padding, y + padding))
+            label = str(labels[index] if index < len(labels) else "")
+            if label:
+                text_box = draw.textbbox((0, 0), label, font=font)
+                text_width = text_box[2] - text_box[0]
+                text_height = text_box[3] - text_box[1]
+                label_x = x + padding + 6
+                label_y = y + padding + image_height - text_height - 10
+                draw.rounded_rectangle(
+                    (label_x - 5, label_y - 4, label_x + text_width + 5, label_y + text_height + 4),
+                    radius=5,
+                    fill="#0f172ae6",
+                )
+                draw.text((label_x, label_y), label, fill="white", font=font)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        storyboard.save(output_path, format="JPEG", quality=90, optimize=True)
+        return {
+            "width": canvas_width,
+            "height": canvas_height,
+            "frame_count": count,
+            "columns": columns,
+            "rows": rows,
+            "padded_count": padded_count,
+        }
+    finally:
+        for image in images:
+            image.close()
+
+
+def probe_video_timeline_media(path: str) -> Dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("未找到 ffprobe，无法读取视频信息")
+    command = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
+        "-of", "json", path,
+    ]
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "无法读取视频信息").strip()[:300])
+    payload = json.loads(proc.stdout or "{}")
+    streams = payload.get("streams") or []
+    stream = streams[0] if streams else {}
+    duration = float((payload.get("format") or {}).get("duration") or 0.0)
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    rate = str(stream.get("avg_frame_rate") or "0/1")
+    numerator, _, denominator = rate.partition("/")
+    fps = float(numerator or 0) / max(1.0, float(denominator or 1))
+    if duration <= 0 or width <= 0 or height <= 0:
+        raise RuntimeError("视频时长或分辨率无效")
+    return {"duration": duration, "width": width, "height": height, "fps": fps}
+
+
+def build_video_timeline_reference(path: str, interval: float = 1.0) -> Dict[str, Any]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未找到 ffmpeg，无法拆分视频")
+    media = probe_video_timeline_media(path)
+    timestamps = timeline_reference_timestamps(media["duration"], interval)
+    cache_key = timeline_reference_cache_key(path, interval)
+    target_dir = os.path.join(OUTPUT_OUTPUT_DIR, "timeline_references", cache_key)
+    manifest_path = os.path.join(target_dir, "manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                cached = json.load(handle)
+            storyboard_path = os.path.join(target_dir, "storyboard.jpg")
+            if cached.get("frames") and cached.get("storyboard_url") and os.path.isfile(storyboard_path) and all(
+                os.path.isfile(os.path.join(target_dir, os.path.basename(str(frame.get("url") or ""))))
+                for frame in cached["frames"]
+            ):
+                return cached
+        except (OSError, ValueError, TypeError):
+            pass
+
+    os.makedirs(target_dir, exist_ok=True)
+    frame_paths = [os.path.join(target_dir, f"frame_{index:04d}.jpg") for index in range(len(timestamps))]
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    # Repeated seekable inputs keep this to one ffmpeg process while extracting exact requested moments.
+    for timestamp in timestamps:
+        command.extend(["-ss", f"{timestamp:.3f}", "-i", path])
+    for index, frame_path in enumerate(frame_paths):
+        command.extend([
+            "-map", f"{index}:v:0", "-frames:v", "1", "-an",
+            "-vf", "scale='min(640,iw)':-2", "-q:v", "3", frame_path,
+        ])
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=max(120, len(timestamps) * 20))
+    if proc.returncode != 0 or not all(os.path.isfile(item) and os.path.getsize(item) > 0 for item in frame_paths):
+        raise RuntimeError((proc.stderr or "ffmpeg 未能完成视频拆帧").strip()[:500])
+
+    with Image.open(frame_paths[0]) as first_frame:
+        frame_width, frame_height = first_frame.size
+    frames = []
+    for timestamp, frame_path in zip(timestamps, frame_paths):
+        relative = os.path.relpath(frame_path, OUTPUT_OUTPUT_DIR).replace("\\", "/")
+        frames.append({
+            "time": timestamp,
+            "label": timeline_reference_time_label(timestamp),
+            "url": f"/assets/output/{relative}",
+        })
+    storyboard_path = os.path.join(target_dir, "storyboard.jpg")
+    storyboard = build_timeline_reference_storyboard(
+        frame_paths,
+        [frame["label"] for frame in frames],
+        storyboard_path,
+    )
+    storyboard_relative = os.path.relpath(storyboard_path, OUTPUT_OUTPUT_DIR).replace("\\", "/")
+    result = {
+        "duration": round(media["duration"], 3),
+        "width": media["width"],
+        "height": media["height"],
+        "fps": round(media["fps"], 3),
+        "frame_width": frame_width,
+        "frame_height": frame_height,
+        "interval": float(interval),
+        "frames": frames,
+        "storyboard_url": f"/assets/output/{storyboard_relative}",
+        "storyboard_width": storyboard["width"],
+        "storyboard_height": storyboard["height"],
+        "storyboard_layout_version": "compact-3",
+    }
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2)
+    return result
+
+
+@app.post("/api/video-timeline-reference")
+async def video_timeline_reference(payload: VideoTimelineReferenceRequest, request: Request):
+    ensure_same_origin_request(request)
+    path = output_file_from_url(payload.url)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="视频文件不存在或尚未保存到本地")
+    if not is_video_preview_file(path):
+        raise HTTPException(status_code=415, detail="所选文件不是支持的视频格式")
+    try:
+        return await asyncio.to_thread(build_video_timeline_reference, path, payload.interval)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="视频拆帧超时") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"视频拆帧失败：{exc}") from exc
+
 def generate_video_preview_image(path: str, width: int) -> Image.Image:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -10823,6 +11138,14 @@ def apimart_upload_raw_file_payload(path: str):
     with open(path, "rb") as fh:
         return os.path.basename(path), fh.read(), content_type_for_path(path)
 
+def async_multipart_file(path: str):
+    """Materialize a local upload as bytes so httpx.AsyncClient gets an async-compatible request stream."""
+    return apimart_upload_raw_file_payload(path)
+
+def async_multipart_form_data(values):
+    """Use mapping-based form fields; tuple iterators create a sync stream in httpx.AsyncClient."""
+    return {str(key): value for key, value in dict(values or {}).items()}
+
 APIMART_UPLOAD_RETRY_ATTEMPTS = 3
 
 def is_transient_tls_error(exc) -> bool:
@@ -11417,6 +11740,45 @@ async def upload_video_to_temp_sh(path: str, source_url: str) -> Dict[str, str]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Temp.sh 上传异常：{exc}") from exc
 
+
+async def upload_video_to_uguu(path: str, source_url: str) -> Dict[str, str]:
+    """上传到 uguu.se（当前环境实测可用的公网图床）。返回公网直链。"""
+    upload_url = os.getenv("UGUU_UPLOAD_URL", "https://uguu.se/upload").strip() or "https://uguu.se/upload"
+    ct = content_type_for_path(path)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=25.0, read=300.0, write=300.0, pool=25.0),
+            follow_redirects=True,
+        ) as client:
+            with open(path, "rb") as fh:
+                files = {"files[]": (os.path.basename(path), fh, ct)}
+                response = await client.post(upload_url, files=files)
+        if not response.is_success:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"uguu.se 上传失败：{response.text[:300]}",
+            )
+        payload = response.json() if response.content else {}
+        files = (payload or {}).get("files") or []
+        first = files[0] if isinstance(files, list) and files else {}
+        direct_url = str(first.get("url") or "").strip() if isinstance(first, dict) else ""
+        if not re.match(r"^https?://", direct_url, re.I):
+            raise HTTPException(
+                status_code=502,
+                detail=f"uguu.se 返回了无法识别的链接：{response.text[:300]}",
+            )
+        return {
+            "url": direct_url,
+            "source": source_url,
+            "name": str(first.get("filename") or "") if isinstance(first, dict) else "",
+            "expires": "1 day",
+            "service": "uguu",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"uguu.se 上传异常：{exc}") from exc
+
 async def upload_local_video_to_cloud(ref_url: str, service: str = "auto") -> Dict[str, str]:
     ref_url = str(ref_url or "").strip()
     if ref_url.startswith("http://") or ref_url.startswith("https://"):
@@ -11427,8 +11789,15 @@ async def upload_local_video_to_cloud(ref_url: str, service: str = "auto") -> Di
         return await upload_video_to_litterbox(path, ref_url)
     if service in {"temp", "temp.sh", "tempsh"}:
         return await upload_video_to_temp_sh(path, ref_url)
+    if service in {"uguu", "uguu.se"}:
+        return await upload_video_to_uguu(path, ref_url)
     errors = []
-    for name, func in (("litterbox", upload_video_to_litterbox), ("temp.sh", upload_video_to_temp_sh)):
+    # uguu.se 在当前环境实测可用，优先；litterbox/temp.sh 作为兜底。
+    for name, func in (
+        ("uguu", upload_video_to_uguu),
+        ("litterbox", upload_video_to_litterbox),
+        ("temp.sh", upload_video_to_temp_sh),
+    ):
         try:
             return await func(path, ref_url)
         except HTTPException as exc:
@@ -12562,7 +12931,7 @@ async def runninghub_model_definition(provider, model):
 
 def runninghub_schema_options(field):
     values = []
-    for item in (field or {}).get("options") or []:
+    for item in (field or {}).get("options") or (field or {}).get("values") or (field or {}).get("enum") or []:
         if isinstance(item, dict):
             value = item.get("value")
         else:
@@ -12577,6 +12946,8 @@ def runninghub_schema_value(field, preferred=None):
     if preferred and (not options or preferred in options):
         return preferred
     default = (field or {}).get("defaultValue")
+    if default is None:
+        default = (field or {}).get("default")
     if default is not None and str(default) != "":
         return default
     return options[0] if options else preferred
@@ -12586,7 +12957,7 @@ def runninghub_schema_field(params, *keys):
     for field in params or []:
         if not isinstance(field, dict):
             continue
-        names = {str(field.get("fieldKey") or "").lower(), str(field.get("label") or "").lower()}
+        names = {str(field.get("fieldKey") or "").lower(), str(field.get("label") or "").lower(), str(field.get("key") or "").lower(), str(field.get("name") or "").lower()}
         if names & wanted:
             return field
     return None
@@ -13146,6 +13517,26 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
                 body[key] = image_urls
             else:
                 body[key] = image_urls[0]
+        video_field = runninghub_schema_field(params, "videoUrls", "videoUrl", "referenceVideos")
+        if video_field:
+            video_urls = []
+            for video_ref in (payload.videos or [])[:3]:
+                up = await runninghub_upload_reference(client, provider, {"url": str(video_ref or "")})
+                if up and str(up).startswith(("http://", "https://")):
+                    video_urls.append(up)
+            if video_urls:
+                video_key = str((video_field or {}).get("fieldKey") or "videoUrls")
+                body[video_key] = video_urls if str(video_key).endswith("s") or (video_field or {}).get("multipleInputs") else video_urls[0]
+        audio_field = runninghub_schema_field(params, "audioUrls", "audioUrl", "referenceAudios")
+        if audio_field:
+            audio_urls = []
+            for audio_ref in (payload.audios or [])[:3]:
+                up = await runninghub_upload_reference(client, provider, {"url": str(audio_ref or "")})
+                if up and str(up).startswith(("http://", "https://")):
+                    audio_urls.append(up)
+            if audio_urls:
+                audio_key = str((audio_field or {}).get("fieldKey") or "audioUrls")
+                body[audio_key] = audio_urls if str(audio_key).endswith("s") or (audio_field or {}).get("multipleInputs") else audio_urls[0]
         runninghub_apply_schema_defaults(body, params)
         response = await client.post(endpoint, headers=runninghub_json_headers(provider), json=body)
         response.raise_for_status()
@@ -13205,11 +13596,39 @@ async def wait_for_runninghub_openapi_task(client, provider, task_id, output_kin
         if output_kind == "video" and video_output_urls(raw):
             return raw
     raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload or task_id}")
+def runninghub_local_capabilities_params(endpoint):
+    """RunningHub 新端点可能不在官方 models_registry 中，回退到已安装 skill 的完整 catalog。"""
+    candidates = [
+        os.path.join(os.path.expanduser("~"), ".codex", "skills", "runninghub", "data", "capabilities.json"),
+    ]
+    target = str(endpoint or "").strip().lower()
+    target = target.replace("https://www.runninghub.cn/openapi/v2/", "")
+    target = target.replace("/openapi/v2/", "")
+    target = target.replace("openapi/v2/", "")
+    target = target.strip("/")
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        endpoints = data.get("endpoints") if isinstance(data, dict) else data
+        for item in endpoints or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("endpoint") or "").strip().lower() == target:
+                return item.get("params") or []
+    return []
 
-async def generate_runninghub_video(payload, provider):
+async def submit_runninghub_video_task(payload, provider, client):
+    """Submit a RunningHub video task and return immediately with its upstream task id."""
     model_def = await runninghub_model_definition(provider, payload.model)
     endpoint = runninghub_task_endpoint(provider, model_def.get("endpoint") or payload.model)
     params = model_def.get("params") if isinstance(model_def.get("params"), list) else []
+    if not params:
+        params = runninghub_local_capabilities_params(endpoint)
     body = {"prompt": str(payload.prompt or "")}
     aspect = str(payload.aspect_ratio or "16:9").strip() or "16:9"
     if runninghub_schema_field(params, "aspectRatio"):
@@ -13223,7 +13642,13 @@ async def generate_runninghub_video(payload, provider):
         body["size"] = runninghub_schema_value(field, runninghub_size_for_aspect(aspect))
     if runninghub_schema_field(params, "duration"):
         field = runninghub_schema_field(params, "duration")
-        body["duration"] = runninghub_schema_value(field, str(max(1, min(60, int(payload.duration or 5)))))
+        duration_value = runninghub_schema_value(field, str(max(1, min(60, int(payload.duration or 5)))))
+        if str((field or {}).get("type") or "").upper() in {"INT", "INTEGER"}:
+            try:
+                duration_value = int(duration_value)
+            except (TypeError, ValueError):
+                pass
+        body["duration"] = duration_value
     if runninghub_schema_field(params, "resolution"):
         field = runninghub_schema_field(params, "resolution")
         body["resolution"] = runninghub_schema_value(field, str(payload.resolution or "720p").lower())
@@ -13231,33 +13656,71 @@ async def generate_runninghub_video(payload, provider):
         body["generateAudio"] = bool(payload.generate_audio)
     if runninghub_schema_field(params, "watermark"):
         body["watermark"] = bool(payload.watermark)
+    image_urls = []
+    for ref in (payload.images or [])[:10]:
+        ref_url = getattr(ref, "url", "") or ""
+        if ref_url:
+            up = await runninghub_upload_reference(client, provider, {"url": ref_url})
+            if up:
+                image_urls.append(up)
+    if image_urls:
+        image_field = runninghub_schema_field(params, "imageUrls", "imageUrl", "firstFrameImage", "lastFrameImage", "referenceImages")
+        key = str((image_field or {}).get("fieldKey") or "imageUrls")
+        if key in {"firstFrameImage", "first_frame_image"}:
+            body[key] = image_urls[0]
+            last_field = runninghub_schema_field(params, "lastFrameImage", "last_frame_image")
+            if len(image_urls) > 1 and last_field:
+                body[str(last_field.get("fieldKey"))] = image_urls[1]
+        elif key.endswith("s") or (image_field or {}).get("multipleInputs") is True:
+            body[key] = image_urls
+        else:
+            body[key] = image_urls[0]
+
+    video_urls = []
+    for ref_url in (payload.videos or [])[:10]:
+        if ref_url:
+            up = await runninghub_upload_reference(client, provider, {"url": str(ref_url)})
+            if up:
+                video_urls.append(up)
+    if video_urls:
+        video_field = runninghub_schema_field(params, "videoUrls", "videoUrl", "referenceVideos", "referenceVideo")
+        key = str((video_field or {}).get("fieldKey") or "videoUrls")
+        body[key] = video_urls if key.endswith("s") or (video_field or {}).get("multipleInputs") is True else video_urls[0]
+
+    audio_urls = []
+    for ref_url in (payload.audios or [])[:10]:
+        if ref_url:
+            up = await runninghub_upload_reference(client, provider, {"url": str(ref_url)})
+            if up:
+                audio_urls.append(up)
+    if audio_urls:
+        audio_field = runninghub_schema_field(params, "audioUrls", "audioUrl", "referenceAudios", "referenceAudio")
+        key = str((audio_field or {}).get("fieldKey") or "audioUrls")
+        body[key] = audio_urls if key.endswith("s") or (audio_field or {}).get("multipleInputs") is True else audio_urls[0]
+
+    runninghub_apply_schema_defaults(body, params)
+    response = await client.post(endpoint, headers=runninghub_json_headers(provider), json=body)
+    response.raise_for_status()
+    raw = response.json()
+    task_id = runninghub_extract_task_id(raw)
+    immediate_urls = video_output_urls(raw)
+    if not task_id and not immediate_urls:
+        reason = runninghub_fail_reason(raw) or json.dumps(raw, ensure_ascii=False)[:800]
+        raise HTTPException(status_code=502, detail=f"RunningHub 视频提交失败：{reason}")
+    return {
+        "task_id": task_id,
+        "status": "QUEUED" if task_id else "SUCCESS",
+        "videos": immediate_urls,
+        "raw": raw,
+    }
+
+
+async def generate_runninghub_video(payload, provider):
     async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as client:
-        image_urls = []
-        for ref in (payload.images or [])[:10]:
-            ref_url = getattr(ref, "url", "") or ""
-            if ref_url:
-                up = await runninghub_upload_reference(client, provider, {"url": ref_url})
-                if up:
-                    image_urls.append(up)
-        if image_urls:
-            image_field = runninghub_schema_field(params, "imageUrls", "imageUrl", "firstFrameImage", "lastFrameImage", "referenceImages")
-            key = str((image_field or {}).get("fieldKey") or "imageUrls")
-            if key in {"firstFrameImage", "first_frame_image"}:
-                body[key] = image_urls[0]
-                last_field = runninghub_schema_field(params, "lastFrameImage", "last_frame_image")
-                if len(image_urls) > 1 and last_field:
-                    body[str(last_field.get("fieldKey"))] = image_urls[1]
-            elif key.endswith("s") or (image_field or {}).get("multipleInputs") is True:
-                body[key] = image_urls
-            else:
-                body[key] = image_urls[0]
-        runninghub_apply_schema_defaults(body, params)
-        response = await client.post(endpoint, headers=runninghub_json_headers(provider), json=body)
-        response.raise_for_status()
-        raw = response.json()
-        task_id = runninghub_extract_task_id(raw)
-        result = raw
-        if task_id and not video_output_urls(raw):
+        submission = await submit_runninghub_video_task(payload, provider, client)
+        task_id = submission.get("task_id") or ""
+        result = submission.get("raw") or {}
+        if task_id and not submission.get("videos"):
             result = await wait_for_runninghub_openapi_task(client, provider, task_id, "video")
         urls = video_output_urls(result)
         if not urls:
@@ -13336,31 +13799,24 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             local_image_paths = [openai_video_proxy_local_image_path(ref) for ref in refs_for_proxy]
             has_local_images = any(local_image_paths)
             if has_local_images:
-                form_data = [(key, value) for key, value in body.items()]
+                form_data = async_multipart_form_data(body)
+                files = []
                 for ref, local_path in zip(refs_for_proxy, local_image_paths):
                     if local_path:
                         continue
                     url = await openai_video_proxy_public_reference_url(ref)
                     if url:
-                        form_data.append(("images", url))
-                files = []
-                opened = []
-                try:
-                    for local_path in local_image_paths:
-                        if not local_path:
-                            continue
-                        fh = open(local_path, "rb")
-                        opened.append(fh)
-                        files.append(("images", (os.path.basename(local_path), fh, content_type_for_path(local_path))))
-                    response = await client.post(
-                        video_url,
-                        headers=api_headers(json_body=False, provider=provider, model=model),
-                        data=form_data,
-                        files=files,
-                    )
-                finally:
-                    for fh in opened:
-                        fh.close()
+                        files.append(("images", (None, url)))
+                for local_path in local_image_paths:
+                    if not local_path:
+                        continue
+                    files.append(("images", async_multipart_file(local_path)))
+                response = await client.post(
+                    video_url,
+                    headers=api_headers(json_body=False, provider=provider, model=model),
+                    data=form_data,
+                    files=files,
+                )
             else:
                 if refs_for_proxy:
                     body["images"] = [await openai_video_proxy_public_reference_url(ref) for ref in refs_for_proxy]
@@ -14754,16 +15210,65 @@ def public_autodl_media_url(value: str, kind: str) -> str:
     )
 
 
-def build_autodl_canvas_request_body(
+def local_media_data_url(value: str) -> str:
+    """把本地画布媒体文件转成 base64 data URL，避免依赖不稳定的外链图床。
+    AutoDL 的 ref_image_* 实测接受 data:image/...;base64,... 直传。
+    """
+    path = output_file_from_url(value)
+    if not path:
+        return ""
+    mime = content_type_for_path(path)
+    if not mime:
+        return ""
+    try:
+        with open(path, "rb") as stream:
+            payload = base64.b64encode(stream.read()).decode("ascii")
+    except OSError:
+        return ""
+    return f"data:{mime};base64,{payload}"
+
+
+async def public_autodl_media_url_async(value: str, kind: str) -> str:
+    """返回 AutoDL 上游可用的公网媒体 URL。
+    公网/已映射本地地址直接透传；本地画布文件在未配置 PUBLIC_MEDIA_BASE_URL 时
+    自动上传图床（uguu.se 优先）换取公网 URL，base64 仅作兜底。
+    """
+    text = str(value or "").strip()
+    try:
+        return public_autodl_media_url(text, kind)
+    except autodl.AutoDLValidationError:
+        pass
+    if text.startswith(("/output/", "/assets/")) and output_file_from_url(text):
+        # 1) 自动上传图床（uguu.se 优先）拿公网 URL —— AutoDL 真实可用
+        try:
+            uploaded = await upload_local_video_to_cloud(text, "auto")
+            public_url = str((uploaded or {}).get("url") or "").strip()
+            if re.match(r"^https?://", public_url, re.I):
+                return public_url
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+        # 2) base64 兜底（对极小图可行）
+        data_url = local_media_data_url(text)
+        if data_url:
+            return data_url
+    raise autodl.AutoDLValidationError(
+        f"AutoDL 的{kind}必须是公网可访问的 http/https URL；"
+        "本地文件自动上传图床或转 base64 均失败，请检查网络后重试，或配置 PUBLIC_MEDIA_BASE_URL"
+    )
+
+
+async def build_autodl_canvas_request_body(
     payload: AutoDLTaskRequest, resolved: autodl.ResolvedWorkflow
 ) -> Dict[str, Any]:
     public_images = [
-        public_autodl_media_url(item.url, "参考图片")
+        await public_autodl_media_url_async(item.url, "参考图片")
         for item in payload.images
         if item.url
     ]
     public_audios = [
-        public_autodl_media_url(item, "参考音频")
+        await public_autodl_media_url_async(item, "参考音频")
         for item in payload.audios
         if item
     ]
@@ -14878,7 +15383,7 @@ async def autodl_status():
 async def autodl_submit_task(payload: AutoDLTaskRequest):
     try:
         resolved = resolve_autodl_canvas_request(payload)
-        body = build_autodl_canvas_request_body(payload, resolved)
+        body = await build_autodl_canvas_request_body(payload, resolved)
         upstream = await autodl.client_from_environment().submit(
             resolved.workflow_id, body
         )
@@ -15168,6 +15673,21 @@ def delete_runninghub_workflow(workflow_id: str):
         save_runninghub_workflow_store(store)
     remove_runninghub_workflow_from_provider(key)
     return {"success": True}
+
+@app.post("/api/runninghub/video-submit")
+async def runninghub_video_submit(payload: CanvasVideoRequest):
+    provider = get_api_provider(payload.provider_id)
+    if not is_runninghub_provider(provider):
+        raise HTTPException(status_code=400, detail="RunningHub 视频提交必须选择 RunningHub provider")
+    async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as client:
+        try:
+            return await submit_runninghub_video_task(payload, provider, client)
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(status_code=exc.response.status_code, detail=f"RunningHub 视频接口错误：{exc.response.text}") from exc
+        except httpx.HTTPError as exc:
+            log_net_error(f"视频(RunningHub提交) 网络/TLS错误 model={payload.model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求 RunningHub 视频接口失败：{exc}") from exc
+
 
 @app.get("/api/runninghub/query")
 async def runninghub_query(taskId: str = ""):
@@ -17462,9 +17982,217 @@ def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     suffix_text = " ".join(suffixes)
     return f"{text} {suffix_text}".strip() if text else suffix_text
 
+MINIMAX_VIDEO_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"}
+
+
+def minimax_video_resolution(resolution: str) -> str:
+    value = str(resolution or "2K").strip().lower()
+    return "2K" if value in {"2k", "1080", "1080p"} else "768P"
+
+
+def minimax_video_ratio(aspect_ratio: str, content_mode: str) -> str:
+    ratio = str(aspect_ratio or "adaptive").strip()
+    if content_mode == "frame":
+        return "adaptive"
+    if content_mode == "text":
+        return ratio if ratio in MINIMAX_VIDEO_RATIOS and ratio != "adaptive" else "16:9"
+    return ratio if ratio in MINIMAX_VIDEO_RATIOS else "adaptive"
+
+
+async def minimax_upload_video_input(value: str, base_url: str, headers: dict) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="MiniMax 官方视频接口缺少媒体地址")
+    if text.startswith("mm_file://"):
+        return text
+    parsed = urllib.parse.urlsplit(text)
+    local_path = ""
+    if parsed.scheme in {"http", "https"}:
+        host = str(parsed.hostname or "").lower()
+        is_private = host in {"127.0.0.1", "localhost", "::1"} or bool(
+            re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host)
+        )
+        if not is_private:
+            return text
+        local_path = urllib.parse.unquote(parsed.path or "")
+    elif text.startswith(("/output/", "/assets/")):
+        local_path = text
+    else:
+        raise HTTPException(status_code=400, detail="MiniMax 官方接口只接受公网媒体地址或 mm_file:// 引用")
+    if not local_path.startswith(("/output/", "/assets/")) or not output_file_from_url(local_path):
+        raise HTTPException(status_code=400, detail="MiniMax 官方接口只接受公网媒体地址或 mm_file:// 引用")
+    path = output_file_from_url(local_path)
+    upload_headers = {"Authorization": headers.get("Authorization") or ""}
+    upload_url = f"{base_url.rstrip('/')}/v1/files/upload"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=180.0, write=180.0, pool=20.0), follow_redirects=True) as client:
+            with open(path, "rb") as fh:
+                response = await client.post(
+                    upload_url,
+                    headers=upload_headers,
+                    data={"purpose": "video_generation_input"},
+                    files={"file": (os.path.basename(path), fh, content_type_for_path(path))},
+                )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"MiniMax 官方文件上传失败：{exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"MiniMax 官方文件上传失败：{minimax_error_message(response) or response.text[:300]}")
+    raw = response.json()
+    file_item = raw.get("file") if isinstance(raw.get("file"), dict) else {}
+    file_id = str(file_item.get("file_id") or raw.get("file_id") or "").strip()
+    if not file_id:
+        raise HTTPException(status_code=502, detail="MiniMax 官方文件上传成功但没有返回 file_id")
+    return f"mm_file://{file_id}"
+
+
+def minimax_error_message(response) -> str:
+    try:
+        raw = response.json()
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        error = raw.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("type") or ""
+            if message:
+                return str(message)[:500]
+        return str(raw.get("message") or raw.get("detail") or "")[:500]
+    return ""
+
+
+async def wait_minimax_video(client, base_url: str, headers: dict, task_id: str):
+    url = f"{base_url.rstrip('/')}/v2/query/video_generation/{urllib.parse.quote(str(task_id), safe='')}"
+    deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+    delay = 5.0
+    last_payload = {}
+    while time.monotonic() < deadline:
+        await asyncio.sleep(delay)
+        response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"MiniMax 官方任务查询失败：{minimax_error_message(response) or response.text[:300]}")
+        raw = response.json()
+        last_payload = raw
+        task = raw.get("task") if isinstance(raw.get("task"), dict) else raw
+        status = str(task.get("status") or "").strip().lower()
+        if status == "succeeded":
+            content = task.get("content") if isinstance(task.get("content"), dict) else {}
+            video_url = str(content.get("url") or "").strip()
+            if not video_url:
+                raise HTTPException(status_code=502, detail="MiniMax 官方任务成功但没有返回视频地址")
+            local_url = await save_remote_video_to_output(video_url, prefix="minimax_", category="output")
+            return local_url, raw
+        if status in {"failed", "cancelled"}:
+            error = task.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or "")[:500]
+            else:
+                message = str(error or task.get("message") or "")[:500]
+            raise HTTPException(status_code=502, detail=f"MiniMax 官方视频任务{status}：{message or '无错误详情'}")
+        delay = min(delay * 1.3, 10.0)
+    raise HTTPException(status_code=504, detail=f"MiniMax 官方视频任务超时：{last_payload.get('task_id') or task_id}")
+
+
+async def silence_minimax_video(local_url: str) -> str:
+    """移除 MiniMax 官方视频自带的 AIGC 音效，避免奇怪的哭声/人声进入成品。"""
+    path = output_file_from_url(local_url)
+    if not path or not os.path.isfile(path):
+        return local_url
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return local_url
+    muted_path = os.path.join(OUTPUT_OUTPUT_DIR, f"muted_{os.path.basename(path)}")
+    if os.path.abspath(path) == os.path.abspath(muted_path):
+        return local_url
+    if os.path.exists(muted_path):
+        os.remove(muted_path)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-v", "error", "-i", path, "-an", "-c", "v", "copy", muted_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.isfile(muted_path):
+            return local_url
+        return output_url_for(os.path.basename(muted_path), "output")
+    except Exception:
+        return local_url
+
+
+async def generate_minimax_video(payload: CanvasVideoRequest, provider):
+    api_key = provider_env_key_value(provider.get("id") or "minimax")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="未配置 MiniMax 官方 API Key，请在 API/.env 设置 MINIMAX_API_KEY。")
+    base_url = video_api_root(provider).rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="MiniMax 官方未配置 Base URL")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    images = [item for item in (payload.images or []) if getattr(item, "url", "")]
+    videos = [item for item in (payload.videos or []) if str(item or "").strip()]
+    audios = [item for item in (payload.audios or []) if str(item or "").strip()]
+    image_roles = [str(getattr(item, "role", "") or "").strip() for item in images]
+    reference_mode = bool(payload.multimodal or videos or audios or any(role == "reference_image" for role in image_roles))
+    frame_mode = bool(any(role in {"first_frame", "last_frame"} for role in image_roles)) or (
+        not reference_mode and images and len(images) <= 2
+    )
+    content = [{"type": "text", "text": payload.prompt}]
+    for index, ref in enumerate(images[:9]):
+        url = await minimax_upload_video_input(str(ref.url or ""), base_url, headers)
+        if reference_mode:
+            role = "reference_image"
+        elif frame_mode:
+            role = str(getattr(ref, "role", "") or "").strip()
+            if role not in {"first_frame", "last_frame"}:
+                role = "first_frame" if index == 0 else "last_frame"
+        else:
+            role = "reference_image"
+        content.append({"type": "image_url", "image_url": {"url": url}, "role": role})
+    for url in videos[:3]:
+        public_url = await minimax_upload_video_input(url, base_url, headers)
+        content.append({"type": "video_url", "video_url": {"url": public_url}, "role": "reference_video"})
+    for url in audios[:3]:
+        public_url = await minimax_upload_video_input(url, base_url, headers)
+        content.append({"type": "audio_url", "audio_url": {"url": public_url}, "role": "reference_audio"})
+    if reference_mode:
+        content_mode = "reference"
+    elif frame_mode:
+        content_mode = "frame"
+    else:
+        content_mode = "text"
+    duration = max(4, min(15, int(payload.duration or 5)))
+    body = {
+        "model": "MiniMax-H3",
+        "content": content,
+        "duration": duration,
+        "resolution": minimax_video_resolution(payload.resolution),
+        "ratio": minimax_video_ratio(payload.aspect_ratio, content_mode),
+        "aigc_watermark": bool(payload.watermark),
+    }
+    submit_url = f"{base_url}/v2/video_generation"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0), follow_redirects=True) as client:
+        response = await client.post(submit_url, headers=headers, json=body)
+        if response.status_code >= 400:
+            detail = minimax_error_message(response) or response.text[:500]
+            raise HTTPException(status_code=502, detail=f"MiniMax 官方视频接口错误：{detail}")
+        raw = response.json()
+        task_id = str(raw.get("task_id") or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=502, detail="MiniMax 官方提交成功但没有返回 task_id")
+        local_url, final_raw = await wait_minimax_video(client, base_url, headers, task_id)
+        if str(os.getenv("MINIMAX_MUTE_AUDIO", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+            local_url = await silence_minimax_video(local_url)
+    return {"videos": [local_url], "task_id": task_id, "raw": final_raw}
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
+    if is_minimax_provider(provider):
+        try:
+            return await generate_minimax_video(payload, provider)
+        except httpx.HTTPError as exc:
+            log_net_error(f"视频(MiniMax官方) 网络/TLS错误 model={payload.model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求 MiniMax 官方视频接口失败：{exc}") from exc
     if is_jimeng_provider(provider):
         return await generate_jimeng_video(payload, provider)
     if is_runninghub_provider(provider):

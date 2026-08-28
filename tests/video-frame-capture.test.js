@@ -16,16 +16,17 @@ assert.match(canvas, /data-video-frame-mode="current"/);
 assert.match(canvas, /async function videoFrameBlob/);
 assert.match(canvas, /async function captureVideoFrame/);
 assert.match(canvas, /frameSourceId:node\.id/);
-assert.match(canvas, /kind:'frameCapture'/);
-assert.match(canvas, /to\.frameSourceId === from\.id/);
+assert.doesNotMatch(canvas, /connections\.push\([^\n]+kind:'frameCapture'/);
+assert.match(canvas, /FRAME_DERIVED_CONNECTION_KINDS/);
+assert.match(canvas, /'frameCapture'/);
 assert.match(canvas, /uploadCroppedBlob\(frame\.blob/);
 assert.match(canvas, /function videoFrameText/);
 assert.match(canvas, /translated\s*!==\s*key/);
 assert.match(css, /\.canvas-video-capture/);
 assert.match(css, /\.canvas-video-capture-menu/);
-assert.match(i18nLoader, /2026\.07\.17\.media-tools\.3/);
-assert.match(html, /canvas\.css\?v=2026\.07\.17-media-tools-3/);
-assert.match(html, /canvas\.js\?v=2026\.08\.24-autodl-h3-1/);
+assert.match(i18nLoader, /2026\.08\.27\.timeline-storyboard\.2/);
+assert.match(html, /canvas\.css\?v=2026\.08\.27-autodl-err-fix-6/);
+assert.match(html, /canvas\.js\?v=2026\.08\.27-autodl-err-fix-6/);
 
 for(const key of [
   'canvas.captureVideoFrame',

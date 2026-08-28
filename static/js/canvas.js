@@ -465,6 +465,7 @@ let managerSelectedAssetIds = new Set();
 let managerSelectedPromptIds = new Set();
 const activeCanvasTaskPolls = new Set();
 const activeAutoDLVideoPolls = new Set();
+const activeRunningHubVideoPolls = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
 let undoStack = [];
@@ -945,10 +946,18 @@ function providerVideoModels(providerId){
 function isAutoDLVideoProvider(providerId){
     return String(providerId || '').trim().toLowerCase() === 'autodl';
 }
+function isRunningHubVideoProvider(providerId){
+    const id = String(providerId || '').trim();
+    const provider = apiProviders.find(item => item.id === id);
+    return id.toLowerCase() === 'runninghub' || isRunningHubProvider(provider);
+}
+function isMinimaxVideoProvider(providerId){
+    return String(providerId || '').trim().toLowerCase() === 'minimax';
+}
 function autodlWorkflowOptions(node){
     const mode = node?.workflowMode === 'manual' ? 'manual' : 'auto';
     const selected = mode === 'manual' ? String(node?.workflowId || '') : '';
-    const automatic = `<option value="" ${selected ? '' : 'selected'}>自动选择</option>`;
+    const automatic = `<option value="" ${selected ? '' : 'selected'}>自动选择（推荐）</option>`;
     const options = (window.AutoDLVideo?.workflowOptions(autodlWorkflows) || []).map(option =>
         `<option value="${escapeHtml(option.value)}" ${option.value === selected ? 'selected' : ''}>${escapeHtml(option.label)}</option>`
     ).join('');
@@ -973,7 +982,12 @@ function videoModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
     const selected = selectedModel || models[0];
-    return uniqueModels([selected, ...models]).filter(Boolean).map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const providerMeta = apiProviders.find(function(p){ return p.id === providerId; }) || {};
+    const labels = Object.assign({}, providerMeta.model_names || {}, {'MiniMax-H3':'MiniMax H3（官方 · 2K/768P）'});
+    return uniqueModels([selected, ...models]).filter(Boolean).map(model => {
+        const label = labels[model] || model;
+        return `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
 }
 function allImageModels(providerId){
     const providerModels = providerImageModels(providerId || managedProviderId);
@@ -1709,9 +1723,9 @@ function refreshOutputTimer(){
 }
 function serializableCanvasPendingItems(items=[]){
     return activePendingItems(items || []).map(item => {
-        const isAutoDLVideo = item.canvasTaskType === 'autodl-video';
-        const taskId = item.canvasTaskId || item.task_id || (isAutoDLVideo ? '' : item.id) || '';
-        if(!taskId && !isAutoDLVideo) return null;
+        const isExternalVideo = item.canvasTaskType === 'autodl-video' || item.canvasTaskType === 'runninghub-video';
+        const taskId = item.canvasTaskId || item.task_id || (isExternalVideo ? '' : item.id) || '';
+        if(!taskId && !isExternalVideo) return null;
         const copy = {};
         [
             'id',
@@ -1738,6 +1752,7 @@ function serializableCanvasPendingItems(items=[]){
             'previewSize',
             'cascadeTargetId',
             'appendGenerated',
+            'terminal',
             'run',
         ].forEach(key => {
             if(item[key] !== undefined) copy[key] = item[key];
@@ -1838,6 +1853,30 @@ function mergeCanvasLogs(remoteLogs=[], localLogs=[]){
         .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
         .slice(0, 500);
 }
+function lockVideoNodeConfigToPendingTask(nodeList=[]){
+    const byId = new Map((nodeList || []).filter(node => node?.id).map(node => [node.id, node]));
+    const snapshots = [];
+    (nodeList || []).filter(node => node?.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(!['runninghub-video','autodl-video'].includes(pending?.canvasTaskType)) return;
+            if(pending?.terminal || !(pending?.task_id || pending?.canvasTaskId)) return;
+            const snapshot = pending?.run?.node;
+            if(snapshot?.type !== 'video' || !snapshot?.id) return;
+            snapshots.push({snapshot, startedAt:Number(pending.startedAt || 0)});
+        });
+    });
+    snapshots.sort((a, b) => a.startedAt - b.startedAt).forEach(({snapshot}) => {
+        const node = byId.get(snapshot.id);
+        if(!node || node.type !== 'video') return;
+        [
+            'apiProvider','model','duration','aspectRatio','resolution','multimodal',
+            'generateAudio','watermark','useFrameRoles','cameraFixed','enhancePrompt','enableUpsample'
+        ].forEach(key => {
+            if(snapshot[key] !== undefined) node[key] = clonePlain(snapshot[key], snapshot[key]);
+        });
+    });
+    return nodeList;
+}
 function preserveLocalRuntimeNodeState(remoteNodes=[]){
     const localById = new Map((nodes || []).filter(node => node?.id).map(node => [node.id, node]));
     const keepLocalEdits = Boolean(localCanvasDirty || hasRecentPromptEdit());
@@ -1930,6 +1969,7 @@ function mergeRemoteCanvasIntoLocalForSave(remote){
         viewport:localViewport
     };
     nodes = mergedNodes;
+    lockVideoNodeConfigToPendingTask(nodes);
     connections = mergedConnections;
     viewport = localViewport;
     canvas.viewport = {...viewport};
@@ -2494,12 +2534,13 @@ async function createCanvas(){
         canvas = data.canvas;
         canvas.logs = canvas.logs || [];
         nodes = canvas.nodes || [];
+        lockVideoNodeConfigToPendingTask(nodes);
         connections = canvas.connections || [];
         viewport = localViewportForCanvas(canvas.id, canvas.viewport || {x:0, y:0, scale:1});
         canvas.viewport = {...viewport};
         resetTransientRunState(nodes);
         if(applyCanvasGeneratorApiDefaults(nodes)) scheduleSave();
-        sanitizeConnections();
+        sanitizeConnections({save:true});
         selected.clear();
         setCanvasMode(true);
         render();
@@ -2647,7 +2688,7 @@ async function openCanvas(id){
         localCanvasDirty = false;
         resetTransientRunState(nodes);
         if(applyCanvasGeneratorApiDefaults(nodes)) scheduleSave();
-        sanitizeConnections();
+        sanitizeConnections({save:true});
         pruneMissingComfyWorkflows();
         missingAssetUrls.clear();
         selected.clear();
@@ -2657,6 +2698,7 @@ async function openCanvas(id){
         refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
         resumeAutoDLVideoTasks();
+        resumeRunningHubVideoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
@@ -2682,6 +2724,7 @@ function applyRemoteCanvasData(remote){
         canvas = remote;
         canvas.logs = mergeCanvasLogs(canvas.logs || [], localLogs);
         nodes = preserveLocalRuntimeNodeState(canvas.nodes || []);
+        lockVideoNodeConfigToPendingTask(nodes);
         connections = canvas.connections || [];
         viewport = localViewport;
         canvas.viewport = {...viewport};
@@ -2698,6 +2741,7 @@ function applyRemoteCanvasData(remote){
         refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
         resumeAutoDLVideoTasks();
+        resumeRunningHubVideoTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -3449,22 +3493,18 @@ function addMsGenNode(point){
 }
 function addVideoNode(point){
     const p = point || defaultPoint(160, 0);
-    const providerId = 'autodl';
+    const providerId = 'runninghub';
     const models = providerVideoModels(providerId);
     return addNode({
         id:uid('vid'),
         type:'video',
         x:p.x,
         y:p.y,
-        apiProvider:'autodl',
-        model:models[0] || 'minimax_h3_lightx2v_v5',
-        workflowMode:'auto',
-        workflowId:'',
-        resolvedWorkflowId:'minimax_h3_lightx2v_v5',
-        resolvedWorkflowReason:'默认多图参考工作流',
-        duration:5,
-        aspectRatio:'16:9',
-        resolution:'768p',
+        apiProvider:'runninghub',
+        model:models[0] || 'rhart-video/sparkvideo-2.0/multimodal-video',
+        duration:10,
+        aspectRatio:'9:16',
+        resolution:'720p',
         enhancePrompt:false,
         enableUpsample:false,
         watermark:false,
@@ -6685,7 +6725,6 @@ async function captureVideoFrame(node, mode, captureBtn, options={}){
             frameTime:frame.time
         };
         nodes.push(imageNode);
-        connections.push({id:uid('c'), from:node.id, to:imageNode.id, kind:'frameCapture'});
         selected.clear();
         selected.add(imageNode.id);
         markCanvasMediaMutation();
@@ -6705,6 +6744,176 @@ async function captureVideoFrame(node, mode, captureBtn, options={}){
             captureBtn.disabled = false;
             captureBtn.classList.remove('busy');
             captureBtn.title = videoFrameText('canvas.captureVideoFrame', '截取视频帧', 'Capture video frame');
+        }
+    }
+}
+function bindTimelineReferenceMediaDrag(element, url){
+    if(!element || !url) return;
+    element.draggable = true;
+    element.addEventListener('dragstart', event => {
+        event.stopPropagation();
+        element.dataset.dragging = '1';
+        const preview = element.querySelector?.('img') || element;
+        setOutputDragPreview(event, preview);
+        event.dataTransfer.effectAllowed = 'copy';
+        event.dataTransfer.setData('application/x-canvas-output-image', url);
+        event.dataTransfer.setData('text/uri-list', url);
+        event.dataTransfer.setData('text/plain', url);
+    });
+    element.addEventListener('dragend', event => {
+        event.stopPropagation();
+        window.setTimeout(() => { delete element.dataset.dragging; }, 0);
+    });
+}
+const TIMELINE_STORYBOARD_LAYOUT_VERSION = 'compact-3';
+function renderTimelineReferenceBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'timeline-reference-body';
+    const frames = Array.isArray(node.timelineFrames) ? node.timelineFrames : [];
+    const meta = [
+        `${Number(node.timelineDuration || 0).toFixed(1)}s`,
+        node.timelineWidth && node.timelineHeight ? `${node.timelineWidth}×${node.timelineHeight}` : '',
+        node.timelineFps ? `${Number(node.timelineFps).toFixed(2)} FPS` : ''
+    ].filter(Boolean).join(' · ');
+    const storyboardUrl = String(node.timelineStoryboardUrl || '');
+    wrap.innerHTML = `
+        <div class="timeline-reference-meta">${escapeHtml(meta)}</div>
+        ${storyboardUrl ? `<button class="timeline-reference-storyboard" type="button" draggable="true" data-timeline-storyboard-url="${escapeAttr(storyboardUrl)}" title="${escapeAttr(videoFrameText('canvas.timelineStoryboardTitle', '全部帧总览', 'All frames overview'))}">${canvasPreviewImgHtml(storyboardUrl, 1200)}<span>${escapeHtml(videoFrameText('canvas.timelineStoryboardTitle', '全部帧总览', 'All frames overview'))}</span></button>` : `<div class="timeline-reference-storyboard-loading">${escapeHtml(videoFrameText('canvas.timelineStoryboardBuilding', '正在生成全部帧总览…', 'Building all-frames overview…'))}</div>`}
+        <div class="timeline-reference-grid">
+            ${frames.map(frame => `<button class="timeline-reference-frame" type="button" draggable="true" data-timeline-frame-url="${escapeAttr(frame.url || '')}" title="${escapeAttr(frame.label || '')}">${canvasPreviewImgHtml(frame.url || '', 640)}<span class="timeline-reference-time">${escapeHtml(frame.label || '')}</span></button>`).join('')}
+        </div>
+        <div class="timeline-reference-hint">${escapeHtml(videoFrameText('canvas.timelineReferenceHint', '用于动作、镜头与节奏分析 · 弱运动参考', 'For action, camera and rhythm analysis · soft motion reference'))}</div>`;
+    const storyboard = wrap.querySelector('[data-timeline-storyboard-url]');
+    if(storyboard){
+        bindTimelineReferenceMediaDrag(storyboard, storyboardUrl);
+        storyboard.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            if(storyboard.dataset.dragging) return;
+            if(storyboardUrl) openOutputLightbox(storyboardUrl, node);
+        });
+    }
+    wrap.querySelectorAll('[data-timeline-frame-url]').forEach(button => {
+        const url = button.dataset.timelineFrameUrl;
+        bindTimelineReferenceMediaDrag(button, url);
+        button.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            if(button.dataset.dragging) return;
+            if(url) openOutputLightbox(url, node);
+        };
+    });
+    if(!storyboardUrl || node.timelineStoryboardLayoutVersion !== TIMELINE_STORYBOARD_LAYOUT_VERSION){
+        window.setTimeout(() => hydrateTimelineReferenceStoryboard(node), 0);
+    }
+    return wrap;
+}
+async function hydrateTimelineReferenceStoryboard(node){
+    const sourceUrl = String(node?.timelineSourceUrl || '').trim();
+    const layoutIsCurrent = node?.timelineStoryboardLayoutVersion === TIMELINE_STORYBOARD_LAYOUT_VERSION;
+    if(!node || node.type !== 'timelineReference' || (node.timelineStoryboardUrl && layoutIsCurrent) || node._timelineStoryboardHydrating || !sourceUrl) return;
+    node._timelineStoryboardHydrating = true;
+    try {
+        const response = await fetch('/api/video-timeline-reference', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({url:sourceUrl, interval:Number(node.timelineInterval || 1)})
+        });
+        const result = await response.json().catch(() => ({}));
+        if(!response.ok || !result.storyboard_url) return;
+        node.timelineStoryboardUrl = String(result.storyboard_url || '');
+        node.timelineStoryboardWidth = Number(result.storyboard_width || 0);
+        node.timelineStoryboardHeight = Number(result.storyboard_height || 0);
+        node.timelineStoryboardLayoutVersion = String(result.storyboard_layout_version || '');
+        if(Array.isArray(result.frames) && result.frames.length){
+            node.timelineFrames = result.frames.map(frame => ({
+                time:Number(frame.time || 0),
+                label:String(frame.label || ''),
+                url:String(frame.url || '')
+            }));
+        }
+        render();
+        scheduleSave();
+    } catch(error) {
+        console.warn('[timeline-reference] storyboard hydrate failed', error);
+    } finally {
+        node._timelineStoryboardHydrating = false;
+    }
+}
+async function createVideoTimelineReference(node, triggerBtn, options={}){
+    const sourceUrl = String(options.sourceUrl || node?.url || '').trim();
+    if(!node || !sourceUrl || node.timelineReferenceBusy) return null;
+    node.timelineReferenceBusy = true;
+    const card = triggerBtn?.closest('.video-card');
+    const menu = card?.querySelector('.canvas-video-capture-menu');
+    if(menu) menu.hidden = true;
+    if(triggerBtn){
+        triggerBtn.disabled = true;
+        triggerBtn.classList.add('busy');
+        triggerBtn.title = videoFrameText('canvas.creatingTimelineReference', '正在拆分时间参考表…', 'Creating timeline reference…');
+    }
+    setStatus(videoFrameText('canvas.creatingTimelineReference', '正在拆分时间参考表…', 'Creating timeline reference…'));
+    try {
+        const response = await fetch('/api/video-timeline-reference', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({url:sourceUrl, interval:1})
+        });
+        const result = await response.json().catch(() => ({}));
+        if(!response.ok) throw new Error(result.detail || videoFrameText('canvas.timelineReferenceFailed', '时间参考表拆分失败', 'Timeline reference failed'));
+        if(!Array.isArray(result.frames) || !result.frames.length) throw new Error(videoFrameText('canvas.timelineReferenceFailed', '时间参考表拆分失败', 'Timeline reference failed'));
+        pushUndo();
+        const sourceRect = nodeRect(node);
+        const existing = nodes.find(item => item.type === 'timelineReference' && item.timelineSourceId === node.id && item.timelineSourceUrl === sourceUrl);
+        const timelineNode = existing || {
+            id:uid('timeline'),
+            type:'timelineReference',
+            x:Number(node.x || 0) + sourceRect.w + 80,
+            y:Number(node.y || 0),
+            w:760,
+            h:520,
+            timelineSourceId:node.id,
+            timelineSourceUrl:sourceUrl,
+        };
+        Object.assign(timelineNode, {
+            name:videoFrameText('canvas.timelineReferenceTitle', '时间参考表', 'Timeline Reference'),
+            timelineDuration:Number(result.duration || 0),
+            timelineWidth:Number(result.width || 0),
+            timelineHeight:Number(result.height || 0),
+            timelineFps:Number(result.fps || 0),
+            timelineInterval:Number(result.interval || 1),
+            timelineStoryboardUrl:String(result.storyboard_url || ''),
+            timelineStoryboardWidth:Number(result.storyboard_width || 0),
+            timelineStoryboardHeight:Number(result.storyboard_height || 0),
+            timelineStoryboardLayoutVersion:String(result.storyboard_layout_version || ''),
+            timelineFrames:result.frames.map(frame => ({
+                time:Number(frame.time || 0),
+                label:String(frame.label || ''),
+                url:String(frame.url || '')
+            }))
+        });
+        if(!existing){
+            nodes.push(timelineNode);
+        }
+        selected.clear();
+        selected.add(timelineNode.id);
+        markCanvasMediaMutation();
+        render();
+        scheduleSave();
+        setStatus(`${videoFrameText('canvas.timelineReferenceCreated', '时间参考表已创建', 'Timeline reference created')} · ${timelineNode.timelineFrames.length} ${langIsEn() ? 'frames' : '帧'}`);
+        return timelineNode;
+    } catch(err) {
+        showErrorModal(
+            err?.message || videoFrameText('canvas.timelineReferenceFailed', '时间参考表拆分失败', 'Timeline reference failed'),
+            videoFrameText('canvas.createTimelineReference', '拆成时间参考表', 'Create timeline reference')
+        );
+        return null;
+    } finally {
+        node.timelineReferenceBusy = false;
+        if(triggerBtn?.isConnected){
+            triggerBtn.disabled = false;
+            triggerBtn.classList.remove('busy');
+            triggerBtn.title = videoFrameText('canvas.captureVideoFrame', '截取视频帧', 'Capture video frame');
         }
     }
 }
@@ -6941,6 +7150,12 @@ function bindVideoFrameCaptureControls(body, node, captureBtn){
             captureVideoFrame(node, button.dataset.videoFrameMode || 'current', captureBtn);
         }, true);
     });
+    menu?.querySelector('[data-video-timeline-reference]')?.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        createVideoTimelineReference(node, captureBtn);
+    }, true);
 }
 async function applyImageCrop(){
     if(!cropState) return;
@@ -7410,12 +7625,14 @@ function renderPendingOutput(pending){
         const querying = Boolean(pending.querying);
         const msg = pending.error || tr('canvas.generationFailed');
         const sub = taskId ? `任务 ID：${escapeHtml(taskId)}` : '没有任务 ID，无法查询';
+		const errLine = msg && msg !== tr('canvas.generationFailed') ? `<div class="output-recover-err" title="${escapeAttr(msg)}">${escapeHtml(msg)}</div>` : '';
         return `<div class="output-img-wrap loading-wrap recoverable" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}>
             <span class="output-time-pill failed">失败</span>
             <div class="output-recover-state">
                 <i data-lucide="refresh-cw" class="${querying ? 'spinning' : ''}"></i>
                 <div class="output-recover-title">${querying ? '查询中' : '任务未丢失'}</div>
                 <div class="output-recover-sub" title="${escapeAttr(msg)}">${sub}</div>
+                ${errLine}
                 <button class="output-recover-query" type="button" ${taskId && !querying ? '' : 'disabled'}>${querying ? '查询中...' : '查询结果'}</button>
             </div>
             <button class="output-del" title="${tr('common.delete')}">×</button>
@@ -7495,7 +7712,7 @@ function renderNode(node){
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
     if(node.type === 'realesrgan') hydrateRealESRGANLastResult(node);
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'realesrgan' ? tr('canvas.realesrganTitle') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'timelineReference' ? videoFrameText('canvas.timelineReferenceTitle', '时间参考表', 'Timeline Reference') : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'realesrgan' ? tr('canvas.realesrganTitle') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const displayRunStatus = node.runStatus || (node.type === 'realesrgan' && node.lastResult ? 'done' : '');
@@ -7516,7 +7733,7 @@ function renderNode(node){
             body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : canvasPreviewImgHtml(node.url, 768, 'draggable="false"')}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
             if(!missing && mediaKind !== 'image'){
                 const mediaHtml = mediaKind === 'video'
-                    ? `<div class="media-card video-card">${canvasVideoPreviewHtml(node.url, 768, 'draggable="false" data-video-fallback-attrs="controls"')}<button class="canvas-video-play" type="button" title="播放"><i data-lucide="play"></i></button><button class="canvas-video-capture" type="button" title="${escapeAttr(videoFrameText('canvas.captureVideoFrame', '截取视频帧', 'Capture video frame'))}"><i data-lucide="camera"></i></button><div class="canvas-video-capture-menu" hidden><button type="button" data-video-frame-mode="first">${escapeHtml(videoFrameModeLabel('first'))}</button><button type="button" data-video-frame-mode="last">${escapeHtml(videoFrameModeLabel('last'))}</button><button type="button" data-video-frame-mode="current">${escapeHtml(videoFrameModeLabel('current'))}</button></div></div>`
+                    ? `<div class="media-card video-card">${canvasVideoPreviewHtml(node.url, 768, 'draggable="false" data-video-fallback-attrs="controls"')}<button class="canvas-video-play" type="button" title="播放"><i data-lucide="play"></i></button><button class="canvas-video-capture" type="button" title="${escapeAttr(videoFrameText('canvas.captureVideoFrame', '截取视频帧', 'Capture video frame'))}"><i data-lucide="camera"></i></button><div class="canvas-video-capture-menu" hidden><button type="button" data-video-frame-mode="first">${escapeHtml(videoFrameModeLabel('first'))}</button><button type="button" data-video-frame-mode="last">${escapeHtml(videoFrameModeLabel('last'))}</button><button type="button" data-video-frame-mode="current">${escapeHtml(videoFrameModeLabel('current'))}</button><button type="button" data-video-timeline-reference>${escapeHtml(videoFrameText('canvas.createTimelineReference', '拆成时间参考表', 'Create timeline reference'))}</button></div></div>`
                     : `<div class="media-card audio-card"><i data-lucide="file-audio" class="w-8 h-8"></i><div class="audio-title">${escapeHtml(node.name || 'Audio')}</div><div class="audio-sub">AUDIO</div><audio src="${escapeAttr(node.url)}" data-url="${escapeAttr(node.url)}" controls preload="metadata"></audio></div>`;
                 body.innerHTML = `<div class="image-preview-wrap">${mediaHtml}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || nodeTitleForMedia(node))}</div>`;
             }
@@ -7599,6 +7816,7 @@ function renderNode(node){
             blank.ondrop = e => handleImageNodeDropEvent(e, node.id, blank);
         }
     }
+    if(node.type === 'timelineReference') body.appendChild(renderTimelineReferenceBody(node));
     if(node.type === 'prompt') {
         const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
         body.innerHTML = `<div class="prompt-editor"><div class="prompt-toolbar"><button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>${promptCounterHtml(node.text || '')}</div><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea></div>`;
@@ -7679,7 +7897,7 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','realesrgan'].includes(node.type) || Boolean(node.type === 'image' && node.frameSourceId) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','realesrgan'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
     const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','realesrgan','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
@@ -7710,6 +7928,7 @@ function bindOutputWrap(wrap, node){
     const audio = wrap.querySelector('audio');
     const fileCard = wrap.querySelector('.output-file-card');
     const playBtn = wrap.querySelector('.canvas-video-play');
+    const downloadBtn = wrap.querySelector('.output-download-btn');
     const del = wrap.querySelector('.output-del');
     const recoverQuery = wrap.querySelector('.output-recover-query');
     if(img){
@@ -7739,6 +7958,14 @@ function bindOutputWrap(wrap, node){
         video.onclick = e => {
             e.stopPropagation();
             openOutputLightbox(video.dataset.url, node);
+        };
+    }
+    if(downloadBtn){
+        downloadBtn.onmousedown = e => e.stopPropagation();
+        downloadBtn.onclick = e => {
+            e.stopPropagation();
+            const url = downloadBtn.dataset.downloadUrl || wrap.dataset.outputUrl;
+            if(url) downloadUrl(url, outputDownloadName(url)).catch(err => alert(err.message || '下载失败'));
         };
     }
     if(fileCard){
@@ -7846,6 +8073,7 @@ function refreshOutputNodeContent(node){
 }
 function defaultNodeSize(type){
     if(type === 'image') return {w:260, h:336};
+    if(type === 'timelineReference') return {w:760, h:520};
     if(type === 'prompt') return {w:310, h:0};
     if(type === 'loop') return {w:336, h:0};
     if(type === 'llm') return {w:420, h:590};
@@ -10290,6 +10518,7 @@ function renderVideoBody(node){
     const autodlVideos = autodlRefs.filter(ref => mediaKindForRef(ref) === 'video').map(ref => ref.url);
     const autodlPrompt = ordered.map(src => src.prompt).filter(Boolean).join('\n\n');
     const autodlResolutionBase = String(node.resolution || '768p').replace(/(横|竖|1:1)$/, '');
+    const isMiniMax = isMinimaxVideoProvider(node.apiProvider);
     const autodlResolved = isAutoDL ? window.AutoDLVideo.resolveWorkflow({
         prompt:autodlPrompt,
         duration:Number(node.duration || 5),
@@ -10314,7 +10543,7 @@ function renderVideoBody(node){
     } else {
         node.model = node.model || 'veo3-fast';
     }
-    const durationMax = isAutoDL && node.workflowMode === 'manual' ? Number(autodlResolved?.maxDuration || 15) : (isAutoDL ? 15 : 60);
+    const durationMax = isMiniMax ? 15 : (isAutoDL && node.workflowMode === 'manual' ? Number(autodlResolved?.maxDuration || 15) : (isAutoDL ? 15 : 60));
     const workflowReason = [autodlResolved?.reason, autodlResolution.reason].filter(Boolean).join(' · ');
     const workflowError = autodlResolved?.error || autodlResolution.error || '';
     wrap.innerHTML = `
@@ -10331,7 +10560,7 @@ function renderVideoBody(node){
             <div class="gen-settings-row">
                 <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider)}</select>
                 <label class="field" style="flex:2;min-width:0">
-                    <div class="setting-title video-model-title">${isAutoDL ? '工作流' : '模型'}</div>
+                    <div class="setting-title video-model-title">${isAutoDL ? '生成模型' : '模型'}</div>
                     <select class="select-lite video-model">${isAutoDL ? autodlWorkflowOptions(node) : videoModelOptions(node.model, node.apiProvider)}</select>
                 </label>
             </div>
@@ -10361,11 +10590,7 @@ function renderVideoBody(node){
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoResolution')}</div>
                     <select class="select-lite video-resolution compact-select">
-                        ${isAutoDL ? '' : '<option value="">Auto</option>'}
-                        <option value="480p">480p</option>
-                        ${isAutoDL ? '<option value="768p">768p</option>' : '<option value="720p">720p</option>'}
-                        <option value="1080p" ${isAutoDL && autodlResolved?.maxResolution !== '1080p' ? 'disabled' : ''}>1080p</option>
-                        ${isAutoDL ? '' : '<option value="780P">780P</option>'}
+                        ${isMiniMax ? '<option value="768p">768P</option><option value="1080p">2K</option>' : `${isAutoDL ? '' : '<option value="">Auto</option>'}<option value="480p">480p</option>${isAutoDL ? '<option value="768p">768p</option>' : '<option value="720p">720p</option>'}<option value="1080p" ${isAutoDL && autodlResolved?.maxResolution !== '1080p' ? 'disabled' : ''}>1080p</option>${isAutoDL ? '' : '<option value="780P">780P</option>'}`}
                     </select>
                 </label>
             </div>
@@ -12857,9 +13082,7 @@ async function pollAutoDLTask(node, out, pending, opts={}){
             }
             if(status === 'FAILED'){
                 const message = result.error || 'AutoDL 视频任务失败';
-                latest.failed = true;
-                latest.error = message;
-                latest.recoverTaskId = taskId;
+                if(out) out._pending = (out._pending || []).filter(item => item.id !== latest.id);
                 node.runStatus = 'failed';
                 node.runError = message;
                 node.running = false;
@@ -12872,12 +13095,7 @@ async function pollAutoDLTask(node, out, pending, opts={}){
         }
     } catch(err) {
         const latest = pendingById(out, pending.id);
-        if(latest){
-            latest.failed = true;
-            latest.error = err.message || 'AutoDL 任务查询失败';
-            latest.recoverTaskId = taskId;
-            latest.canvasTaskStatus = 'failed';
-        }
+        if(latest && out) out._pending = (out._pending || []).filter(item => item.id !== latest.id);
         node.runStatus = 'failed';
         node.runError = err.message || String(err);
         node.running = false;
@@ -12888,6 +13106,13 @@ async function pollAutoDLTask(node, out, pending, opts={}){
     } finally {
         activeAutoDLVideoPolls.delete(taskId);
     }
+}
+
+
+function normalizeAutoDLResolution(value){
+    const base = String(value || '768p').replace(/(横|竖|1:1)$/, '');
+    const valid = ['480p', '768p', '1080p'];
+    return valid.includes(base) ? base : '768p';
 }
 
 async function runAutoDLVideoNode(node, snapshot, out, pending, opts={}){
@@ -12908,7 +13133,7 @@ async function runAutoDLVideoNode(node, snapshot, out, pending, opts={}){
                 prompt:snapshot.prompt,
                 duration:Number(node.duration || 5),
                 aspect_ratio:node.aspectRatio || '16:9',
-                resolution:node.resolution || '768p',
+                resolution:normalizeAutoDLResolution(node.resolution),
                 seed:Number.isFinite(Number(node.seed)) ? Number(node.seed) : null,
                 images:snapshot.refs,
                 videos:videoUrls,
@@ -12942,7 +13167,187 @@ async function runAutoDLVideoNode(node, snapshot, out, pending, opts={}){
         return pollAutoDLTask(node, out, pending, opts);
     } catch(err) {
         if(!pending.task_id){
+            if(out) out._pending = (out._pending || []).filter(item => item.id !== pending.id);
+            node.runStatus = 'failed';
+            node.runError = `提交失败：${err.message || String(err)}`;
+            node.running = false;
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(opts.cascade) throw err;
+            return 'unknown_submission';
+        }
+        node.runStatus = 'failed';
+        node.runError = pending.error || err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw err;
+        return 'unknown_submission';
+    }
+}
+
+function findRunningHubVideoPending(node){
+    if(!node) return null;
+    for(const out of nodes.filter(item => item.type === 'output')){
+        const pending = (out._pending || []).find(item =>
+            item?.canvasTaskType === 'runninghub-video'
+            && item?.run?.node?.id === node.id
+            && !item?.terminal
+            && Boolean(item.task_id || item.canvasTaskId)
+        );
+        if(pending) return {out, pending};
+    }
+    return null;
+}
+
+function finishRunningHubVideoTask(node, out, pending, data, taskId='', opts={}){
+    const videos = (data?.urls || data?.videos || []).map(item => ({
+        url:outputUrlValue(item),
+        kind:'video',
+        provider_id:'runninghub',
+        status:'SUCCESS'
+    })).filter(item => item.url);
+    if(!videos.length) throw new Error('RunningHub 任务成功但未返回本地视频');
+    const meta = collectRunMeta(out, pending.id);
+    meta.run.request = {
+        ...(meta.run.request || {}),
+        provider_id:'runninghub',
+        provider_name:'RunningHub',
+        backend:'runninghub',
+        task_id:taskId,
+        status:'SUCCESS'
+    };
+    out._pending = (out._pending || []).filter(item => item.id !== pending.id);
+    appendOutputImages(out, videos, meta.run?.refs?.[0], [{...meta, kind:'video'}]);
+    mergeGeneratedOutputs(node, videos, Boolean(opts.cascade));
+    addGenerationLog({run:meta.run, outputs:videos, runMs:meta.runMs || 0});
+    node.runStatus = 'done';
+    node.runError = '';
+    node.running = false;
+    refreshRunNodes(node, out);
+    markCanvasMediaMutation();
+    scheduleSave();
+    return 'SUCCESS';
+}
+
+async function pollRunningHubVideoTask(node, out, pending, opts={}){
+    const taskId = String(pending?.task_id || pending?.canvasTaskId || '').trim();
+    if(!taskId) return 'unknown_submission';
+    if(activeRunningHubVideoPolls.has(taskId)) return 'RUNNING';
+    activeRunningHubVideoPolls.add(taskId);
+    node.running = true;
+    try {
+        for(let attempt = 0; attempt < 5760; attempt++){
+            const latest = pendingById(out, pending.id);
+            if(!latest) return 'missing';
+            const response = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`);
+            if(!response.ok) throw new Error(await responseErrorMessage(response, 'RunningHub 任务查询失败'));
+            const json = await response.json();
+            const data = json.data || json;
+            const status = String(data.status || '').toUpperCase();
+            latest.status = status.toLowerCase();
+            latest.canvasTaskStatus = latest.status;
+            latest.message = status === 'QUEUED' ? 'RunningHub 排队中' : status === 'RUNNING' ? 'RunningHub 生成中' : '';
+            latest.error = '';
+            latest.failed = false;
+            node.runStatus = status === 'QUEUED' ? 'queued' : 'running';
+            node.runError = '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(status === 'SUCCESS') return finishRunningHubVideoTask(node, out, latest, data, taskId, opts);
+            if(status === 'FAILED'){
+                const message = data.failReason || 'RunningHub 视频任务失败';
+                latest.failed = true;
+                latest.terminal = true;
+                latest.error = message;
+                latest.recoverTaskId = taskId;
+                node.runStatus = 'failed';
+                node.runError = message;
+                node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                if(opts.cascade) throw new Error(message);
+                return 'FAILED';
+            }
+            await sleep(2500);
+        }
+        throw new Error('RunningHub 任务仍在后台运行，已保存任务 ID，可稍后继续查询');
+    } catch(err) {
+        const latest = pendingById(out, pending.id);
+        if(latest && !latest.terminal){
+            latest.failed = false;
+            latest.error = err.message || 'RunningHub 任务查询暂时中断';
+            latest.recoverTaskId = taskId;
+            latest.canvasTaskStatus = 'query_error';
+        }
+        node.runStatus = latest?.terminal ? 'failed' : 'queued';
+        node.runError = err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade && latest?.terminal) throw err;
+        return latest?.terminal ? 'FAILED' : 'QUERY_ERROR';
+    } finally {
+        activeRunningHubVideoPolls.delete(taskId);
+    }
+}
+
+async function runRunningHubVideoNode(node, snapshot, out, pending, opts={}){
+    pending.provider_id = 'runninghub';
+    pending.canvasTaskType = 'runninghub-video';
+    pending.canvasTaskStatus = 'submitting';
+    pending.status = 'submitting';
+    pending.run.request = {
+        ...(pending.run.request || {}),
+        provider_id:'runninghub',
+        provider_name:'RunningHub',
+        backend:'runninghub',
+        model:node.model || ''
+    };
+    scheduleSave();
+    await saveCanvas();
+    try {
+        const response = await fetch('/api/runninghub/video-submit', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                prompt:snapshot.prompt,
+                provider_id:'runninghub',
+                model:node.model || '',
+                duration:Number(node.duration || 5),
+                aspect_ratio:node.aspectRatio || '16:9',
+                resolution:node.resolution || '',
+                images:snapshot.refs,
+                videos:manualVideoUrlForNode(node)
+                    ? [manualVideoUrlForNode(node)]
+                    : snapshot.videoRefs.map(ref => tempShUploadedUrlForNode(node, ref.url)),
+                audios:snapshot.audioRefs.map(ref => ref.url).filter(Boolean),
+                watermark:Boolean(node.watermark),
+                generate_audio:Boolean(node.generateAudio),
+                multimodal:Boolean(node.multimodal)
+            })
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'RunningHub 视频提交失败'));
+        const submission = await response.json();
+        if(submission.videos?.length && !submission.task_id){
+            return finishRunningHubVideoTask(node, out, pending, {videos:submission.videos}, '', opts);
+        }
+        if(!submission.task_id) throw new Error('RunningHub 提交成功但没有返回 task_id');
+        pending.task_id = submission.task_id;
+        pending.canvasTaskId = submission.task_id;
+        pending.status = String(submission.status || 'QUEUED').toLowerCase();
+        pending.canvasTaskStatus = pending.status;
+        pending.run.request = {
+            ...(pending.run.request || {}),
+            task_id:submission.task_id,
+            status:submission.status || 'QUEUED'
+        };
+        await saveCanvas();
+        return pollRunningHubVideoTask(node, out, pending, opts);
+    } catch(err) {
+        if(!pending.task_id){
             pending.failed = true;
+            pending.terminal = false;
             pending.status = 'unknown_submission';
             pending.canvasTaskStatus = 'unknown_submission';
             pending.error = `提交状态未知，为避免重复扣费不会自动重试：${err.message || String(err)}`;
@@ -12960,6 +13365,16 @@ async function runAutoDLVideoNode(node, snapshot, out, pending, opts={}){
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
+    if(isRunningHubVideoProvider(node.apiProvider)){
+        const existing = findRunningHubVideoPending(node);
+        if(existing){
+            node.running = true;
+            node.runStatus = existing.pending.canvasTaskStatus || existing.pending.status || 'queued';
+            node.runError = '';
+            refreshRunNodes(node, existing.out);
+            return pollRunningHubVideoTask(node, existing.out, existing.pending, opts);
+        }
+    }
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -12980,6 +13395,10 @@ async function runVideoNode(nodeId, opts={}){
     if(isAutoDLVideoProvider(node.apiProvider)){
         const pending = pendingById(out, pendingId);
         return runAutoDLVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
+    }
+    if(isRunningHubVideoProvider(node.apiProvider)){
+        const pending = pendingById(out, pendingId);
+        return runRunningHubVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
     }
     try {
         const result = await cascadeFetch('/api/canvas-video', {
@@ -14870,6 +15289,21 @@ async function queryRecoverPendingOutput(pendingId){
         scheduleSave();
         return;
     }
+    if(pending.canvasTaskType === 'runninghub-video'){
+        const node = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+        pending.failed = false;
+        pending.terminal = false;
+        pending.querying = false;
+        pending.error = '';
+        if(node){
+            node.running = true;
+            node.runStatus = 'running';
+            await pollRunningHubVideoTask(node, out, pending, {resume:true});
+        }
+        refreshNodes([out.id]);
+        scheduleSave();
+        return;
+    }
     try {
         const res = await fetch('/api/image-task-query', {
             method:'POST',
@@ -15122,6 +15556,42 @@ function resumeAutoDLVideoTasks(){
         scheduleSave();
     }
 }
+function resumeRunningHubVideoTasks(){
+    let changed = false;
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.canvasTaskType !== 'runninghub-video' || pending.terminal) return;
+            const videoNode = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+            const taskId = String(pending.task_id || pending.canvasTaskId || '').trim();
+            if(!taskId){
+                pending.failed = true;
+                pending.status = 'unknown_submission';
+                pending.canvasTaskStatus = 'unknown_submission';
+                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                if(videoNode){
+                    videoNode.running = false;
+                    videoNode.runStatus = 'failed';
+                    videoNode.runError = pending.error;
+                }
+                changed = true;
+                return;
+            }
+            pending.task_id = taskId;
+            pending.canvasTaskId = taskId;
+            pending.failed = false;
+            if(videoNode){
+                videoNode.running = true;
+                videoNode.runStatus = pending.canvasTaskStatus || pending.status || 'queued';
+                videoNode.runError = '';
+            }
+            pollRunningHubVideoTask(videoNode, out, pending, {resume:true});
+        });
+    });
+    if(changed){
+        refreshRunNodes();
+        scheduleSave();
+    }
+}
 function renderOutputMedia(item, useGridLayout=false){
     const url = outputUrlValue(item);
     const safe = escapeAttr(url);
@@ -15129,7 +15599,8 @@ function renderOutputMedia(item, useGridLayout=false){
     const kind = mediaKindForOutputItem(item);
     const grid = useGridLayout ? (meta.grid || null) : null;
     const gridStyle = grid ? ` style="grid-row:${Number(grid.row || 0) + 1};grid-column:${Number(grid.col || 0) + 1};aspect-ratio:${Math.max(1, Number(grid.w || 1))}/${Math.max(1, Number(grid.h || 1))}"` : '';
-    const timePill = meta.runMs && !meta.viewed ? `<span class="output-time-pill">${formatRunDuration(meta.runMs)}</span>` : '';
+    const runMs = Number(meta.runMs || 0) || Number(meta.run?.runMs || 0) || Number(meta.run?.request?.total_ms || 0);
+    const timePill = runMs > 0 ? `<span class="output-time-pill" title="时间">时间 ${formatRunDuration(runMs)}</span>` : '';
     if(kind === 'error'){
         const text = meta.error || meta.message || outputImageName(url) || tr('canvas.generationFailed');
         const provider = meta.run?.request?.provider_name || meta.run?.request?.provider_id || '';
@@ -15151,7 +15622,7 @@ function renderOutputMedia(item, useGridLayout=false){
         return `<div class="output-img-wrap" data-output-url="${safe}" data-missing-url="${safe}"${gridStyle}>${remoteOutputHtml(url, true)}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
     if(kind === 'video'){
-        return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasVideoPreviewHtml(url, useGridLayout ? 512 : 768, 'alt="video output" data-video-fallback-attrs="controls data-output-video-fallback=&quot;1&quot;"')}${timePill}<button class="canvas-video-play output-video-play" type="button" title="播放"><i data-lucide="play"></i></button><div class="output-video-badge"><i data-lucide="play" class="w-3 h-3"></i>VIDEO</div><button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+        return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasVideoPreviewHtml(url, useGridLayout ? 512 : 768, 'alt="video output" data-video-fallback-attrs="controls data-output-video-fallback=&quot;1&quot;"')}${timePill}<button class="canvas-video-play output-video-play" type="button" title="播放"><i data-lucide="play"></i></button><button class="output-download-btn" type="button" title="下载" data-download-url="${safe}"><i data-lucide="download" class="w-4 h-4"></i></button><div class="output-video-badge"><i data-lucide="play" class="w-3 h-3"></i>VIDEO</div><button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
     if(kind === 'audio'){
         return `<div class="output-img-wrap output-audio-wrap" data-output-url="${safe}"${gridStyle}><div class="output-audio-card"><i data-lucide="file-audio" class="w-7 h-7"></i><span>${escapeHtml(outputImageName(url))}</span><audio src="${safe}" data-url="${safe}" controls preload="metadata"></audio></div>${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
@@ -15286,11 +15757,7 @@ function navigateOutputLightbox(direction){
 }
 function createImageCardFromOutput(url, point){
     if(!ensureCanvas() || !url) return;
-    if(mediaKindForRef(url) !== 'image') return;
-    const p = point || defaultPoint(0, 0);
-    nodes.push({id:uid('img'), type:'image', x:p.x, y:p.y, url, name:outputImageName(url)});
-    render();
-    scheduleSave();
+    createImageCardFromUrl(url, point, outputImageName(url));
 }
 async function downloadUrl(url, filename){
     const res = await fetch(url);
@@ -15824,6 +16291,14 @@ function initOutputMediaToolEvents(){
     outputVideoCaptureMenu?.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
+        const timelineButton = event.target.closest('[data-lightbox-video-timeline-reference]');
+        if(timelineButton && !timelineButton.disabled){
+            const sourceNode = currentOutputLightboxSourceNode();
+            if(!sourceNode || !currentOutputLightboxUrl) return;
+            outputVideoCaptureMenu.hidden = true;
+            createVideoTimelineReference(sourceNode, outputVideoCaptureBtn, {sourceUrl:currentOutputLightboxUrl});
+            return;
+        }
         const button = event.target.closest('[data-lightbox-video-frame-mode]');
         if(!button || button.disabled) return;
         const sourceNode = currentOutputLightboxSourceNode();
@@ -16598,7 +17073,6 @@ function canConnect(fromId, toId){
     const from = nodes.find(n => n.id === fromId);
     const to = nodes.find(n => n.id === toId);
     if(!from || !to) return false;
-    if(to.type === 'image' && to.frameSourceId === from.id && (mediaKindForNode(from) === 'video' || from.type === 'output')) return true;
     if(to.type === 'realesrgan'){
         if(CANVAS_IMAGE_OUTPUT_TYPES.includes(from.type)) return !wouldCreateGeneratorCycle(fromId, toId);
         return ['image','group','output'].includes(from.type);
@@ -16619,8 +17093,13 @@ function canConnect(fromId, toId){
     if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
     return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);
 }
-function sanitizeConnections(){
-    connections = (connections || []).filter(c => canConnect(c.from, c.to));
+const FRAME_DERIVED_CONNECTION_KINDS = new Set(['frameCapture', 'timelineReference']);
+function sanitizeConnections(options={}){
+    const previous = connections || [];
+    connections = previous.filter(c => !FRAME_DERIVED_CONNECTION_KINDS.has(String(c?.kind || '')) && canConnect(c.from, c.to));
+    const changed = connections.length !== previous.length;
+    if(changed && options.save) scheduleSave();
+    return changed;
 }
 function endDrag(event=null){
     const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || knifeChanged || tempLink);

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -222,6 +224,78 @@ class AutoDLAPITests(unittest.TestCase):
             "https://media.example/reference.png", body["ref_image_0"]
         )
         self.assertEqual("https://media.example/voice.wav", body["ref_audio_0"])
+
+
+class CloudUploadUguuTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def test_uguu_upload_returns_public_url(self):
+        tmp = self.temp_dir.name
+        img = os.path.join(tmp, "aiko.png")
+        png_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
+        with open(img, "wb") as f:
+            f.write(png_bytes)
+
+        async def fake_post(url, **kw):
+            class R:
+                status_code = 200
+                content = b"{}"
+                is_success = True
+                text = '{"success":true}'
+
+                def json(self):
+                    return {
+                        "success": True,
+                        "files": [
+                            {
+                                "url": "https://h.uguu.se/test.png",
+                                "filename": "aiko.png",
+                            }
+                        ],
+                        "errors": [],
+                    }
+
+            return R()
+
+        with mock.patch("httpx.AsyncClient") as ac:
+            ac.return_value.__aenter__ = mock.AsyncMock(return_value=ac.return_value)
+            ac.return_value.__aexit__ = mock.AsyncMock(return_value=False)
+            ac.return_value.post = fake_post
+            result = asyncio.run(main.upload_video_to_uguu(img, "/assets/x.png"))
+        self.assertEqual("https://h.uguu.se/test.png", result["url"])
+        self.assertEqual("uguu", result.get("service"))
+
+    def test_auto_prefers_uguu(self):
+        calls = []
+
+        async def fake_uguu(path, source, _m=None):
+            calls.append("uguu")
+            return {
+                "url": "https://h.uguu.se/ok.png",
+                "source": source,
+                "service": "uguu",
+            }
+
+        with mock.patch.object(
+            main, "local_media_path_for_cloud_upload", return_value="/tmp/aiko.png"
+        ), mock.patch.object(
+            main,
+            "upload_video_to_uguu",
+            new=mock.AsyncMock(side_effect=fake_uguu),
+        ), mock.patch.object(
+            main,
+            "upload_video_to_litterbox",
+            new=mock.AsyncMock(side_effect=AssertionError("should not call litter")),
+        ):
+            res = asyncio.run(
+                main.upload_local_video_to_cloud("/assets/x.png", "auto")
+            )
+        self.assertEqual("uguu", calls[0])
+        self.assertEqual("https://h.uguu.se/ok.png", res["url"])
 
 
 if __name__ == "__main__":

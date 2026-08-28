@@ -80,7 +80,13 @@ assert.match(
   AutoDLVideo.resolutionValue('768p', '1:1', workflows[2]).error,
   /不支持 1:1/,
 );
-assert.equal(AutoDLVideo.workflowOptions(workflows).length, 7);
+const workflowOptions = AutoDLVideo.workflowOptions(workflows);
+assert.equal(workflowOptions.length, 7);
+assert.equal(
+  workflowOptions[0].label,
+  'H3 多图参考生视频 · minimax_h3_lightx2v_v5',
+  'model choices should show both the friendly name and the real workflow id',
+);
 assert.match(
   AutoDLVideo.explainResolutionAdjustment('1080p', '768p', longWorkflow),
   /最高支持 768p/,

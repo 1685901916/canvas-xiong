@@ -12,17 +12,21 @@ const helperIndex = canvasHtml.indexOf('/static/js/autodl-video.js');
 const canvasIndex = canvasHtml.indexOf('/static/js/canvas.js');
 assert(helperIndex >= 0, 'canvas should load the AutoDL helper');
 assert(helperIndex < canvasIndex, 'AutoDL helper must load before canvas.js');
+assert.match(canvasHtml, /autodl-video\.js\?v=2026\.08\.27-autodl-err-fix-6/);
+assert.match(canvasHtml, /canvas\.js\?v=2026\.08\.27-autodl-err-fix-6/);
 
 const addVideoStart = canvasJs.indexOf('function addVideoNode');
 const addVideoEnd = canvasJs.indexOf('function addRhNode', addVideoStart);
 const addVideoSource = canvasJs.slice(addVideoStart, addVideoEnd);
-assert.match(addVideoSource, /apiProvider\s*:\s*['"]autodl['"]/);
-assert.match(addVideoSource, /workflowMode\s*:\s*['"]auto['"]/);
-assert.match(addVideoSource, /workflowId\s*:\s*['"]['"]/);
-assert.match(addVideoSource, /resolvedWorkflowId\s*:\s*['"]minimax_h3_lightx2v_v5['"]/);
+assert.match(addVideoSource, /apiProvider\s*:\s*['"]runninghub['"]/);
+assert.match(addVideoSource, /model:\s*models\[0\]\s*\|\|\s*['"]rhart-video\/sparkvideo-2\.0\/multimodal-video['"]/);
+assert.match(addVideoSource, /duration:\s*10/);
+assert.match(addVideoSource, /aspectRatio:\s*['"]9:16['"]/);
+assert.match(addVideoSource, /resolution:\s*['"]720p['"]/);
 
 assert.match(canvasJs, /fetch\(['"]\/api\/autodl\/workflows['"]\)/);
-assert.match(canvasJs, /自动选择/);
+assert.match(canvasJs, /自动选择（推荐）/);
+assert.match(canvasJs, /生成模型/);
 assert.match(canvasJs, /autodl-workflow-reason/);
 assert.match(canvasJs, /autodl-media-counts/);
 assert.match(canvasJs, /workflowMode\s*=\s*['"]manual['"]/);
