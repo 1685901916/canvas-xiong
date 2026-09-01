@@ -25,8 +25,11 @@ assert.match(canvas, /translated\s*!==\s*key/);
 assert.match(css, /\.canvas-video-capture/);
 assert.match(css, /\.canvas-video-capture-menu/);
 assert.match(i18nLoader, /2026\.08\.27\.timeline-storyboard\.2/);
-assert.match(html, /canvas\.css\?v=2026\.08\.27-autodl-err-fix-6/);
-assert.match(html, /canvas\.js\?v=2026\.08\.27-autodl-err-fix-6/);
+// canvas.html 的 ?v= 由 sync_static_html_versions() 在每次启动时按 CANVAS_RUNTIME_VERSION
+// 重写，写死具体版本号的断言会在每次合理升级时误报。这里只校验带了版本参数；
+// 版本本身有没有跟着改，由 tests/test_runninghub_canvas_video.py 盯 CANVAS_RUNTIME_VERSION。
+assert.match(html, /canvas\.css\?v=[\w.\-]+/);
+assert.match(html, /canvas\.js\?v=[\w.\-]+/);
 
 for(const key of [
   'canvas.captureVideoFrame',

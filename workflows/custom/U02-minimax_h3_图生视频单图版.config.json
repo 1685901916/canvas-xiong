@@ -1,0 +1,49 @@
+{
+  "title": "AutoDL 自部署 MiniMax H3｜单图生视频",
+  "fields": [
+    {
+      "id": "f_prompt",
+      "node": "139",
+      "input": "prompt",
+      "name": "视频提示词",
+      "type": "textarea",
+      "default": "",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    },
+    {
+      "id": "f_image",
+      "node": "114",
+      "input": "image",
+      "name": "Aiko参考图",
+      "type": "image",
+      "default": "",
+      "min": null,
+      "max": null,
+      "step": null,
+      "options": [],
+      "random_enabled": false
+    }
+  ],
+  "mini_cards": {
+    "image": {
+      "x": 24,
+      "y": 210
+    },
+    "output": {
+      "x": 540,
+      "y": 120
+    },
+    "custom": {
+      "x": 280,
+      "y": 78
+    },
+    "prompt": {
+      "x": 24,
+      "y": 30
+    }
+  }
+}

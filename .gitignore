@@ -20,3 +20,6 @@ python/Scripts/
 final-inspection-*.png
 
 *.lnk
+
+# 会话期间的画布/源码快照，本地留存即可，不进版本库
+_backups/

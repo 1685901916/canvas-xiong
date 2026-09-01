@@ -33,6 +33,7 @@ from typing import List, Dict, Any, Optional, Tuple, Literal
 from threading import BoundedSemaphore, Lock, Thread
 import httpx
 import autodl_support as autodl
+import minimax_design_support as minimax_design
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -188,7 +189,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.08.27-autodl-err-fix-6"
+CANVAS_RUNTIME_VERSION = "2026.09.01-pending-lifecycle-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -377,6 +378,22 @@ except Exception:
 VOLCENGINE_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 VOLCENGINE_DEFAULT_PROJECT_NAME = "default"
 VOLCENGINE_DEFAULT_REGION = "cn-beijing"
+# 方舟各 Seedance 型号的时长/分辨率能力（来源：方舟模型广场「模型限制」）。
+# 超出范围时接口直接报错而不是自动收敛，所以发请求前要先夹一遍。
+# 注意这里是子串匹配：fast / mini 必须排在 seedance-2-0 之前，否则会被它先吃掉。
+VOLCENGINE_VIDEO_LIMITS = (
+    ("seedance-2-5", 4, 30, ("480p", "720p", "1080p")),
+    ("seedance-2-0-fast", 4, 15, ("480p", "720p")),
+    ("seedance-2-0-mini", 4, 15, ("480p", "720p")),
+    ("seedance-2-0", 4, 15, ("480p", "720p", "1080p", "4k")),
+)
+VOLCENGINE_VIDEO_DEFAULT_LIMITS = (1, 60, ("480p", "720p", "1080p"))
+VOLCENGINE_DEFAULT_VIDEO_MODELS = [
+    "doubao-seedance-2-5-260628",
+    "doubao-seedance-2-0-260128",
+    "doubao-seedance-2-0-fast-260128",
+    "doubao-seedance-2-0-mini-260615",
+]
 RUNNINGHUB_DEFAULT_IMAGE_MODELS = [
     "gpt-image-2.0/text-to-image-channel-low-price",
     "gpt-image-2.0/edit-channel-low-price",
@@ -889,7 +906,7 @@ def default_api_providers():
             "primary": False,
             "image_models": [],
             "chat_models": [],
-            "video_models": [],
+            "video_models": list(VOLCENGINE_DEFAULT_VIDEO_MODELS),
             "ms_loras": [],
             "ms_defaults_version": 0,
             "volcengine_project_name": VOLCENGINE_DEFAULT_PROJECT_NAME,
@@ -996,6 +1013,7 @@ def merge_default_api_providers(providers, inject_missing=True):
             if not current.get("base_url"):
                 current["base_url"] = volc_default["base_url"]
             current["protocol"] = "volcengine"
+            current["video_models"] = model_list_from_values([*VOLCENGINE_DEFAULT_VIDEO_MODELS, *(current.get("video_models") or [])])
             current["volcengine_project_name"] = str(current.get("volcengine_project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME
             current["volcengine_region"] = str(current.get("volcengine_region") or VOLCENGINE_DEFAULT_REGION).strip() or VOLCENGINE_DEFAULT_REGION
     apimart_default = next((d for d in default_api_providers() if d["id"] == "apimart"), None)
@@ -1378,6 +1396,8 @@ def normalize_provider(item):
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
     image_generation_endpoint = normalize_endpoint_override(item.get("image_generation_endpoint"), "文生图端口")
     image_edit_endpoint = normalize_endpoint_override(item.get("image_edit_endpoint"), "图生图/编辑端口")
+    chat_endpoint = normalize_endpoint_override(item.get("chat_endpoint"), "聊天端口")
+    chat_endpoint = normalize_endpoint_override(item.get("chat_endpoint"), "聊天端口")
     volc_project = re.sub(r"\s+", " ", str(item.get("volcengine_project_name") or "").strip())[:80]
     volc_region = re.sub(r"\s+", " ", str(item.get("volcengine_region") or "").strip())[:40]
     if provider_id == "volcengine":
@@ -1423,6 +1443,8 @@ def normalize_provider(item):
         "image_request_mode": image_request_mode,
         "image_generation_endpoint": image_generation_endpoint,
         "image_edit_endpoint": image_edit_endpoint,
+        "chat_endpoint": chat_endpoint,
+        "chat_endpoint": chat_endpoint,
         "enabled": bool(item.get("enabled", True)),
         "primary": bool(item.get("primary", False)),
         "image_models": image_models,
@@ -1846,21 +1868,31 @@ def sync_static_html_versions():
                 print(f"同步静态页面版本号失败({name}): {e}")
     except Exception as e:
         print(f"同步静态页面版本号失败: {e}")
-    canvas_path = os.path.join(STATIC_DIR, "canvas.html")
-    try:
-        with open(canvas_path, "r", encoding="utf-8") as f:
-            canvas_html = f.read()
-        canvas_version = urllib.parse.quote(CANVAS_RUNTIME_VERSION, safe="._-")
-        for asset in ("/static/css/canvas.css", "/static/js/autodl-video.js", "/static/js/canvas.js"):
-            canvas_html = re.sub(
-                rf'({re.escape(asset)}\?v=)[^"\'`\s<>)]*',
-                rf'\g<1>{canvas_version}',
-                canvas_html,
-            )
-        with open(canvas_path, "w", encoding="utf-8", newline="") as f:
-            f.write(canvas_html)
-    except Exception as e:
-        print(f"同步画布运行时版本号失败: {e}")
+    # 画布运行时脚本单独用 CANVAS_RUNTIME_VERSION：它们的改动频率远高于 VERSION 文件。
+    # 列表页/智能画布页的脚本也纳入进来——它们和 canvas.js 属于同一套画布逻辑，
+    # 只跟着 VERSION 走的话，改了代码用户刷新还是拿旧缓存。
+    canvas_runtime_targets = {
+        "canvas.html": ("/static/css/canvas.css", "/static/js/autodl-video.js", "/static/js/canvas.js"),
+        "canvas-list.html": ("/static/js/canvas-list.js",),
+        "smart-canvas.html": ("/static/js/smart-canvas.js",),
+    }
+    canvas_version = urllib.parse.quote(CANVAS_RUNTIME_VERSION, safe="._-")
+    for page_name, assets in canvas_runtime_targets.items():
+        page_path = os.path.join(STATIC_DIR, page_name)
+        try:
+            with open(page_path, "r", encoding="utf-8") as f:
+                page_html = f.read()
+            _ver_stop = "\"'`"  # 版本号在遇到引号/反引号时结束
+            for asset in assets:
+                page_html = re.sub(
+                    rf'({re.escape(asset)}\?v=)[^{re.escape(_ver_stop)}\s<>)]*',
+                    rf'\g<1>{canvas_version}',
+                    page_html,
+                )
+            with open(page_path, "w", encoding="utf-8", newline="") as f:
+                f.write(page_html)
+        except Exception as e:
+            print(f"同步画布运行时版本号失败({page_name}): {e}")
 
 def static_html_response(filename: str):
     path = os.path.join(STATIC_DIR, filename)
@@ -2851,6 +2883,18 @@ class AutoDLTaskRequest(BaseModel):
     first_last: bool = False
     workflow_mode: Literal["auto", "manual"] = "auto"
     workflow_id: str = ""
+
+class MiniMaxDesignVideoRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=7000)
+    duration: int = Field(default=5, ge=4, le=15)
+    aspect_ratio: str = "16:9"
+    resolution: str = "768p"
+    images: List[AIReference] = []
+    videos: List[str] = []
+    audios: List[str] = []
+    generate_audio: bool = False
+    multimodal: bool = False
+    source_node_id: str = ""
 
 class TempShUploadRequest(BaseModel):
     url: str = ""
@@ -5032,6 +5076,11 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
         base = base_root if base_root.endswith("/api/v3") else base_root + "/api/v3"
     elif protocol == "runninghub":
         base = RUNNINGHUB_LLM_BASE_URL
+    elif protocol == "apimart" and str(api_provider.get("chat_endpoint") or "").strip():
+        # Some APIMart-compatible gateways use /apimart/v1 for images but
+        # expose chat completions at a separate root /v1 endpoint.
+        chat_endpoint = str(api_provider.get("chat_endpoint") or "").strip().rstrip("/")
+        base = chat_endpoint.rsplit("/chat/completions", 1)[0].rstrip("/")
     else:
         base = base_root if base_root.endswith("/v1") else base_root + "/v1"
     hdrs = api_headers(provider=api_provider, model=mdl)
@@ -8803,6 +8852,11 @@ def build_video_timeline_reference(path: str, interval: float = 1.0) -> Dict[str
         raise RuntimeError("未找到 ffmpeg，无法拆分视频")
     media = probe_video_timeline_media(path)
     timestamps = timeline_reference_timestamps(media["duration"], interval)
+    # Container duration can be a few frames longer than the last decodable
+    # video frame. Keep the tail sample inside a conservative decode-safe range.
+    safe_tail = max(0.0, media["duration"] - max(0.1, 1.0 / max(media["fps"], 1.0)))
+    if timestamps:
+        timestamps[-1] = min(timestamps[-1], round(safe_tail, 3))
     cache_key = timeline_reference_cache_key(path, interval)
     target_dir = os.path.join(OUTPUT_OUTPUT_DIR, "timeline_references", cache_key)
     manifest_path = os.path.join(target_dir, "manifest.json")
@@ -8828,11 +8882,38 @@ def build_video_timeline_reference(path: str, interval: float = 1.0) -> Dict[str
     for index, frame_path in enumerate(frame_paths):
         command.extend([
             "-map", f"{index}:v:0", "-frames:v", "1", "-an",
-            "-vf", "scale='min(640,iw)':-2", "-q:v", "3", frame_path,
+            # JPEG/MJPEG needs full-range YUV; explicit conversion avoids
+            # FFmpeg failing on otherwise valid limited-range H.264 inputs.
+            "-vf", "scale='min(640,iw)':-2,format=yuvj420p", "-q:v", "3", frame_path,
         ])
     proc = subprocess.run(command, capture_output=True, text=True, timeout=max(120, len(timestamps) * 20))
-    if proc.returncode != 0 or not all(os.path.isfile(item) and os.path.getsize(item) > 0 for item in frame_paths):
-        raise RuntimeError((proc.stderr or "ffmpeg 未能完成视频拆帧").strip()[:500])
+    missing = [item for item in frame_paths if not os.path.isfile(item) or os.path.getsize(item) <= 0]
+    if proc.returncode != 0 or missing:
+        # Some FFmpeg builds fail when one command has repeated inputs and
+        # multiple MJPEG outputs. Fall back to one seek/output per frame.
+        fallback_errors = []
+        for timestamp, frame_path in zip(timestamps, frame_paths):
+            # Try the requested time, then nearby earlier times. This handles
+            # MP4 duration/index rounding at the final frame without failing
+            # the entire reference table.
+            attempts = [timestamp, max(0.0, round(timestamp - 0.1, 3)), max(0.0, round(timestamp - 0.25, 3))]
+            for attempt_timestamp in attempts:
+                fallback = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{attempt_timestamp:.3f}", "-i", path,
+                "-frames:v", "1", "-an",
+                "-vf", "scale='min(640,iw)':-2,format=yuvj420p",
+                "-q:v", "3", "-strict", "-2", frame_path,
+                ]
+                retry = subprocess.run(fallback, capture_output=True, text=True, timeout=30)
+                if retry.returncode == 0 and os.path.isfile(frame_path) and os.path.getsize(frame_path) > 0:
+                    break
+                if attempt_timestamp == attempts[-1]:
+                    fallback_errors.append((retry.stderr or f"timestamp={timestamp:.3f}").strip()[:240])
+        missing = [item for item in frame_paths if not os.path.isfile(item) or os.path.getsize(item) <= 0]
+        if missing:
+            detail = "; ".join(fallback_errors) or (proc.stderr or "ffmpeg 未能完成视频拆帧")
+            raise RuntimeError(detail[:800])
 
     with Image.open(frame_paths[0]) as first_frame:
         frame_width, frame_height = first_frame.size
@@ -8897,7 +8978,7 @@ def generate_video_preview_image(path: str, width: int) -> Image.Image:
             "-ss", "0.5",
             "-i", path,
             "-frames:v", "1",
-            "-vf", f"scale='min({width},iw)':-2",
+            "-vf", f"scale='min({width},iw)':-2,format=yuvj420p",
             frame_path,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -10717,18 +10798,36 @@ def volcengine_content_role(role: str, kind: str = "image") -> Optional[str]:
     # 否则火山后端会误判为 r2v(参考图生视频)，导致 seedance/seedream 等生图模型失败。
     return None
 
-def volcengine_video_duration(duration) -> int:
+def volcengine_video_limits(model: str):
+    """按 Model ID 返回 (最短秒, 最长秒, 支持的分辨率)。未知型号退回宽松默认值。"""
+    value = str(model or "").strip().lower().replace("_", "-").replace(".", "-")
+    for token, low, high, resolutions in VOLCENGINE_VIDEO_LIMITS:
+        if token in value:
+            return low, high, resolutions
+    return VOLCENGINE_VIDEO_DEFAULT_LIMITS
+
+def volcengine_video_duration(duration, model: str = "") -> int:
+    low, high, _ = volcengine_video_limits(model)
     try:
         value = int(duration)
     except Exception:
         value = 5
-    return max(1, min(60, value))
+    return max(low, min(high, value))
 
-def volcengine_video_resolution(value: str) -> str:
+def volcengine_video_resolution(value: str, model: str = "") -> str:
     text = str(value or "").strip().lower()
-    aliases = {"": "", "auto": "", "480": "480p", "720": "720p", "1080": "1080p"}
+    aliases = {"": "", "auto": "", "480": "480p", "720": "720p", "1080": "1080p", "2160": "4k", "3840": "4k"}
     text = aliases.get(text, text)
-    return text if text in {"480p", "720p", "1080p"} else ""
+    if text not in {"480p", "720p", "1080p", "4k"}:
+        return ""
+    _, _, resolutions = volcengine_video_limits(model)
+    if text in resolutions:
+        return text
+    # 该型号不支持所选分辨率时降到它支持的最高档，避免整单直接失败（与即梦侧同样的兜底策略）
+    for fallback in ("4k", "1080p", "720p", "480p"):
+        if fallback in resolutions:
+            return fallback
+    return ""
 
 def is_volcengine_seedance2_model(model: str) -> bool:
     value = str(model or "").strip().lower().replace("_", "-").replace(".", "-")
@@ -15379,6 +15478,103 @@ async def autodl_status():
     return await autodl.doctor_safe()
 
 
+def minimax_design_media_path(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme in {"http", "https"}:
+        host = str(parsed.hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return text
+        text = urllib.parse.unquote(parsed.path or "")
+    local = output_file_from_url(text)
+    if local and os.path.isfile(local):
+        return os.path.abspath(local)
+    if os.path.isabs(text) and os.path.isfile(text):
+        return os.path.abspath(text)
+    raise minimax_design.MiniMaxDesignValidationError(f"找不到画布输入素材：{str(value)[:180]}")
+
+
+@app.get("/api/minimax-design/status")
+async def minimax_design_status():
+    try:
+        return await minimax_design.MiniMaxDesignClient().health()
+    except (minimax_design.MiniMaxDesignError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=503, detail=f"MiniMax Design 本机服务不可用：{exc}") from exc
+
+
+@app.get("/api/minimax-design/models/video")
+async def minimax_design_video_models():
+    try:
+        return await minimax_design.MiniMaxDesignClient().video_models()
+    except (minimax_design.MiniMaxDesignError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=503, detail=f"无法读取 MiniMax Design 视频模型：{exc}") from exc
+
+
+@app.post("/api/minimax-design/video-submit")
+async def minimax_design_submit_video(payload: MiniMaxDesignVideoRequest, request: Request):
+    ensure_same_origin_request(request)
+    try:
+        image_paths = [minimax_design_media_path(item.url) for item in payload.images if item.url]
+        video_paths = [minimax_design_media_path(value) for value in payload.videos if value]
+        audio_paths = [minimax_design_media_path(value) for value in payload.audios if value]
+        filename = f"infinite-canvas-{int(time.time())}-{uuid.uuid4().hex[:8]}.mp4"
+        body = minimax_design.build_video_request(
+            prompt=payload.prompt,
+            duration=payload.duration,
+            aspect_ratio=payload.aspect_ratio,
+            resolution=payload.resolution,
+            generate_audio=payload.generate_audio,
+            image_paths=image_paths,
+            video_paths=video_paths,
+            audio_paths=audio_paths,
+            multimodal=payload.multimodal,
+            filename=filename,
+            source_node_id=payload.source_node_id,
+        )
+        submitted = await minimax_design.MiniMaxDesignClient().submit_video(body)
+        return {
+            "provider_id": "minimax-design-local",
+            "provider_name": "MiniMax Design（本机）",
+            "model": "MiniMax-H3",
+            "task_id": submitted["task_id"],
+            "status": "QUEUED",
+            "request_mode": body["params"]["image_mode"],
+        }
+    except minimax_design.MiniMaxDesignValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (minimax_design.MiniMaxDesignError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/minimax-design/tasks/{task_id}")
+async def minimax_design_task_status(task_id: str):
+    safe_task_id = str(task_id or "").strip()
+    if not safe_task_id or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", safe_task_id):
+        raise HTTPException(status_code=400, detail="MiniMax Design task_id 无效")
+    try:
+        result = await minimax_design.MiniMaxDesignClient().query_video(safe_task_id)
+        if result["status"] == "SUCCESS":
+            local_path = minimax_design.materialize_video(
+                result["video_path"], safe_task_id, OUTPUT_OUTPUT_DIR
+            )
+            filename = os.path.basename(local_path)
+            result["videos"] = [{
+                "url": f"/assets/output/{urllib.parse.quote(filename, safe='._-')}",
+                "kind": "video",
+            }]
+        else:
+            result["videos"] = []
+        result["provider_id"] = "minimax-design-local"
+        result.pop("video_path", None)
+        return result
+    except minimax_design.MiniMaxDesignValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (minimax_design.MiniMaxDesignError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/autodl/tasks")
 async def autodl_submit_task(payload: AutoDLTaskRequest):
     try:
@@ -18389,10 +18585,10 @@ async def canvas_video(payload: CanvasVideoRequest):
                     }
                     # 火山方舟视频接口（含 Seedance 2.0 图生视频）均通过 body 的 duration 字段控制时长；
                     # 之前对 seedance-2.0 + 参考图的情况省略了 duration，导致接口回退到默认 5s。
-                    body["duration"] = volcengine_video_duration(payload.duration)
+                    body["duration"] = volcengine_video_duration(payload.duration, volc_model)
                     if payload.aspect_ratio:
                         body["ratio"] = payload.aspect_ratio
-                    resolution = volcengine_video_resolution(payload.resolution)
+                    resolution = volcengine_video_resolution(payload.resolution, volc_model)
                     if resolution:
                         body["resolution"] = resolution
                     if payload.watermark:

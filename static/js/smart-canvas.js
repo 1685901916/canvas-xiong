@@ -1161,6 +1161,8 @@ function canvasListUrlForProject(projectId){
     return `/static/canvas-list.html?project=${encodeURIComponent(pid)}`;
 }
 function backToCanvasList(){
+    // 主动返回列表：清掉“上次打开”，否则刷新又被拉回画布，列表页待不住。
+    try { localStorage.removeItem('canvasLastOpenedId'); } catch(e){}
     savePromptDraftForCurrent();
     window.location.href = canvasListUrlForProject(canvas?.project || sourceProjectId || 'default');
 }

@@ -32,6 +32,16 @@ function rememberProjectId(pid){
     try { localStorage.setItem(CANVAS_LIST_PROJECT_KEY, pid); } catch(e){}
 }
 
+// 首页 shell 的 iframe 固定加载本页，所以刷新会把正在编辑的画布丢掉。
+// 记住上次打开的画布，启动时直接跳回去；点过“返回”的话记录已被清空，正常留在列表。
+const CANVAS_LAST_OPENED_KEY = 'canvasLastOpenedId';
+function rememberLastOpenedCanvas(id){
+    try { if(id) localStorage.setItem(CANVAS_LAST_OPENED_KEY, String(id)); } catch(e){}
+}
+function lastOpenedCanvasId(){
+    try { return localStorage.getItem(CANVAS_LAST_OPENED_KEY) || ''; } catch(e){ return ''; }
+}
+
 function formatCanvasTime(value){
     if(!value) return '--';
     const raw = Number(value);
@@ -528,6 +538,7 @@ function openCanvas(c){
     const enc = encodeURIComponent(c.id);
     const project = encodeURIComponent(c.project || currentProjectId || 'default');
     rememberProjectId(c.project || currentProjectId || 'default');
+    rememberLastOpenedCanvas(c.id);
     window.location.href = (c.kind === 'smart')
         ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`
         : `/static/canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`;
@@ -1233,6 +1244,13 @@ window.addEventListener('message', event => {
 });
 
 /* ===== Boot ===== */
+// 有“上次打开”的记录就直接回到那个画布（刷新场景）。id 失效时 canvas.js 会清掉记录
+// 并跳回本页，那时 lastOpenedCanvasId() 为空，不会来回弹。
+(function restoreLastOpenedCanvas(){
+    const lastId = lastOpenedCanvasId();
+    if(!lastId) return;
+    window.location.replace(`/static/canvas.html?id=${encodeURIComponent(lastId)}`);
+})();
 window.StudioI18n?.apply?.();
 applyViewport();
 loadAll();

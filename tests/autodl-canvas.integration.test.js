@@ -12,8 +12,11 @@ const helperIndex = canvasHtml.indexOf('/static/js/autodl-video.js');
 const canvasIndex = canvasHtml.indexOf('/static/js/canvas.js');
 assert(helperIndex >= 0, 'canvas should load the AutoDL helper');
 assert(helperIndex < canvasIndex, 'AutoDL helper must load before canvas.js');
-assert.match(canvasHtml, /autodl-video\.js\?v=2026\.08\.27-autodl-err-fix-6/);
-assert.match(canvasHtml, /canvas\.js\?v=2026\.08\.27-autodl-err-fix-6/);
+// canvas.html 的 ?v= 由 sync_static_html_versions() 在每次启动时按 CANVAS_RUNTIME_VERSION
+// 重写，写死具体版本号的断言会在每次合理升级时误报。这里只校验带了版本参数；
+// 版本本身有没有跟着改，由 tests/test_runninghub_canvas_video.py 盯 CANVAS_RUNTIME_VERSION。
+assert.match(canvasHtml, /autodl-video\.js\?v=[\w.\-]+/);
+assert.match(canvasHtml, /canvas\.js\?v=[\w.\-]+/);
 
 const addVideoStart = canvasJs.indexOf('function addVideoNode');
 const addVideoEnd = canvasJs.indexOf('function addRhNode', addVideoStart);

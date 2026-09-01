@@ -374,10 +374,13 @@ let pendingPurgeCanvasId = null;
 let emojiPickerCanvasId = null;
 let canvasSortMode = (() => { try { return localStorage.getItem('canvasSortMode') || 'recent'; } catch(e){ return 'recent'; } })();
 const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
+const CANVAS_LAST_OPENED_KEY = 'canvasLastOpenedId';
 const CANVAS_COLOR_OPTIONS = ['red','orange','amber','green','teal','blue','violet','pink','slate'];
 let canvasMetaAnchorId = '';
 // 先绑定返回，避免编辑器后续初始化较慢时丢失来源项目。
 backToManagerBtn?.addEventListener('click', () => {
+    // 主动返回列表：清掉"上次打开"，否则刷新又会被拉回画布，列表页就再也待不住了。
+    forgetLastOpenedCanvas();
     window.location.href = canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject());
 });
 let localCanvasDirty = false;
@@ -466,6 +469,8 @@ let managerSelectedPromptIds = new Set();
 const activeCanvasTaskPolls = new Set();
 const activeAutoDLVideoPolls = new Set();
 const activeRunningHubVideoPolls = new Set();
+const activeMiniMaxDesignVideoPolls = new Set();
+let miniMaxDesignVideoModels = [{id:'MiniMax-H3', name:'MiniMax H3'}];
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
 let undoStack = [];
@@ -539,7 +544,7 @@ const CANVAS_THEME_KEY = 'canvas_theme';
 const QUICK_TOOLBAR_COLLAPSED_KEY = 'canvas_quick_toolbar_collapsed';
 const CANVAS_SESSION_VIEWPORTS_KEY = 'canvas_session_viewports_v1';
 let canvasSessionViewportFallback = {};
-let quickToolbarExpanded = false;
+let quickToolbarExpanded = true;
 const DEFAULT_VIDEO_MODELS = [
     // Veo
     'veo2', 'veo2-fast', 'veo2-pro',
@@ -928,7 +933,24 @@ function sanitizeImageNodeProviderModel(node){
 function videoApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
         .filter(p => p.id !== 'modelscope' && p.enabled !== false && (p.video_models || []).length);
-    return providers.length ? providers : defaultApiProviders();
+    const selfHosted = {id:'autodl-cloud', name:'AutoDL 云端部署', video_models:[
+        'U02-minimax_h3_图生视频单图版',
+        'U02-minimax_h3_图生视频基础版-V2',
+        'U02-minimax_h3_多图视频参考版'
+    ], model_names:{
+        'U02-minimax_h3_图生视频单图版':'MiniMax H3 · 自部署单图视频',
+        'U02-minimax_h3_图生视频基础版-V2':'MiniMax H3 · 自部署基础版 V2',
+        'U02-minimax_h3_多图视频参考版':'MiniMax H3 · 自部署多图/视频参考'
+    }};
+    const list = providers.filter(p => p.id !== selfHosted.id);
+    list.push(selfHosted);
+    if(!list.some(p => p.id === 'minimax-design-local')) list.push({
+        id:'minimax-design-local',
+        name:'MiniMax Design（本机）',
+        video_models:miniMaxDesignVideoModels.map(model => model.id),
+        model_names:Object.fromEntries(miniMaxDesignVideoModels.map(model => [model.id, model.name || model.id]))
+    });
+    return list.length ? list : [selfHosted];
 }
 function resolveVideoProviderId(id){
     const providers = videoApiProviders();
@@ -941,10 +963,22 @@ function videoProviderOptions(selectedId){
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
+    if(String(providerId || '').trim().toLowerCase() === 'autodl-cloud') return [
+        'U02-minimax_h3_图生视频单图版',
+        'U02-minimax_h3_图生视频基础版-V2',
+        'U02-minimax_h3_多图视频参考版'
+    ];
+    if(isMiniMaxDesignVideoProvider(providerId)) return miniMaxDesignVideoModels.map(model => model.id);
     return uniqueModels(provider?.video_models || []);
 }
 function isAutoDLVideoProvider(providerId){
     return String(providerId || '').trim().toLowerCase() === 'autodl';
+}
+function isAutoDLCloudVideoProvider(providerId){
+    return String(providerId || '').trim().toLowerCase() === 'autodl-cloud';
+}
+function isMiniMaxDesignVideoProvider(providerId){
+    return String(providerId || '').trim().toLowerCase() === 'minimax-design-local';
 }
 function isRunningHubVideoProvider(providerId){
     const id = String(providerId || '').trim();
@@ -953,6 +987,20 @@ function isRunningHubVideoProvider(providerId){
 }
 function isMinimaxVideoProvider(providerId){
     return String(providerId || '').trim().toLowerCase() === 'minimax';
+}
+async function loadMiniMaxDesignVideoModels(){
+    try {
+        const response = await fetch('/api/minimax-design/models/video');
+        if(!response.ok) return miniMaxDesignVideoModels;
+        const data = await response.json();
+        const models = (Array.isArray(data) ? data : (data.models || []))
+            .filter(model => model && model.backend === 'minimax_v3' && model.id === 'MiniMax-H3')
+            .map(model => ({id:model.id, name:model.name || model.id, params:model.params || {}}));
+        if(models.length) miniMaxDesignVideoModels = models;
+        return miniMaxDesignVideoModels;
+    } catch(_) {
+        return miniMaxDesignVideoModels;
+    }
 }
 function autodlWorkflowOptions(node){
     const mode = node?.workflowMode === 'manual' ? 'manual' : 'auto';
@@ -983,7 +1031,15 @@ function videoModelOptions(selectedModel, providerId){
     }
     const selected = selectedModel || models[0];
     const providerMeta = apiProviders.find(function(p){ return p.id === providerId; }) || {};
-    const labels = Object.assign({}, providerMeta.model_names || {}, {'MiniMax-H3':'MiniMax H3（官方 · 2K/768P）'});
+    const selfHostedLabels = String(providerId || '').trim().toLowerCase() === 'autodl-cloud' ? {
+        'U02-minimax_h3_图生视频单图版':'MiniMax H3 · 自部署单图视频',
+        'U02-minimax_h3_图生视频基础版-V2':'MiniMax H3 · 自部署基础版 V2',
+        'U02-minimax_h3_多图视频参考版':'MiniMax H3 · 自部署多图/视频参考'
+    } : {};
+    const localLabels = isMiniMaxDesignVideoProvider(providerId)
+        ? Object.fromEntries(miniMaxDesignVideoModels.map(model => [model.id, `${model.name || model.id}（MiniMax Design 本机）`]))
+        : {};
+    const labels = Object.assign({}, providerMeta.model_names || {}, selfHostedLabels, localLabels, {'MiniMax-H3':localLabels['MiniMax-H3'] || 'MiniMax H3（官方 · 2K/768P）'});
     return uniqueModels([selected, ...models]).filter(Boolean).map(model => {
         const label = labels[model] || model;
         return `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
@@ -1905,8 +1961,47 @@ function preserveLocalRuntimeNodeState(remoteNodes=[]){
         return merged;
     });
 }
+// 本地已删除、但可能还没成功同步到服务端的节点 id。
+// 合并远端时用它把这些节点挡掉：合并逻辑是"远端有、本地没有就补上"，
+// 分不清"别的客户端新增"和"我刚删了"，不挡就会把刚删的节点又加回来。
+// 保存成功后清空——那时删除已经落库，远端不会再带回来。
+const deletedNodeIds = new Set();
+function markNodesDeleted(ids){
+    (ids || []).forEach(id => { if(id) deletedNodeIds.add(id); });
+}
+function clearDeletedNodeMarks(){
+    deletedNodeIds.clear();
+}
+function dropDeletedFromRemote(remoteNodes, remoteConnections){
+    return {
+        nodes: (remoteNodes || []).filter(node => !(node?.id && deletedNodeIds.has(node.id))),
+        connections: (remoteConnections || []).filter(conn => !deletedNodeIds.has(conn?.from) && !deletedNodeIds.has(conn?.to)),
+    };
+}
+
+// 取"真正的服务端任务 id"。提交没拿到 task_id 时，canvasTaskId 会被兜底成本地
+// pending 自己的 id（形如 p_xxx_时间戳），拿它去查询永远 404，节点就一直卡在
+// "运行中"、输出定时器一直空转。这里把这种情况判成"没有任务 id"，
+// 让调用方走已有的 unknown_submission 分支：标记失败并停止轮询。
+// 上游任务已经消失（404 / 未找到 / 已过期 / 被清理）——这是永久状态，不是临时抖动。
+// 必须标成终态，否则恢复逻辑会一直把节点置回"生成中"，用户既看不到失败也没法重新生成。
+function isUpstreamTaskGone(status, message){
+    if(Number(status) === 404) return true;
+    return /未找到|不存在|已过期|被清理|not\s*found/i.test(String(message || ''));
+}
+
+function serverTaskIdOf(pending){
+    const id = String(pending?.task_id || pending?.canvasTaskId || '').trim();
+    if(!id) return '';
+    if(id === String(pending?.id || '')) return '';
+    if(/^p_[0-9a-z]+_\d+$/i.test(id)) return '';
+    return id;
+}
+
 function mergeRemoteCanvasIntoLocalForSave(remote){
     if(!remote || !canvas || remote.id !== canvas.id) return false;
+    const prunedRemote = dropDeletedFromRemote(remote.nodes, remote.connections);
+    remote = {...remote, nodes: prunedRemote.nodes, connections: prunedRemote.connections};
     const localNodes = nodes || [];
     const localById = new Map(localNodes.filter(node => node?.id).map(node => [node.id, node]));
     const remoteById = new Map((remote.nodes || []).filter(node => node?.id).map(node => [node.id, node]));
@@ -2028,6 +2123,8 @@ async function saveCanvas(){
             return;
         }
         if(!res.ok) throw new Error('save failed');
+        // 删除已经落库，远端不会再把它们带回来，墓碑可以清了。
+        clearDeletedNodeMarks();
         const data = await res.json().catch(() => ({}));
         const localViewport = {...viewport};
         if(data.canvas){
@@ -2673,6 +2770,7 @@ async function openCanvas(id){
         resetCascadeRuntimeState();
         canvas = data.canvas;
         rememberCanvasListProject(canvas.project || 'default');
+        rememberLastOpenedCanvas(canvas.id);
         const touched = await touchCanvasOpened(canvas.id);
         if(touched?.updated_at) canvas.updated_at = Number(touched.updated_at);
         if((canvas.kind || 'classic') === 'smart'){
@@ -2694,17 +2792,23 @@ async function openCanvas(id){
         selected.clear();
         setCanvasMode(true);
         renderCanvasList();
+        loadMiniMaxDesignVideoModels().then(() => {
+            if(nodes.some(node => node.type === 'video' && isMiniMaxDesignVideoProvider(node.apiProvider))) render();
+        });
         render();
         refreshMissingCanvasAssetsInBackground();
         resumeCanvasImageTasks();
         resumeAutoDLVideoTasks();
         resumeRunningHubVideoTasks();
+        resumeMiniMaxDesignVideoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
         setStatus(tr('canvas.openFailed'));
         console.error(e);
-        // 打开失败（id 无效/已删除）：回到选画布页面，避免停在空白编辑器。
+        // 打开失败（id 无效/已删除）：清掉记录并回到选画布页面，避免停在空白编辑器、
+        // 也避免下次刷新拿着同一个坏 id 再失败一次。
+        forgetLastOpenedCanvas();
         window.location.replace(canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject()));
     }
 }
@@ -2721,7 +2825,8 @@ function applyRemoteCanvasData(remote){
         const localViewport = localViewportForCanvas(canvas.id, viewport || remote.viewport || {x:0, y:0, scale:1});
         const localSelectedIds = new Set(selected);
         const localLogs = canvas.logs || [];
-        canvas = remote;
+        const prunedRemote = dropDeletedFromRemote(remote.nodes, remote.connections);
+        canvas = {...remote, nodes: prunedRemote.nodes, connections: prunedRemote.connections};
         canvas.logs = mergeCanvasLogs(canvas.logs || [], localLogs);
         nodes = preserveLocalRuntimeNodeState(canvas.nodes || []);
         lockVideoNodeConfigToPendingTask(nodes);
@@ -2742,6 +2847,7 @@ function applyRemoteCanvasData(remote){
         resumeCanvasImageTasks();
         resumeAutoDLVideoTasks();
         resumeRunningHubVideoTasks();
+        resumeMiniMaxDesignVideoTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -3174,6 +3280,20 @@ function rememberedCanvasListProject(){
     try { return localStorage.getItem(CANVAS_LIST_PROJECT_KEY) || 'default'; } catch(e){ return 'default'; }
 }
 
+// 首页 shell 的 iframe 固定加载 /static/canvas.html（不带 ?id），刷新时就是这种情况。
+// 记住上次打开的画布，没有 ?id 时用它恢复现场，而不是把人甩回列表页。
+function rememberLastOpenedCanvas(id){
+    try { if(id) localStorage.setItem(CANVAS_LAST_OPENED_KEY, String(id)); } catch(e){}
+}
+
+function forgetLastOpenedCanvas(){
+    try { localStorage.removeItem(CANVAS_LAST_OPENED_KEY); } catch(e){}
+}
+
+function lastOpenedCanvasId(){
+    try { return localStorage.getItem(CANVAS_LAST_OPENED_KEY) || ''; } catch(e){ return ''; }
+}
+
 function requestedCanvasListProject(){
     try { return new URLSearchParams(window.location.search).get('project') || ''; } catch(e){ return ''; }
 }
@@ -3243,7 +3363,7 @@ function addLLMNode(point){
         llmProvider:providerId,
         model:resolveChatModel('', providerId),
         mode:'node',
-        systemPrompt:'You are a helpful assistant. Rewrite the input into a concise image prompt.',
+        systemPrompt:SEEDANCE_VIDEO_PROMPT_SYSTEM,
         chatInput:'',
         messages:[],
         outputText:'',
@@ -3321,6 +3441,58 @@ function canvasAgentLatestGeneratorId(){
     const failed = [...nodes].reverse().find(n => n.type === 'generator' && (n.runStatus === 'failed' || n.runError));
     if(failed) return failed.id;
     return [...nodes].reverse().find(n => n.type === 'generator')?.id || '';
+}
+function canvasGroupList(){
+    return nodes.filter(n => n.type === 'group');
+}
+function canvasGroupSequence(group){
+    const index = canvasGroupList().findIndex(item => item.id === group?.id);
+    return index >= 0 ? `G${index + 1}` : 'G?';
+}
+function canvasGroupLabel(group){
+    return `${canvasGroupSequence(group)} · Group`;
+}
+function canvasSelectedGroupId(){
+    return [...selected].map(id => nodes.find(n => n.id === id)).find(n => n?.type === 'group')?.id || '';
+}
+function canvasPromptNodeForGroup(text, groupId){
+    const group = nodes.find(n => n.id === groupId && n.type === 'group');
+    const cleanText = String(text || '').trim();
+    if(!group || !cleanText) return null;
+    const existing = (group.items || []).map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const promptNodes = existing.filter(n => n.type === 'prompt');
+    const promptNode = {
+        id:uid('prompt'),
+        type:'prompt',
+        x:Number(group.x || 0) + 28,
+        y:Number(group.y || 0) + 86 + promptNodes.length * 236,
+        w:Math.max(340, Math.min(560, Number(group.w || 420) - 56)),
+        h:220,
+        text:cleanText,
+        name:`${canvasGroupSequence(group)} 对话提示词`,
+        source:'canvas-chat'
+    };
+    nodes.push(promptNode);
+    group.items = Array.isArray(group.items) ? [...group.items, promptNode.id] : [promptNode.id];
+    group.h = Math.max(Number(group.h || 0), promptNode.y - Number(group.y || 0) + promptNode.h + 24);
+    return promptNode;
+}
+function putLLMOutputIntoGroup(nodeId, groupId=''){
+    const source = nodes.find(n => n.id === nodeId && n.type === 'llm');
+    const text = String(source?.outputText || '').trim();
+    const targetId = groupId || canvasSelectedGroupId();
+    const group = nodes.find(n => n.id === targetId && n.type === 'group');
+    if(!text){ alert('当前对话还没有可放入 Group 的输出。'); return null; }
+    if(!group){ alert('请先选中一个 Group，或在目标下拉框中选择 Group。'); return null; }
+    pushUndo();
+    const promptNode = canvasPromptNodeForGroup(text, group.id);
+    if(!promptNode) return null;
+    selected = new Set([group.id, promptNode.id]);
+    syncGeneratorInputs();
+    render();
+    scheduleSave();
+    canvasAgentMessage(`已将对话输出放入 ${canvasGroupLabel(group)}，Prompt 节点保持可见。`);
+    return promptNode;
 }
 async function canvasAgentReloadCanvas(){
     if(!canvas?.id) return null;
@@ -7712,7 +7884,7 @@ function renderNode(node){
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
     if(node.type === 'realesrgan') hydrateRealESRGANLastResult(node);
-    const title = node.type === 'image' ? 'Image' : node.type === 'timelineReference' ? videoFrameText('canvas.timelineReferenceTitle', '时间参考表', 'Timeline Reference') : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'realesrgan' ? tr('canvas.realesrganTitle') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'timelineReference' ? videoFrameText('canvas.timelineReferenceTitle', '时间参考表', 'Timeline Reference') : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? canvasGroupLabel(node) : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'realesrgan' ? tr('canvas.realesrganTitle') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const displayRunStatus = node.runStatus || (node.type === 'realesrgan' && node.lastResult ? 'done' : '');
@@ -7845,7 +8017,14 @@ function renderNode(node){
         if(imgCount) parts.push(`${imgCount} ${tr('canvas.imageCount')}`);
         if(promptCount) parts.push(`${promptCount} ${tr('canvas.promptCount')}`);
         const text = parts.length ? `${parts.join(' · ')} ${tr('canvas.grouped')}` : tr('canvas.groupEmpty');
-        body.innerHTML = `<div class="text-[11px] text-gray-400">${text}</div>`;
+        body.innerHTML = `<div class="group-sequence-hint">${canvasGroupSequence(node)} · 选择此组后，可将对话输出放入这里</div><div class="text-[11px] text-gray-400">${text}</div><button type="button" class="group-target-btn">将此组设为对话目标</button>`;
+        body.querySelector('.group-target-btn').onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            selected = new Set([node.id]);
+            refreshSelectionVisuals();
+            canvasAgentMessage(`${canvasGroupLabel(node)} 已设为对话提示词目标。`);
+        };
         const previewItems = groupImageItems(node);
         if(previewItems.length){
             const openGroupPreview = e => {
@@ -7981,7 +8160,10 @@ function bindOutputWrap(wrap, node){
             e.stopPropagation();
             const pid = wrap.dataset.pendingId;
             if(pid){
+                // 之前这里漏了 scheduleSave()：卡片从界面消失但没写回服务端，
+                // 一刷新原样回来，用户以为"删不掉"。
                 node._pending = (node._pending || []).filter(p => p.id !== pid);
+                scheduleSave();
             } else {
                 const url = img?.dataset.url || video?.dataset.url || audio?.dataset.url || wrap.dataset.outputUrl || wrap.dataset.missingUrl || '';
                 node.images = (node.images || []).filter(item => outputUrlValue(item) !== url);
@@ -9622,6 +9804,7 @@ function renderLLMBody(node){
     const modelOpts = chatModelOptions(node.model, llmProv);
     const imgs = llmInputImages(node);
     const videos = llmInputVideos(node);
+    if((imgs.length || videos.length) && (!node.systemPrompt || node.systemPrompt === 'You are a helpful assistant. Rewrite the input into a concise image prompt.')) node.systemPrompt = SEEDANCE_VIDEO_PROMPT_SYSTEM;
     const mediaBadgeText = [
         imgs.length ? `${imgs.length} 张图片` : '',
         videos.length ? `${videos.length} 个视频` : ''
@@ -9634,6 +9817,7 @@ function renderLLMBody(node){
             <select class="select-lite llm-model">${modelOpts}</select>
             <div class="llm-mode"><button data-mode="node">${tr('canvas.nodeMode')}</button><button data-mode="chat">${tr('canvas.chatMode')}</button></div>
             <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button">System</button>
+            <button class="llm-seedance-toggle" type="button" title="应用 Seedance 视频提示词规范">Seedance规范</button>
         </div>
         ${imgBadge}
         ${node.showSystem ? `<textarea class="llm-system" placeholder="${tr('canvas.systemPrompt')}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
@@ -9664,6 +9848,7 @@ function renderLLMBody(node){
         scheduleSave();
     };
     wrap.querySelector('.llm-sys-toggle').onclick = e => { e.stopPropagation(); node.showSystem = !node.showSystem; render(); scheduleSave(); };
+    wrap.querySelector('.llm-seedance-toggle').onclick = e => { e.stopPropagation(); node.systemPrompt = SEEDANCE_VIDEO_PROMPT_SYSTEM; node.showSystem = true; render(); scheduleSave(); };
     const sysEl = wrap.querySelector('.llm-system');
     if(sysEl){ sysEl.oninput = e => { node.systemPrompt = e.target.value; scheduleSave(); }; bindScrollableText(sysEl); }
     wrap.querySelectorAll('[data-mode]').forEach(btn => {
@@ -9692,7 +9877,7 @@ function renderLLMNodePane(container, node){
         <div class="llm-pane-label">Input${isReadonly ? ' <span style="font-size:9px;opacity:.5;font-weight:600;text-transform:none;letter-spacing:0">(来自连接)</span>' : ''}</div>
         <textarea class="llm-input-area llm-input-output" style="height:${inputHeight}px; flex:0 0 ${inputHeight}px;" ${isReadonly ? 'readonly' : ''} placeholder="${inputPlaceholder}">${escapeHtml(inputValue)}</textarea>
         <div class="llm-pane-resizer" title="${tr('canvas.resizePanes')}"></div>
-        <div class="llm-pane-label">Output</div>
+        <div class="llm-pane-label-row"><div class="llm-pane-label">Output</div><div class="llm-output-actions"><button class="llm-export-prompt" type="button" title="把输出创建为可直接使用的提示词节点">导出提示词节点</button><button class="llm-export-group" type="button" title="把输出放入指定 Group">放入 Group</button></div></div>
         <div class="llm-output-wrap" style="height:${outputHeight}px; flex:0 0 ${outputHeight}px;">
             <button class="llm-copy-btn llm-output-copy" type="button" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
             <div class="llm-output llm-result-output">${escapeHtml(node.outputText || tr('canvas.llmOutputEmpty'))}</div>
@@ -9711,6 +9896,8 @@ function renderLLMNodePane(container, node){
     bindScrollableText(container.querySelector('.llm-result-output'));
     container.querySelector('.llm-pane-resizer').onmousedown = e => startLLMPaneResize(e, node);
     container.querySelector('.llm-run').onclick = e => { e.stopPropagation(); runLLMNode(node.id); };
+    container.querySelector('.llm-export-prompt').onclick = e => { e.stopPropagation(); exportLLMOutputToPromptNode(node.id); };
+    container.querySelector('.llm-export-group').onclick = e => { e.stopPropagation(); putLLMOutputIntoGroup(node.id, node.chatTargetGroupId || canvasSelectedGroupId()); };
     bindCascadeButtons(container, node.id);
     const copyBtn = container.querySelector('.llm-output-copy');
     if(copyBtn){
@@ -9728,15 +9915,23 @@ function renderLLMNodePane(container, node){
 }
 function renderLLMChatPane(container, node){
     const messages = node.messages || [];
+    const groups = canvasGroupList();
+    const targetGroupId = node.chatTargetGroupId || canvasSelectedGroupId() || groups[0]?.id || '';
     container.innerHTML = `
         <div class="llm-chat-log">${messages.length ? messages.map((msg, mi) => `<div class="llm-bubble ${msg.role === 'user' ? 'user' : 'assistant'}" data-msg-idx="${mi}">${escapeHtml(msg.content || '')}${msg.role === 'assistant' ? `<button class="llm-bubble-copy" type="button" title="复制"><i data-lucide="copy" style="width:11px;height:11px;display:inline-block;vertical-align:middle"></i></button>` : ''}</div>`).join('') : `<div class="text-[11px] text-gray-300">${tr('canvas.startChat')}</div>`}</div>
         <textarea class="llm-chat-input mt-2" rows="2" placeholder="${tr('canvas.chatInput')}">${escapeHtml(node.chatInput || '')}</textarea>
+        <div class="llm-group-target-row"><span>对话提示词放入</span><select class="llm-target-group" ${groups.length ? '' : 'disabled'}>${groups.length ? groups.map(group => `<option value="${escapeAttr(group.id)}" ${group.id === targetGroupId ? 'selected' : ''}>${escapeHtml(canvasGroupLabel(group))}</option>`).join('') : '<option>暂无 Group</option>'}</select><button class="llm-export-group" type="button" ${groups.length && node.outputText ? '' : 'disabled'}>放入 Group</button></div>
         <button class="llm-run mt-2" ${node.running ? 'disabled' : ''}><i data-lucide="send" class="w-4 h-4"></i>${node.running ? tr('canvas.sending') : 'Send'}</button>
     `;
     bindScrollableText(container.querySelector('.llm-chat-log'));
     bindScrollableText(container.querySelector('.llm-chat-input'));
     const chatInputEl = container.querySelector('.llm-chat-input');
     chatInputEl.oninput = e => { node.chatInput = e.target.value; scheduleSave(); };
+    const targetGroupEl = container.querySelector('.llm-target-group');
+    if(targetGroupEl){
+        node.chatTargetGroupId = targetGroupEl.value || targetGroupId;
+        targetGroupEl.onchange = e => { node.chatTargetGroupId = e.target.value; scheduleSave(); };
+    }
     chatInputEl.onkeydown = e => {
         if(e.key === 'Enter' && !e.shiftKey && !e.isComposing){
             e.preventDefault();
@@ -9745,6 +9940,7 @@ function renderLLMChatPane(container, node){
         }
     };
     container.querySelector('.llm-run').onclick = e => { e.stopPropagation(); runLLMChat(node.id); };
+    container.querySelector('.llm-export-group').onclick = e => { e.stopPropagation(); putLLMOutputIntoGroup(node.id, node.chatTargetGroupId || targetGroupId); };
     container.querySelectorAll('.llm-bubble-copy').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = async e => {
@@ -10503,6 +10699,66 @@ function renderGeneratorBody(node){
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
+// —— 火山方舟 Seedance 计费估算 ——
+// 官方公式（方舟模型广场「价格示例」）：
+//   视频费用 = Token单价 × Token用量
+//   Token用量 = (输出宽 × 输出高 × 输出帧率 × 输出时长) / 1024
+//   含视频输入时，时长按 (输入 + 输出) 计，所以参考视频越长越贵。
+// 下面的 tokens/秒 是用官方示例反算出来的（24fps），四个型号的示例值都能对上。
+const ARK_SEEDANCE_TOKENS_PER_SEC = {
+    // 2.5 的 480P 画幅比 2.0 小一档，单独列
+    '2-5':     {'480p':9607.5, '720p':21600, '1080p':48600},
+    'default': {'480p':10044,  '720p':21600, '1080p':48600, '4k':194400},
+};
+// 刊例价，元/百万 tokens：[不含视频输入, 含视频输入]
+const ARK_SEEDANCE_UNIT_PRICE = {
+    '2-0':      {'480p':[46,28], '720p':[46,28], '1080p':[51,31], '4k':[26,16]},
+    '2-0-fast': {'480p':[37,22], '720p':[37,22]},
+    '2-0-mini': {'480p':[23,14], '720p':[23,14]},
+    '2-5':      {'480p':[70,42], '720p':[70,42], '1080p':[77,46]},
+};
+function arkSeedanceVariant(model){
+    const v = String(model || '').toLowerCase().replace(/[_.]/g, '-');
+    if(!v.includes('seedance')) return '';
+    if(v.includes('seedance-2-5')) return '2-5';
+    if(v.includes('seedance-2-0-fast')) return '2-0-fast';
+    if(v.includes('seedance-2-0-mini')) return '2-0-mini';
+    if(v.includes('seedance-2-0')) return '2-0';
+    return '';
+}
+function arkSeedanceEstimate(model, duration, resolution, hasVideoInput){
+    const variant = arkSeedanceVariant(model);
+    if(!variant) return null;
+    const res = String(resolution || '').toLowerCase();
+    if(!res) return {variant, needResolution:true};
+    const pair = (ARK_SEEDANCE_UNIT_PRICE[variant] || {})[res];
+    const perSec = (ARK_SEEDANCE_TOKENS_PER_SEC[variant === '2-5' ? '2-5' : 'default'] || {})[res];
+    if(!pair || !perSec) return {variant, unsupported:true, resolution:res};
+    const seconds = Math.max(0, Number(duration) || 0);
+    if(!seconds) return {variant, needResolution:false, yuan:0, seconds:0};
+    const unit = hasVideoInput ? pair[1] : pair[0];
+    const tokens = perSec * seconds;
+    return {
+        variant, resolution:res, unit, tokens, seconds,
+        hasVideoInput:Boolean(hasVideoInput),
+        yuan: tokens * unit / 1e6,
+        perSecond: perSec * unit / 1e6,
+    };
+}
+function arkSeedanceCostText(model, duration, resolution, hasVideoInput){
+    const est = arkSeedanceEstimate(model, duration, resolution, hasVideoInput);
+    if(!est) return '';
+    if(est.needResolution) return '选择分辨率后显示预估费用';
+    if(est.unsupported) return `该型号不支持 ${est.resolution}，提交时会自动降档`;
+    if(!est.seconds) return '';
+    const yuan = est.yuan.toFixed(2);
+    const per = est.perSecond.toFixed(2);
+    const base = `约 ¥${yuan}（${per} 元/秒 × ${est.seconds}s，${est.unit} 元/百万tokens）`;
+    return est.hasVideoInput
+        ? `≥ ¥${yuan} · 含视频参考按「参考+输出」总时长计费，参考视频越长越贵`
+        : base;
+}
+
 function renderVideoBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -10518,7 +10774,7 @@ function renderVideoBody(node){
     const autodlVideos = autodlRefs.filter(ref => mediaKindForRef(ref) === 'video').map(ref => ref.url);
     const autodlPrompt = ordered.map(src => src.prompt).filter(Boolean).join('\n\n');
     const autodlResolutionBase = String(node.resolution || '768p').replace(/(横|竖|1:1)$/, '');
-    const isMiniMax = isMinimaxVideoProvider(node.apiProvider);
+    const isMiniMax = isMinimaxVideoProvider(node.apiProvider) || isMiniMaxDesignVideoProvider(node.apiProvider);
     const autodlResolved = isAutoDL ? window.AutoDLVideo.resolveWorkflow({
         prompt:autodlPrompt,
         duration:Number(node.duration || 5),
@@ -10607,6 +10863,7 @@ function renderVideoBody(node){
                 <button type="button" class="setting-check ${node.useFrameRoles ? 'active' : ''}" data-video-toggle="useFrameRoles"><span class="check-dot"></span>${tr('canvas.videoFirstLastFrames')}</button>
                 `}
             </div>
+            <div class="video-cost-hint" hidden></div>
         </div>
         <div class="gen-run-row">
             <button class="gen-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="clapperboard" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.videoGenerate')}</button>
@@ -10623,6 +10880,15 @@ function renderVideoBody(node){
     durationSelect.value = String(node.duration || 5);
     aspectSelect.value = node.aspectRatio || '16:9';
     resolutionSelect.value = node.resolution || '';
+    const costHint = wrap.querySelector('.video-cost-hint');
+    // 只有火山方舟的 Seedance 有公开的 token 计费公式，其它平台留空不显示
+    function refreshVideoCostHint(){
+        if(!costHint) return;
+        const text = arkSeedanceCostText(node.model, node.duration || 5, node.resolution, autodlVideos.length > 0);
+        costHint.textContent = text;
+        costHint.hidden = !text;
+    }
+    refreshVideoCostHint();
     [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect].forEach(input => {
         input.onmousedown = e => e.stopPropagation();
         input.onclick = e => e.stopPropagation();
@@ -10630,6 +10896,7 @@ function renderVideoBody(node){
     providerSelect.onchange = e => {
         e.stopPropagation();
         node.apiProvider = e.target.value;
+        if(isMiniMaxDesignVideoProvider(node.apiProvider)) loadMiniMaxDesignVideoModels().then(() => render());
         const models = providerVideoModels(node.apiProvider);
         if(isAutoDLVideoProvider(node.apiProvider)){
             node.workflowMode = 'auto';
@@ -10652,11 +10919,11 @@ function renderVideoBody(node){
         render();
         scheduleSave();
     };
-    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(durationMax, Number(e.target.value || 5))); scheduleSave(); };
+    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(durationMax, Number(e.target.value || 5))); refreshVideoCostHint(); scheduleSave(); };
     durationSelect.onchange = () => { if(isAutoDLVideoProvider(node.apiProvider)) render(); };
     durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(durationMax, Number(node.duration || 5)))); };
     aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; if(isAutoDLVideoProvider(node.apiProvider)) render(); scheduleSave(); };
-    resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; if(isAutoDLVideoProvider(node.apiProvider)) render(); scheduleSave(); };
+    resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; if(isAutoDLVideoProvider(node.apiProvider)) render(); else refreshVideoCostHint(); scheduleSave(); };
     wrap.querySelectorAll('[data-video-toggle]').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = e => {
@@ -13241,7 +13508,24 @@ async function pollRunningHubVideoTask(node, out, pending, opts={}){
             const latest = pendingById(out, pending.id);
             if(!latest) return 'missing';
             const response = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`);
-            if(!response.ok) throw new Error(await responseErrorMessage(response, 'RunningHub 任务查询失败'));
+            if(!response.ok){
+                const failMsg = await responseErrorMessage(response, 'RunningHub 任务查询失败');
+                // 同 MiniMax Design：上游任务没了就是永久失败，不能当成临时查询中断反复重试。
+                if(isUpstreamTaskGone(response.status, failMsg)){
+                    latest.failed = true;
+                    latest.terminal = true;
+                    latest.error = failMsg;
+                    latest.canvasTaskStatus = 'task_gone';
+                    latest.recoverTaskId = taskId;
+                    node.runStatus = 'failed';
+                    node.runError = failMsg;
+                    node.running = false;
+                    refreshRunNodes(node, out);
+                    scheduleSave();
+                    return 'FAILED';
+                }
+                throw new Error(failMsg);
+            }
             const json = await response.json();
             const data = json.data || json;
             const status = String(data.status || '').toUpperCase();
@@ -13362,9 +13646,288 @@ async function runRunningHubVideoNode(node, snapshot, out, pending, opts={}){
     }
 }
 
+function findMiniMaxDesignVideoPending(node){
+    if(!node) return null;
+    for(const out of nodes.filter(item => item.type === 'output')){
+        const pending = (out._pending || []).find(item =>
+            item?.canvasTaskType === 'minimax-design-video'
+            && item?.run?.node?.id === node.id
+            && !item?.terminal
+            && Boolean(item.task_id || item.canvasTaskId)
+        );
+        if(pending) return {out, pending};
+    }
+    return null;
+}
+
+function findActivePaidVideoPending(node){
+    if(!node) return null;
+    for(const out of nodes.filter(item => item.type === 'output')){
+        const pending = (out._pending || []).find(item =>
+            item?.run?.node?.id === node.id
+            && ['autodl-video','runninghub-video','minimax-design-video'].includes(item?.canvasTaskType)
+            && !item?.terminal
+            && !item?.failed
+            // 必须是真正的服务端任务 id。提交失败时 canvasTaskId 会兜底成本地 pending id，
+            // 拿它当"有任务在跑"会把节点永久锁死，用户再也提交不了。
+            && Boolean(serverTaskIdOf(item))
+        );
+        if(pending) return {out, pending};
+    }
+    return null;
+}
+
+async function pollMiniMaxDesignVideoTask(node, out, pending, opts={}){
+    const taskId = String(pending?.task_id || pending?.canvasTaskId || '').trim();
+    if(!taskId) return 'unknown_submission';
+    if(activeMiniMaxDesignVideoPolls.has(taskId)) return 'RUNNING';
+    activeMiniMaxDesignVideoPolls.add(taskId);
+    node.running = true;
+    try {
+        for(let attempt = 0; attempt < 5760; attempt++){
+            const latest = pendingById(out, pending.id);
+            if(!latest) return 'missing';
+            const response = await fetch(`/api/minimax-design/tasks/${encodeURIComponent(taskId)}`);
+            if(!response.ok){
+                const failMsg = await responseErrorMessage(response, 'MiniMax Design 任务查询失败');
+                // 上游任务已不存在（404 / 已过期 / 被清理）是永久状态，再查多少次也不会回来。
+                // 不标终态的话：每次打开画布都会把节点重新置成"生成中"，生成按钮永远是灰的。
+                if(isUpstreamTaskGone(response.status, failMsg)){
+                    latest.failed = true;
+                    latest.terminal = true;
+                    latest.error = failMsg;
+                    latest.canvasTaskStatus = 'task_gone';
+                    latest.recoverTaskId = taskId;
+                    node.runStatus = 'failed';
+                    node.runError = failMsg;
+                    node.running = false;
+                    refreshRunNodes(node, out);
+                    scheduleSave();
+                    return 'FAILED';
+                }
+                throw new Error(failMsg);
+            }
+            const result = await response.json();
+            const status = String(result.status || '').toUpperCase();
+            latest.status = status.toLowerCase();
+            latest.canvasTaskStatus = latest.status;
+            latest.message = status === 'QUEUED' ? 'MiniMax Design 排队中' : status === 'RUNNING' ? 'MiniMax Design 生成中' : '';
+            latest.error = '';
+            latest.failed = false;
+            node.runStatus = status === 'QUEUED' ? 'queued' : 'running';
+            node.runError = '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(status === 'QUEUED' || status === 'RUNNING'){
+                await sleep(2500);
+                continue;
+            }
+            if(status === 'SUCCESS'){
+                const videos = (result.videos || []).map(item => ({
+                    url:outputUrlValue(item),
+                    kind:'video',
+                    provider_id:'minimax-design-local',
+                    status:'SUCCESS'
+                })).filter(item => item.url);
+                if(!videos.length) throw new Error('MiniMax Design 任务成功但没有返回本地视频');
+                const meta = collectRunMeta(out, latest.id);
+                meta.run.request = {
+                    ...(meta.run.request || {}),
+                    provider_id:'minimax-design-local',
+                    provider_name:'MiniMax Design（本机）',
+                    model:'MiniMax-H3',
+                    task_id:taskId,
+                    status:'SUCCESS'
+                };
+                out._pending = (out._pending || []).filter(item => item.id !== latest.id);
+                appendOutputImages(out, videos, meta.run?.refs?.[0], [{...meta, kind:'video'}]);
+                mergeGeneratedOutputs(node, videos, Boolean(opts.cascade));
+                addGenerationLog({run:meta.run, outputs:videos, runMs:meta.runMs || 0});
+                node.runStatus = 'done';
+                node.runError = '';
+                node.running = false;
+                refreshRunNodes(node, out);
+                markCanvasMediaMutation();
+                scheduleSave();
+                return 'SUCCESS';
+            }
+            if(status === 'FAILED'){
+                const message = result.error || 'MiniMax Design 视频任务失败';
+                latest.failed = true;
+                latest.terminal = true;
+                latest.error = message;
+                latest.recoverTaskId = taskId;
+                node.runStatus = 'failed';
+                node.runError = message;
+                node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                if(opts.cascade) throw new Error(message);
+                return 'FAILED';
+            }
+            throw new Error(`MiniMax Design 返回未知任务状态：${status || 'UNKNOWN'}`);
+        }
+        throw new Error('MiniMax Design 任务仍在后台运行，已保存任务 ID，可稍后继续查询');
+    } catch(err) {
+        const latest = pendingById(out, pending.id);
+        if(latest && !latest.terminal){
+            latest.failed = false;
+            latest.error = err.message || 'MiniMax Design 任务查询暂时中断';
+            latest.recoverTaskId = taskId;
+            latest.canvasTaskStatus = 'query_error';
+        }
+        node.runStatus = latest?.terminal ? 'failed' : 'queued';
+        node.runError = err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade && latest?.terminal) throw err;
+        return latest?.terminal ? 'FAILED' : 'QUERY_ERROR';
+    } finally {
+        activeMiniMaxDesignVideoPolls.delete(taskId);
+    }
+}
+
+async function runMiniMaxDesignVideoNode(node, snapshot, out, pending, opts={}){
+    pending.provider_id = 'minimax-design-local';
+    pending.canvasTaskType = 'minimax-design-video';
+    pending.canvasTaskStatus = 'submitting';
+    pending.status = 'submitting';
+    pending.run.request = {
+        ...(pending.run.request || {}),
+        provider_id:'minimax-design-local',
+        provider_name:'MiniMax Design（本机）',
+        model:node.model || 'MiniMax-H3'
+    };
+    await saveCanvas();
+    try {
+        const response = await fetch('/api/minimax-design/video-submit', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                prompt:snapshot.prompt,
+                duration:Number(node.duration || 5),
+                aspect_ratio:node.aspectRatio || '16:9',
+                resolution:node.resolution || '768p',
+                images:snapshot.refs,
+                videos:manualVideoUrlForNode(node)
+                    ? [manualVideoUrlForNode(node)]
+                    : snapshot.videoRefs.map(ref => ref.url).filter(Boolean),
+                audios:snapshot.audioRefs.map(ref => ref.url).filter(Boolean),
+                generate_audio:Boolean(node.generateAudio),
+                multimodal:Boolean(node.multimodal || snapshot.videoRefs.length || snapshot.audioRefs.length)
+            })
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'MiniMax Design 视频提交失败'));
+        const submission = await response.json();
+        if(!submission.task_id) throw new Error('MiniMax Design 提交成功但没有返回 task_id');
+        pending.task_id = submission.task_id;
+        pending.canvasTaskId = submission.task_id;
+        pending.status = String(submission.status || 'QUEUED').toLowerCase();
+        pending.canvasTaskStatus = pending.status;
+        pending.run.request = {
+            ...(pending.run.request || {}),
+            task_id:submission.task_id,
+            status:submission.status || 'QUEUED',
+            request_mode:submission.request_mode || ''
+        };
+        await saveCanvas();
+        return pollMiniMaxDesignVideoTask(node, out, pending, opts);
+    } catch(err) {
+        if(!pending.task_id){
+            pending.failed = true;
+            pending.status = 'unknown_submission';
+            pending.canvasTaskStatus = 'unknown_submission';
+            pending.error = `提交状态未知，为避免重复扣费不会自动重试：${err.message || String(err)}`;
+        }
+        node.runStatus = 'failed';
+        node.runError = pending.error || err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw err;
+        return 'unknown_submission';
+    }
+}
+
+async function runAutoDLCloudVideoNode(node, snapshot, out, pending, opts={}){
+    const selectedModel = String(node?.model || '').trim();
+    const isReferenceWorkflow = selectedModel === 'U02-minimax_h3_多图视频参考版';
+    const workflowJson = isReferenceWorkflow
+        ? 'custom/U02-minimax_h3_多图视频参考版.json'
+        : selectedModel === 'U02-minimax_h3_图生视频基础版-V2'
+            ? 'custom/U02-minimax_h3_图生视频基础版-V2.json'
+            : 'custom/U02-minimax_h3_图生视频单图版.json';
+    pending.provider_id = 'autodl-cloud';
+    pending.canvasTaskType = 'comfy-video';
+    pending.canvasTaskStatus = 'submitting';
+    pending.status = 'submitting';
+    pending.run.request = {...(pending.run.request || {}), provider_id:'autodl-cloud', provider_name:'AutoDL 云端部署', workflow_id:workflowJson};
+    await saveCanvas();
+    try {
+        const inputName = await comfyNameForRef(snapshot.refs[0]);
+        const params = isReferenceWorkflow
+            ? {'114':{image:inputName},'139':{prompt:snapshot.prompt}}
+            : workflowJson.endsWith('基础版-V2.json')
+                ? {'114':{image:inputName},'144':{image:inputName},'139':{prompt:snapshot.prompt}}
+                : {'114':{image:inputName},'139':{prompt:snapshot.prompt}};
+        if(isReferenceWorkflow){
+            const imageNames = [];
+            for(const ref of snapshot.refs.slice(0, 9)) imageNames.push(await comfyNameForRef(ref));
+            imageNames.forEach((name, index) => { params['150'] = params['150'] || {}; params['150'][`image_${index + 1}`] = name; });
+            const videoNames = [];
+            for(const ref of snapshot.videoRefs.slice(0, 3)) videoNames.push(await comfyNameForRef(ref));
+            videoNames.forEach((name, index) => { params['150'] = params['150'] || {}; params['150'][`video_${index + 1}`] = name; });
+        }
+        const result = await runQueuedComfyGenerate({
+            prompt:snapshot.prompt,
+            workflow_json:workflowJson,
+            params,
+            type:'autodl-cloud-video',
+            client_id:CLIENT_ID
+        }, {cascadeTargetId:opts.cascadeTargetId});
+        pending.run.request = requestMetaFromResult(result);
+        const outputs = comfyResultOutputs(result);
+        if(result.error) throw new Error(result.error);
+        if(!outputs.length) throw new Error('AutoDL 云端部署任务完成但没有返回视频');
+        const meta = {runMs:nowMs() - Number(pending.startedAt || nowMs()), run:pending.run};
+        if(out) out._pending = (out._pending || []).filter(item => item.id !== pending.id);
+        appendOutputImages(out, outputs, snapshot.refs[0], [meta]);
+        mergeGeneratedOutputs(node, outputs, true);
+        node.runStatus = 'done'; node.runError = ''; node.running = false;
+        addGenerationLog({run:pending.run, outputs, runMs:meta.runMs});
+        refreshRunNodes(node, out); scheduleSave();
+        return 'SUCCESS';
+    } catch(err) {
+        if(out) out._pending = (out._pending || []).filter(item => item.id !== pending.id);
+        node.runStatus = 'failed'; node.runError = err.message || String(err); node.running = false;
+        addGenerationLog({run:pending.run, outputs:[], runMs:nowMs() - Number(pending.startedAt || nowMs()), error:node.runError});
+        refreshRunNodes(node, out); scheduleSave();
+        if(opts.cascade) throw err;
+        return 'FAILED';
+    }
+}
+
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
+    const activePaid = findActivePaidVideoPending(node);
+    if(activePaid){
+        if(activePaid.pending.canvasTaskType === 'minimax-design-video' && isMiniMaxDesignVideoProvider(node.apiProvider)){
+            node.running = true;
+            return pollMiniMaxDesignVideoTask(node, activePaid.out, activePaid.pending, opts);
+        }
+        const providerName = activePaid.pending?.run?.request?.provider_name || activePaid.pending.provider_id || '已有';
+        const blockingTaskId = serverTaskIdOf(activePaid.pending);
+        const message = `${providerName} 任务仍在排队或生成中；为避免重复扣费，本次不会再次提交。
+任务 ID：${blockingTaskId}
+若确认这个任务已经作废，可在输出节点上删掉它的进度卡片后再生成。`;
+        node.runStatus = 'queued';
+        node.runError = message;
+        refreshRunNodes(node, activePaid.out);
+        if(!opts.cascade) showErrorModal(message, '任务仍在运行');
+        return 'RUNNING';
+    }
     if(isRunningHubVideoProvider(node.apiProvider)){
         const existing = findRunningHubVideoPending(node);
         if(existing){
@@ -13392,6 +13955,14 @@ async function runVideoNode(nodeId, opts={}){
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs, cascadeTargetId})];
     if(!opts.cascade){ node.running = true; refreshRunNodes(node, out); }
     else refreshRunNodes(node, out);
+    if(isAutoDLCloudVideoProvider(node.apiProvider)){
+        const pending = pendingById(out, pendingId);
+        return runAutoDLCloudVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
+    }
+    if(isMiniMaxDesignVideoProvider(node.apiProvider)){
+        const pending = pendingById(out, pendingId);
+        return runMiniMaxDesignVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
+    }
     if(isAutoDLVideoProvider(node.apiProvider)){
         const pending = pendingById(out, pendingId);
         return runAutoDLVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
@@ -14758,6 +15329,7 @@ function deleteNode(id, event){
     event?.stopPropagation();
     pushUndo();
     destroyLTXEditor(nodes.find(n => n.id === id));
+    markNodesDeleted([id]);
     nodes = nodes.filter(n => n.id !== id);
     connections = connections.filter(c => c.from !== id && c.to !== id);
     selected.delete(id);
@@ -15304,6 +15876,21 @@ async function queryRecoverPendingOutput(pendingId){
         scheduleSave();
         return;
     }
+    if(pending.canvasTaskType === 'minimax-design-video'){
+        const node = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+        pending.failed = false;
+        pending.terminal = false;
+        pending.querying = false;
+        pending.error = '';
+        if(node){
+            node.running = true;
+            node.runStatus = 'running';
+            await pollMiniMaxDesignVideoTask(node, out, pending, {resume:true});
+        }
+        refreshNodes([out.id]);
+        scheduleSave();
+        return;
+    }
     try {
         const res = await fetch('/api/image-task-query', {
             method:'POST',
@@ -15528,9 +16115,12 @@ function resumeAutoDLVideoTasks(){
         (out._pending || []).forEach(pending => {
             if(pending?.canvasTaskType !== 'autodl-video' || pending.failed) return;
             const node = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
-            const taskId = String(pending.task_id || pending.canvasTaskId || '').trim();
+            const taskId = serverTaskIdOf(pending);
             if(!taskId){
                 pending.failed = true;
+                // 标终态：没有服务端任务 id 就永远查不回来，不标的话它会一直被当成
+                // "活跃任务"，既拦截新提交，又在每次打开画布时被反复复活。
+                pending.terminal = true;
                 pending.status = 'unknown_submission';
                 pending.canvasTaskStatus = 'unknown_submission';
                 pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
@@ -15562,9 +16152,12 @@ function resumeRunningHubVideoTasks(){
         (out._pending || []).forEach(pending => {
             if(pending?.canvasTaskType !== 'runninghub-video' || pending.terminal) return;
             const videoNode = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
-            const taskId = String(pending.task_id || pending.canvasTaskId || '').trim();
+            const taskId = serverTaskIdOf(pending);
             if(!taskId){
                 pending.failed = true;
+                // 标终态：没有服务端任务 id 就永远查不回来，不标的话它会一直被当成
+                // "活跃任务"，既拦截新提交，又在每次打开画布时被反复复活。
+                pending.terminal = true;
                 pending.status = 'unknown_submission';
                 pending.canvasTaskStatus = 'unknown_submission';
                 pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
@@ -15585,6 +16178,45 @@ function resumeRunningHubVideoTasks(){
                 videoNode.runError = '';
             }
             pollRunningHubVideoTask(videoNode, out, pending, {resume:true});
+        });
+    });
+    if(changed){
+        refreshRunNodes();
+        scheduleSave();
+    }
+}
+function resumeMiniMaxDesignVideoTasks(){
+    let changed = false;
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.canvasTaskType !== 'minimax-design-video' || pending.terminal) return;
+            const videoNode = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+            const taskId = serverTaskIdOf(pending);
+            if(!taskId){
+                pending.failed = true;
+                // 标终态：没有服务端任务 id 就永远查不回来，不标的话它会一直被当成
+                // "活跃任务"，既拦截新提交，又在每次打开画布时被反复复活。
+                pending.terminal = true;
+                pending.status = 'unknown_submission';
+                pending.canvasTaskStatus = 'unknown_submission';
+                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                if(videoNode){
+                    videoNode.running = false;
+                    videoNode.runStatus = 'failed';
+                    videoNode.runError = pending.error;
+                }
+                changed = true;
+                return;
+            }
+            pending.task_id = taskId;
+            pending.canvasTaskId = taskId;
+            pending.failed = false;
+            if(videoNode){
+                videoNode.running = true;
+                videoNode.runStatus = pending.canvasTaskStatus || pending.status || 'queued';
+                videoNode.runError = '';
+            }
+            pollMiniMaxDesignVideoTask(videoNode, out, pending, {resume:true});
         });
     });
     if(changed){
@@ -17908,6 +18540,7 @@ function deleteSelectedNodes(){
     };
     selected.forEach(collect);
     toDelete.forEach(id => destroyLTXEditor(nodes.find(n => n.id === id)));
+    markNodesDeleted([...toDelete]);
     nodes = nodes.filter(n => !toDelete.has(n.id));
     connections = connections.filter(c => !toDelete.has(c.from) && !toDelete.has(c.to));
     selected.clear();
@@ -17949,7 +18582,7 @@ window.onload = async () => {
     await loadConfig();
     pruneMissingComfyWorkflows();
     // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
-    const openId = new URLSearchParams(window.location.search).get('id');
+    const openId = new URLSearchParams(window.location.search).get('id') || lastOpenedCanvasId();
     if(openId){
         await openCanvas(openId);
     } else {
