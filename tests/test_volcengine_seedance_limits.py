@@ -80,3 +80,37 @@ def test_merge_backfills_new_models_into_existing_config():
     assert SEEDANCE_2_5 in volc["video_models"]
     # 用户原有条目不能丢
     assert SEEDANCE_2_0_FAST in volc["video_models"]
+
+
+def test_video_image_contents_always_carry_a_role():
+    """方舟要求每个 image 内容项都带 role，否则报
+    "role must be specified for image contents"。
+
+    这里曾经先无条件 append 一个 item（没有显式 role 时 volcengine_content_role
+    按设计返回 None，那个 item 就缺 role），再走 append_volcengine_image 又加一遍，
+    结果既非法又重复。入列统一交给 append_volcengine_image。
+    """
+    import inspect
+    from pathlib import Path
+
+    src = Path(main.__file__).read_text(encoding="utf-8")
+    start = src.index("def append_volcengine_image(url: str, role: str):")
+    block = src[start:src.index("for url in (payload.videos or [])[:3]:", start)]
+
+    # append_volcengine_image 内部必须始终写入 role
+    appender = block[: block.index("for ref in payload.images[:9]:")]
+    assert '"role": role,' in appender, "入列函数必须写 role"
+
+    # 循环体里不能再有绕过它的裸 append
+    loop = block[block.index("for ref in payload.images[:9]:") :]
+    assert "body[\"content\"].append(item)" not in loop, "又出现绕过 append_volcengine_image 的裸入列了"
+    assert loop.count("append_volcengine_image(") == 3, "三条分支各调用一次"
+
+
+def test_content_role_has_no_silent_reference_image_fallback():
+    """未显式指定 role 的纯生图请求不能兜底成 reference_image，
+    否则火山会误判成 r2v（参考图生视频）。"""
+    assert main.volcengine_content_role("", "image") is None
+    assert main.volcengine_content_role("first_frame", "image") == "first_frame"
+    assert main.volcengine_content_role("", "audio") == "reference_audio"
+    assert main.volcengine_content_role("", "video") == "reference_video"

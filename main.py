@@ -189,7 +189,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.01-minimax-workspace-1"
+CANVAS_RUNTIME_VERSION = "2026.09.01-ark-role-fix-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -15563,10 +15563,13 @@ async def minimax_design_task_status(task_id: str):
     if not safe_task_id or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", safe_task_id):
         raise HTTPException(status_code=400, detail="MiniMax Design task_id 无效")
     try:
-        result = await minimax_design.MiniMaxDesignClient().query_video(safe_task_id)
+        client = minimax_design.MiniMaxDesignClient()
+        result = await client.query_video(safe_task_id)
         if result["status"] == "SUCCESS":
+            # 产出路径是相对于网关沙箱的（往往就是个裸文件名），要按沙箱根目录还原
+            workspace = await minimax_design.resolve_workspace_root(client)
             local_path = minimax_design.materialize_video(
-                result["video_path"], safe_task_id, OUTPUT_OUTPUT_DIR
+                result["video_path"], safe_task_id, OUTPUT_OUTPUT_DIR, workspace
             )
             filename = os.path.basename(local_path)
             result["videos"] = [{
@@ -18629,15 +18632,11 @@ async def canvas_video(payload: CanvasVideoRequest):
                         url = volcengine_media_reference_url(ref.url, max_image_size=1536)
                         if not url:
                             continue
-                        item = {
-                            "type": "image_url",
-                            "image_url": {"url": url},
-                        }
-                        role = volcengine_content_role(ref.role, "image")
-                        if role:
-                            item["role"] = role
-                        body["content"].append(item)
-                        image_like_urls.add(url)
+                        # 这里曾经先无条件 append 一个 item，再走下面的 append_volcengine_image，
+                        # 导致同一张图进两次；而且没有显式 role 时 volcengine_content_role 按设计
+                        # 返回 None，那个 item 就是缺 role 的非法项，方舟直接报
+                        # "role must be specified for image contents"。
+                        # 统一由 append_volcengine_image 负责入列，它会正确分配 role。
                         role = volcengine_content_role(ref.role, "image")
                         if role in {"first_frame", "last_frame"}:
                             append_volcengine_image(url, role)

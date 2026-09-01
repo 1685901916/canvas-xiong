@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import unittest
 
@@ -165,3 +166,50 @@ class MiniMaxDesignSourceContractTests(unittest.TestCase):
             src,
             "又退回成套话优先了，真原因会被盖掉",
         )
+
+
+class MiniMaxDesignOutputPathTests(unittest.TestCase):
+    """网关返回的产出路径是相对于它自己沙箱的（通常就是个裸文件名）。
+    直接 abspath 会解析到画布进程的工作目录，结果就是"返回的视频文件不存在"。"""
+
+    def test_bare_filename_resolves_against_workspace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "out.mp4").write_bytes(b"v")
+            resolved = support.resolve_gateway_output("out.mp4", root)
+            self.assertEqual(resolved, str(Path(root, "out.mp4").resolve()))
+
+    def test_absolute_path_is_kept(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / "abs.mp4"
+            target.write_bytes(b"v")
+            self.assertEqual(
+                support.resolve_gateway_output(str(target), "D:" + chr(92) + "elsewhere"),
+                str(target.resolve()),
+            )
+
+    def test_escaping_the_sandbox_is_rejected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(support.MiniMaxDesignError):
+                support.resolve_gateway_output("../../secret.ini", root)
+
+    def test_empty_path_returns_empty(self):
+        self.assertEqual(support.resolve_gateway_output("", "/tmp"), "")
+
+    def test_materialize_reports_the_path_it_actually_looked_at(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(support.MiniMaxDesignError) as ctx:
+                support.materialize_video("missing.mp4", "t1", out, root)
+            self.assertIn("missing.mp4", str(ctx.exception), "报错要带上实际查找的路径，否则没法排查")
+
+    def test_materialize_copies_from_workspace(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as out:
+            (Path(root) / "clip.mp4").write_bytes(b"video-bytes")
+            local = support.materialize_video("clip.mp4", "PAZKokPoGZxa", out, root)
+            self.assertTrue(os.path.isfile(local))
+            self.assertEqual(Path(local).read_bytes(), b"video-bytes")
+            self.assertEqual(Path(local).name, "minimax_design_PAZKokPoGZxa.mp4")

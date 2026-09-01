@@ -189,10 +189,31 @@ def normalize_task_response(task_id: str, data: Dict[str, Any]) -> Dict[str, Any
     }
 
 
-def materialize_video(source_path: str, task_id: str, output_dir: str) -> str:
-    source = os.path.abspath(str(source_path or ""))
-    if not os.path.isfile(source):
-        raise MiniMaxDesignError("MiniMax Design 返回的视频文件不存在")
+def resolve_gateway_output(source_path: str, workspace_root: str = "") -> str:
+    """网关返回的产出路径是相对于它自己沙箱的（通常就是个裸文件名），
+    直接 abspath 会解析到画布进程的工作目录，必然找不到。"""
+    raw = str(source_path or "").strip()
+    if not raw:
+        return ""
+    if os.path.isabs(raw):
+        return os.path.abspath(raw)
+    root = str(workspace_root or "").strip()
+    if not root:
+        return os.path.abspath(raw)
+    resolved = os.path.abspath(os.path.join(root, raw.replace("/", os.sep)))
+    # 网关返回的路径不该跳出它自己的沙箱
+    root_abs = os.path.abspath(root)
+    if os.path.commonpath([root_abs, resolved]) != root_abs:
+        raise MiniMaxDesignError(f"MiniMax Design 返回的产出路径越界：{raw}")
+    return resolved
+
+
+def materialize_video(source_path: str, task_id: str, output_dir: str, workspace_root: str = "") -> str:
+    source = resolve_gateway_output(source_path, workspace_root)
+    if not source or not os.path.isfile(source):
+        raise MiniMaxDesignError(
+            f"MiniMax Design 返回的视频文件不存在：{source or source_path}"
+        )
     os.makedirs(output_dir, exist_ok=True)
     safe_task = re.sub(r"[^A-Za-z0-9_-]+", "_", str(task_id or "task")).strip("_") or "task"
     ext = os.path.splitext(source)[1].lower()
