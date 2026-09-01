@@ -4,7 +4,7 @@ import main
 
 
 def test_runninghub_video_lifecycle_static_version_is_current():
-    assert main.CANVAS_RUNTIME_VERSION == "2026.09.01-pending-lifecycle-1"
+    assert main.CANVAS_RUNTIME_VERSION == "2026.09.01-minimax-workspace-1"
 
 
 def test_runninghub_default_provider_has_curated_video_models():

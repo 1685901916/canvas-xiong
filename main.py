@@ -189,7 +189,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.01-pending-lifecycle-1"
+CANVAS_RUNTIME_VERSION = "2026.09.01-minimax-workspace-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -15516,9 +15516,18 @@ async def minimax_design_video_models():
 async def minimax_design_submit_video(payload: MiniMaxDesignVideoRequest, request: Request):
     ensure_same_origin_request(request)
     try:
-        image_paths = [minimax_design_media_path(item.url) for item in payload.images if item.url]
-        video_paths = [minimax_design_media_path(value) for value in payload.videos if value]
-        audio_paths = [minimax_design_media_path(value) for value in payload.audios if value]
+        # 网关会把沙箱外的绝对路径判成 path traversal，所以素材要先落进它的沙箱、
+        # 再按相对路径提交。沙箱位置由 MINIMAX_DESIGN_WORKSPACE 指定，或向网关探测。
+        client = minimax_design.MiniMaxDesignClient()
+        workspace = await minimax_design.resolve_workspace_root(client)
+
+        def stage(value):
+            local = minimax_design_media_path(value)
+            return minimax_design.stage_media_into_workspace(local, workspace)
+
+        image_paths = [stage(item.url) for item in payload.images if item.url]
+        video_paths = [stage(value) for value in payload.videos if value]
+        audio_paths = [stage(value) for value in payload.audios if value]
         filename = f"infinite-canvas-{int(time.time())}-{uuid.uuid4().hex[:8]}.mp4"
         body = minimax_design.build_video_request(
             prompt=payload.prompt,
@@ -15533,7 +15542,7 @@ async def minimax_design_submit_video(payload: MiniMaxDesignVideoRequest, reques
             filename=filename,
             source_node_id=payload.source_node_id,
         )
-        submitted = await minimax_design.MiniMaxDesignClient().submit_video(body)
+        submitted = await client.submit_video(body)
         return {
             "provider_id": "minimax-design-local",
             "provider_name": "MiniMax Design（本机）",

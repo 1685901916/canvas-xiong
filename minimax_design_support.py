@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,16 @@ BACKEND_ID = "minimax_v3"
 RATIOS = {"16:9", "4:3", "1:1", "3:4", "9:16", "21:9"}
 
 
+# 网关只接受它自己沙箱内的相对路径：任何绝对路径都会被判成 "Path traversal detected"。
+# 所以画布的素材必须先复制进沙箱，再按相对路径引用。沙箱位置随安装目录变化，
+# 优先读环境变量，读不到就向网关探测一次（提交一个必不存在的相对路径，
+# 从它回显的 ENOENT 绝对路径里反推根目录；文件不存在，不会启动任何生成）。
+WORKSPACE_ENV = "MINIMAX_DESIGN_WORKSPACE"
+STAGING_SUBDIR = "infinite-canvas"
+_WORKSPACE_PROBE_NAME = "__infinite_canvas_probe__.png"
+_workspace_cache: Optional[str] = None
+
+
 class MiniMaxDesignError(RuntimeError):
     pass
 
@@ -28,6 +39,68 @@ class MiniMaxDesignValidationError(MiniMaxDesignError):
 
 def _clean_paths(values: Optional[Iterable[str]]) -> list[str]:
     return [str(value).strip() for value in (values or []) if str(value).strip()]
+
+
+def _parse_workspace_from_enoent(message: str) -> str:
+    """从 ENOENT 报错里取出网关拼出的绝对路径，去掉探测文件名即为沙箱根目录。"""
+    match = re.search(r"open '([^']+)'", str(message or ""))
+    if not match:
+        return ""
+    resolved = match.group(1)
+    tail = _WORKSPACE_PROBE_NAME
+    idx = resolved.replace("/", "\\").rfind(tail)
+    if idx <= 0:
+        return ""
+    return resolved.replace("/", "\\")[:idx].rstrip("\\/")
+
+
+def stage_media_into_workspace(local_path: str, root: str) -> str:
+    """把本机素材复制进网关沙箱，返回可提交的相对路径。
+
+    以内容哈希 + 原名命名，重复引用同一素材不会重复复制。
+    """
+    root = str(root or "").strip()
+    if not root:
+        raise MiniMaxDesignError(
+            f"未能确定 MiniMax Design 的素材目录，请设置环境变量 {WORKSPACE_ENV} 指向它的 output_files 目录"
+        )
+    digest = hashlib.sha1(os.path.abspath(local_path).encode("utf-8")).hexdigest()[:12]
+    name = f"{digest}_{os.path.basename(local_path)}"
+    target_dir = os.path.join(root, STAGING_SUBDIR)
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, name)
+    if not os.path.exists(target) or os.path.getsize(target) != os.path.getsize(local_path):
+        shutil.copy2(local_path, target)
+    # 网关按 posix 风格拼路径，统一用正斜杠
+    return f"{STAGING_SUBDIR}/{name}"
+
+
+def _error_detail(data: Dict[str, Any], raw_text: str = "") -> str:
+    parts = []
+    reasons = data.get("message")
+    if isinstance(reasons, (list, tuple)):
+        reasons = "；".join(str(item) for item in reasons if str(item).strip())
+    for value in (reasons, data.get("error")):
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    if parts:
+        return "：".join(parts)
+    generic = str(data.get("user_message") or "").strip()
+    return generic or str(raw_text or "")[:500]
+
+
+async def resolve_workspace_root(client: "MiniMaxDesignClient") -> str:
+    global _workspace_cache
+    override = str(os.environ.get(WORKSPACE_ENV, "") or "").strip()
+    if override:
+        return override
+    if _workspace_cache:
+        return _workspace_cache
+    root = await client.probe_workspace_root()
+    if root:
+        _workspace_cache = root
+    return root
 
 
 def build_video_request(
@@ -148,14 +221,13 @@ class MiniMaxDesignClient:
         except ValueError:
             data = {"error": response.text[:500]}
         if response.status_code >= 400:
-            # 网关把具体原因放在 message（可能是数组），error 只是 "Bad Request" 这种通用标签。
-            # 之前只取 error，用户和日志里都只看到 "Bad Request"，等于没有信息。
-            reasons = data.get("message")
-            if isinstance(reasons, (list, tuple)):
-                reasons = "；".join(str(item) for item in reasons if str(item).strip())
-            reasons = str(reasons or "").strip()
-            fallback = data.get("user_message") or data.get("error") or response.text[:500]
-            detail = f"{fallback}：{reasons}" if reasons and reasons != fallback else (reasons or fallback)
+            # 网关的报错分散在几个字段，且具体程度差别很大：
+            #   message      —— 参数校验的逐条原因（可能是数组），最具体
+            #   error        —— 有时是真原因（"duration must be between 4 and 15"），
+            #                    有时只是 "Bad Request" 这种标签
+            #   user_message —— 面向终端用户的套话（"请稍后重试或联系客服"），最没信息量
+            # 按具体程度排序拼接，套话只在没有别的信息时才用，否则真原因会被它盖掉。
+            detail = _error_detail(data, response.text)
             raise MiniMaxDesignError(f"MiniMax Design 本机接口错误（{response.status_code}）：{detail}")
         return data
 
@@ -164,6 +236,29 @@ class MiniMaxDesignClient:
 
     async def video_models(self) -> Dict[str, Any]:
         return await self._request("GET", "/api/models/video")
+
+    async def probe_workspace_root(self) -> str:
+        """向网关提交一个必定不存在的相对路径，从 ENOENT 报错反推它的沙箱根目录。
+        文件不存在，所以不会启动任何生成，也不会产生费用。"""
+        body = {
+            "backend": BACKEND_ID,
+            "model_id": MODEL_ID,
+            "prompt": "probe",
+            "filename": "probe.mp4",
+            "image_paths": [_WORKSPACE_PROBE_NAME],
+            "params": {
+                "duration": "5",
+                "ratio": "adaptive",
+                "resolution": "768P",
+                "generate_audio": "false",
+                "image_mode": "first-last-frame",
+            },
+        }
+        try:
+            data = await self._request("POST", "/api/generate/video/submit", json=body)
+        except MiniMaxDesignError as exc:
+            return _parse_workspace_from_enoent(str(exc))
+        return _parse_workspace_from_enoent(str(data.get("error") or ""))
 
     async def submit_video(self, body: Dict[str, Any]) -> Dict[str, Any]:
         data = await self._request("POST", "/api/generate/video/submit", json=body)
