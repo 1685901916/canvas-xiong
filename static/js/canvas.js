@@ -10869,7 +10869,7 @@ function renderVideoBody(node){
             <div class="video-cost-hint" hidden></div>
         </div>
         <div class="gen-run-row">
-            <button class="gen-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="clapperboard" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.videoGenerate')}</button>
+            <button class="gen-btn ${node.running ? 'running' : ''}"><i data-lucide="clapperboard" class="w-4 h-4"></i>${node.running ? '生成中 · 再跑一次' : tr('canvas.videoGenerate')}</button>
             ${cascadeBtnHtml(node)}
         </div>
         ${retryBarHtml(node)}
@@ -10964,7 +10964,23 @@ function renderVideoBody(node){
     const list = wrap.querySelector('.video-img-list');
     renderVideoImageInputs(list, node, mediaInputs);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
-    wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    wrap.querySelector('.gen-btn').onclick = e => {
+        e.stopPropagation();
+        if(node.running){
+            // 已有任务在跑还要再提交，会重复计费，必须由用户明确确认。
+            const est = arkSeedanceCostText(node.model, node.duration || 5, node.resolution, false);
+            const cost = est && !/选择分辨率|不支持/.test(est) ? `
+本次预估：${est}` : '';
+            const ok = confirm(`这个节点已有任务在生成中。
+再跑一次会另外提交一个任务，两个任务都会计费。${cost}
+
+确定继续吗？`);
+            if(!ok) return;
+            runCanvasGenerate(node.id, {force:true});
+            return;
+        }
+        runCanvasGenerate(node.id);
+    };
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
@@ -13913,8 +13929,9 @@ async function runAutoDLCloudVideoNode(node, snapshot, out, pending, opts={}){
 
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
-    if(!node || (node.running && !opts.cascade)) return;
-    const activePaid = findActivePaidVideoPending(node);
+    if(!node || (node.running && !opts.cascade && !opts.force)) return;
+    // force 表示用户已在确认弹窗里明白"会重复计费"仍选择继续，这里不再拦。
+    const activePaid = opts.force ? null : findActivePaidVideoPending(node);
     if(activePaid){
         if(activePaid.pending.canvasTaskType === 'minimax-design-video' && isMiniMaxDesignVideoProvider(node.apiProvider)){
             node.running = true;
@@ -15069,10 +15086,14 @@ function computeConnectedWorkflowOrder(anchorId){
     nodes.filter(n => connected.has(n.id) && runTypes.includes(n.type)).forEach(n => visit(n.id));
     return order;
 }
-async function runCanvasGenerate(nodeId){
+async function runCanvasGenerate(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
-    if(!node || node.running || cascadeRunningIds.has(nodeId)) return;
-    return runCascadeNodeByType(node, {cascade:false});
+    if(!node) return;
+    // force：用户在"生成中"时明确要求再跑一次。仍然挡住级联运行中的节点——
+    // 那是多节点编排，中途插一脚会打乱顺序。
+    if(cascadeRunningIds.has(nodeId)) return;
+    if(node.running && !opts.force) return;
+    return runCascadeNodeByType(node, {cascade:false, ...opts});
 }
 function computeCascadeOrder(targetId){
     const visited = new Set();
