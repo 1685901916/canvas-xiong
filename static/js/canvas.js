@@ -3683,7 +3683,10 @@ function addVideoNode(point){
         cameraFixed:false,
         generateAudio:false,
         useFrameRoles:false,
-        multimodal:false,
+        // 默认开「全能参考」：不开的话多张图只有第一张会被当首帧提交，其余静默丢弃。
+        // 画布上挂多张参考图是常态，默认按参考图走更符合预期。
+        // 单图想做「这张图动起来」的首帧驱动，把它关掉或勾「首尾帧」即可。
+        multimodal:true,
         tempShLinks:[],
         inputs:[],
         running:false
