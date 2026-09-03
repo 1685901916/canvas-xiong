@@ -210,8 +210,6 @@ async function refreshCanvasConfigFromSettings(){
         sanitizeImageNodeProviderModel(node);
         sanitizeVideoNodeProviderModel(node);
     });
-    // 和远端对齐之后重记快照：这些节点现在等于服务器上的样子，下次保存不该再报它们脏
-    rememberSavedNodes();
     if(typeof render === 'function') render();
 }
 window.addEventListener('message', event => {
@@ -1918,9 +1916,15 @@ function hasLocalPendingGeneration(){
         return node.type === 'output' && activePendingItems(node._pending || []).length;
     });
 }
+// 正在拖动、缩放、拉线的时候，节点坐标只在内存里改、还没标脏（scheduleSave 要到松手才调）。
+// 这时如果把远端整份换进来，nodes 数组换成了新对象，dragNode.node 还指着旧对象，
+// 松手保存的就是远端的旧坐标——节点「弹回去」就是这么来的。
+function hasActiveCanvasInteraction(){
+    return Boolean(dragNode || resizeNode || tempLink || llmPaneDrag);
+}
 function shouldDeferRemoteCanvasApply(options={}){
     const includePending = options.includePending !== false;
-    return Boolean(localCanvasDirty || saveTimer || savingCanvasNow || saveCanvasAgain || hasRecentPromptEdit() || hasRecentMediaMutation() || (includePending && hasLocalPendingGeneration()));
+    return Boolean(hasActiveCanvasInteraction() || localCanvasDirty || saveTimer || savingCanvasNow || saveCanvasAgain || hasRecentPromptEdit() || hasRecentMediaMutation() || (includePending && hasLocalPendingGeneration()));
 }
 function shouldMergeLocalCanvasOnConflict(){
     return Boolean(hasRecentPromptEdit() || hasRecentMediaMutation() || hasLocalPendingGeneration());
@@ -2022,6 +2026,9 @@ function preserveLocalRuntimeNodeState(remoteNodes=[]){
 // 分不清"别的客户端新增"和"我刚删了"，不挡就会把刚删的节点又加回来。
 // 保存成功后清空——那时删除已经落库，远端不会再带回来。
 const deletedNodeIds = new Set();
+// 上次成功保存之后新增的日志。PUT 只带这些，服务器那份才是全量、由它合并。
+// 以前每次自动保存都把 500 条日志（3MB）整份上传、再整份收回来。
+let unsyncedCanvasLogs = [];
 // 上次和服务器对齐时每个节点的样子（id -> 序列化后的字符串）。
 // 保存时拿它比一遍，只把真的改过的节点报给服务器，没改过的一律不发——
 // 不发就不可能覆盖别人。以前整份 PUT，页面手里几秒前的旧节点会连带写回去，
@@ -2263,6 +2270,7 @@ async function saveCanvas(){
     saveCanvasAgain = false;
     const payloadNodes = serializableCanvasNodes();
     const dirtyIds = dirtyNodeIdsFrom(payloadNodes);
+    const payloadLogs = unsyncedCanvasLogs.slice();
     try {
         const res = await fetch(`/api/canvases/${canvas.id}`, {
             method:'PUT',
@@ -2273,7 +2281,7 @@ async function saveCanvas(){
                 nodes:payloadNodes,
                 connections,
                 viewport,
-                logs:canvas.logs || [],
+                logs:payloadLogs,
                 client_id:CLIENT_ID,
                 base_updated_at:Number(lastCanvasUpdatedAt || canvas.updated_at || 0),
                 // 服务器只会采用这几个节点，其余保持它自己的版本
@@ -2315,6 +2323,9 @@ async function saveCanvas(){
         if(!res.ok) throw new Error('save failed');
         // 删除已经落库，远端不会再把它们带回来，墓碑可以清了。
         clearDeletedNodeMarks();
+        // 这批日志服务器已经合并进去了；保存期间新加的留着下次发
+        const sentLogIds = new Set(payloadLogs.map(log => log?.id).filter(Boolean));
+        unsyncedCanvasLogs = unsyncedCanvasLogs.filter(log => !sentLogIds.has(log?.id));
         rememberSavedNodes();
         const data = await res.json().catch(() => ({}));
         const localViewport = {...viewport};
@@ -2340,7 +2351,13 @@ async function saveCanvas(){
         if(!localCanvasDirty) recentCanvasMediaMutationUntil = 0;
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at);
         setStatus('Saved');
-        loadCanvasList(false);
+        // 以前这里整份重拉画布列表（服务器要把 200 多个文件全读一遍）；列表里只需要更新这一条。
+        if(canvases.some(item => item.id === canvas.id)){
+            updateCanvasListRecord({
+                id:canvas.id, title:canvas.title, icon:canvas.icon, kind:canvas.kind, project:canvas.project,
+                updated_at:canvas.updated_at, last_active_at:canvas.updated_at, node_count:nodes.length
+            });
+        }
     } catch(e) {
         setStatus('Save failed');
         console.error(e);
@@ -2499,7 +2516,9 @@ function compareCanvasRecords(a, b){
         const cmp = String(a.title || '').localeCompare(String(b.title || ''), 'zh-Hans-CN', {numeric:true, sensitivity:'base'});
         if(cmp !== 0) return cmp;
     }
-    return Number(b.updated_at || b.created_at || 0) - Number(a.updated_at || a.created_at || 0);
+    // 打开画布不再刷新 updated_at，服务器另给 last_active_at（编辑或打开，取较晚的）
+    const activeAt = item => Number(item.last_active_at || item.updated_at || item.created_at || 0);
+    return activeAt(b) - activeAt(a);
 }
 function sortCanvasListByUpdated(){
     canvases.sort(compareCanvasRecords);
@@ -2827,6 +2846,7 @@ async function createCanvas(){
         resetCascadeRuntimeState();
         canvas = data.canvas;
         canvas.logs = canvas.logs || [];
+        unsyncedCanvasLogs = [];
         nodes = canvas.nodes || [];
         lockVideoNodeConfigToPendingTask(nodes);
         connections = canvas.connections || [];
@@ -2975,6 +2995,7 @@ async function openCanvas(id){
             return;
         }
         canvas.logs = canvas.logs || [];
+        unsyncedCanvasLogs = [];
         nodes = canvas.nodes || [];
         connections = canvas.connections || [];
         viewport = localViewportForCanvas(canvas.id, canvas.viewport || {x:0, y:0, scale:1});
@@ -3034,6 +3055,9 @@ function applyRemoteCanvasData(remote){
         canvas.viewport = {...viewport};
         lastCanvasUpdatedAt = Number(canvas.updated_at || Date.now());
         localCanvasDirty = false;
+        // 和远端对齐了：这些节点现在就等于服务器上的样子，下次保存不该再报它们脏。
+        // 漏掉这一步的话整份都算脏、全被发出去，覆盖别人的老毛病就又回来了。
+        rememberSavedNodes();
         if(!preserveRuntime) resetTransientRunState(nodes);
         if(applyCanvasGeneratorApiDefaults(nodes)) scheduleSave();
         sanitizeConnections();
@@ -3161,7 +3185,8 @@ async function syncRemoteCanvasNow(){
         return;
     }
     try {
-        const res = await fetch(`/api/canvases/${canvas.id}`);
+        // 同步别人的改动只要节点和连线；日志本地有，不必再下几 MB
+        const res = await fetch(`/api/canvases/${canvas.id}?logs=0`);
         if(!res.ok) throw new Error(tr('canvas.openFailed'));
         const data = await res.json();
         const remote = data.canvas;
@@ -3214,6 +3239,13 @@ function handleCanvasPatchMessage(data){
     if(data.canvas_id !== canvas.id) return;
     const at = Number(data.updated_at || 0);
     if(at && at <= lastAppliedCanvasPatchAt) return;
+    // 本地正在拖动/编辑或有没存完的改动时，不能直接把补丁盖上去：会覆盖本地坐标，
+    // 也会把还没保存的连线整个换掉。改走整份同步，它会一直等到本地空闲再应用。
+    if(shouldDeferRemoteCanvasApply({includePending:false})){
+        deferRemoteCanvasSync(300);
+        setStatus('Local changes pending');
+        return;
+    }
     const patch = data.patch || {};
     const removed = new Set((patch.removed || []).map(String));
     const changedIds = [];
@@ -16160,6 +16192,7 @@ function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
         error:error ? String(error) : '',
     };
     canvas.logs = [entry, ...canvas.logs].slice(0, 500);
+    unsyncedCanvasLogs.push(entry);
 }
 function renderCanvasLog(){
     const logs = canvas?.logs || [];

@@ -65,7 +65,12 @@ def test_client_can_delete_a_connection():
 
 
 def test_legacy_client_without_dirty_ids_still_works():
-    import inspect
-    src = inspect.getsource(main.update_canvas)
-    assert "payload.dirty_node_ids is None" in src, "没带脏清单的老页面要走原来的整份覆盖"
+    """没带脏清单的老页面仍要走原来的整份覆盖 + 乐观锁。
+
+    这里查整份模块源码而不是某个函数：保存这段逻辑被拆成过 apply_canvas_save，
+    绑死在函数名上的断言会被别人的重构误伤。
+    """
+    src = open(main.__file__, encoding="utf-8").read()
+    assert "payload.dirty_node_ids is None" in src, "老页面要留着乐观锁那条路"
     assert "merge_protected_canvas_agent_results" in src
+    assert "merge_dirty_canvas_nodes" in src

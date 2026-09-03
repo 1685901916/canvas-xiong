@@ -69,7 +69,19 @@ assert.match(canvas, /const savedNodeSignatures = new Map\(\)/);
 assert.match(canvas, /dirty_node_ids:dirtyIds/, '保存要带上脏节点清单');
 assert.match(canvas, /removed_node_ids:\[\.\.\.deletedNodeIds\]/, '删除要显式告诉服务器');
 assert.match(canvas, /const dirtyIds = dirtyNodeIdsFrom\(payloadNodes\)/);
-// 快照必须在三个地方对齐，否则要么整份都算脏、要么改动被漏掉
-assert.match(canvas, /clearDeletedNodeMarks\(\);\s*\n\s*rememberSavedNodes\(\);/, '保存成功后对齐');
-assert.match(canvas, /rememberSavedNodes\(\);\s*\n\s*if\(typeof render === 'function'\) render\(\);/, '整份同步后对齐');
+// 快照必须在三个地方对齐，否则要么整份都算脏、要么改动被漏掉。
+// 查「函数体里有没有调用」，不查两行是否相邻——别人往中间加一行注释不该让测试挂掉。
+function bodyOf(head){
+  const i = canvas.indexOf(head);
+  if (i < 0) return '';
+  const ends = [canvas.indexOf('\nasync function ', i + 10), canvas.indexOf('\nfunction ', i + 10)]
+    .filter(n => n > 0);
+  return ends.length ? canvas.slice(i, Math.min(...ends)) : canvas.slice(i);
+}
+const saveBody = bodyOf('async function saveCanvas()');
+assert.ok(saveBody.includes('clearDeletedNodeMarks()'), '保存成功后要清墓碑');
+assert.ok(saveBody.includes('rememberSavedNodes()'), '保存成功后要对齐快照');
+assert.ok(saveBody.includes('dirty_node_ids'), '保存要带上脏节点清单');
+const applyBody = bodyOf('function applyRemoteCanvasData(');
+assert.ok(applyBody.includes('rememberSavedNodes()'), '整份同步后要对齐快照');
 assert.match(canvas, /removed\.forEach\(id => savedNodeSignatures\.delete\(id\)\)/, '增量补丁后对齐');
