@@ -10,7 +10,7 @@
       --image /assets/output/a.png \
       --prompt-file prompt.txt \
       --model volcengine:doubao-seedance-2-0-260128 \
-      --mode first-frame --audio --title "镜中初见 v2"
+      --mode first-frame --audio
 
   # 三张参考图、全能参考
   python tools/board.py --canvas <id> --image a.png --image b.png --image c.png \
@@ -105,7 +105,6 @@ def main():
     p.add_argument("--ratio", default="9:16")
     p.add_argument("--resolution", default="720p")
     p.add_argument("--audio", action="store_true", help="开生成音频")
-    p.add_argument("--title", default="", help="视频节点标题")
     p.add_argument("--at", metavar="x,y", help="左上角坐标；不给就自动放到现有内容下方")
     args = p.parse_args()
 
@@ -144,7 +143,9 @@ def main():
 
     row_w = max(len(image_ids), 1) * IMAGE_W + max(len(image_ids) - 1, 0) * GAP_X
     video = timed("POST", P + "/nodes", {
-        "type": "video", "name": args.title or "视频生成",
+        # 视频节点和组的标题由前端写死（「视频生成」/「G3」），传 name 也不会显示；
+        # 想给板子做标记就用 --image-name，图片下面的说明文字是会显示的。
+        "type": "video",
         "apiProvider": provider, "model": model,
         "duration": args.duration, "aspectRatio": args.ratio, "resolution": args.resolution,
         "useFrameRoles": args.mode == "first-frame",
