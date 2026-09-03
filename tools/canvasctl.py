@@ -228,6 +228,38 @@ def compose_board(args: argparse.Namespace) -> Dict[str, Any]:
     return data
 
 
+def compose_video_board(args: argparse.Namespace) -> Dict[str, Any]:
+    canvas_id = get_or_create_canvas(args)
+    images = normalize_images(args.base, args.image or [])
+    prompt = args.prompt or ""
+    if args.prompt_file:
+        with open(os.path.abspath(args.prompt_file), "r", encoding="utf-8-sig") as handle:
+            prompt = handle.read()
+    payload = {
+        "action": "compose_video_board",
+        "title": args.title or args.new_title or "Canvas Video Board",
+        "prompt": prompt,
+        "images": images,
+        "image_node_ids": args.image_node or [],
+        "targets": parse_targets(args.target or [], args.ratio or ""),
+        "provider_id": args.provider,
+        "model": args.model,
+        "duration": args.duration,
+        "aspect_ratio": args.ratio,
+        "resolution": args.resolution,
+        "generate_audio": bool(args.audio),
+        "multimodal": not bool(args.first_last_frames),
+        "use_frame_roles": bool(args.first_last_frames),
+        "group_images": True,
+        "run": False,
+        "x": args.x or 0,
+        "y": args.y or 0,
+    }
+    data = request_json(args.base, "POST", f"/api/canvas-agent/canvases/{canvas_id}/actions", payload, timeout=120)
+    data["canvas_id"] = canvas_id
+    return data
+
+
 def create_task(base_url: str, plan: Dict[str, Any], index: int, timeout: float) -> Dict[str, Any]:
     payload = {
         "prompt": plan.get("prompt") or "Edit the reference images.",
@@ -421,6 +453,28 @@ def cmd_compose(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compose_video(args: argparse.Namespace) -> int:
+    data = compose_video_board(args)
+    canvas_id = data.get("canvas_id") or ""
+    result = data.get("result") or {}
+    summary = {
+        "canvas_id": canvas_id,
+        "canvas_url": f"{clean_base_url(args.base)}/static/canvas.html?canvas={canvas_id}",
+        "result": result,
+    }
+    if args.json:
+        print_json(summary)
+    else:
+        print(f"画布：{summary['canvas_url']}")
+        print(
+            f"结构：groups={len(result.get('group_ids') or [])} "
+            f"videos={len(result.get('video_ids') or [])} outputs={len(result.get('output_ids') or [])}"
+        )
+        print(f"备份：{result.get('backup_path') or '-'}")
+        print("状态：仅创建结构，未提交付费生成")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control Infinite Canvas automation.")
     parser.add_argument("--base", default=DEFAULT_BASE_URL, help="Canvas service base URL")
@@ -460,6 +514,29 @@ def build_parser() -> argparse.ArgumentParser:
     compose.add_argument("--concurrency", type=int, default=8)
     compose.add_argument("--task-timeout", type=int, default=900)
     compose.set_defaults(func=cmd_compose)
+
+    compose_video = sub.add_parser("compose-video", help="Create a Group -> Video -> Output board without running it")
+    compose_video.add_argument("--json", action="store_true")
+    compose_video.add_argument("--canvas", default="")
+    compose_video.add_argument("--new-title", default="")
+    compose_video.add_argument("--title", default="")
+    compose_video.add_argument("--prompt", default="")
+    compose_video.add_argument("--prompt-file", default="", help="UTF-8 text file containing the full video prompt")
+    compose_video.add_argument("--target", action="append", default=[], help="target title::prompt")
+    compose_video.add_argument("--image", action="append", default=[], help="local path or /assets, /output, http(s), data image URL")
+    compose_video.add_argument("--image-node", action="append", default=[])
+    compose_video.add_argument("--provider", default="volcengine")
+    compose_video.add_argument("--model", default="doubao-seedance-2-0-260128")
+    compose_video.add_argument("--duration", type=int, default=15)
+    compose_video.add_argument("--ratio", default="9:16")
+    compose_video.add_argument("--resolution", default="720p")
+    audio = compose_video.add_mutually_exclusive_group()
+    audio.add_argument("--audio", dest="audio", action="store_true", default=True)
+    audio.add_argument("--no-audio", dest="audio", action="store_false")
+    compose_video.add_argument("--first-last-frames", action="store_true", help="Use first/last-frame roles instead of multimodal references")
+    compose_video.add_argument("--x", type=float, default=0)
+    compose_video.add_argument("--y", type=float, default=0)
+    compose_video.set_defaults(func=cmd_compose_video)
     return parser
 
 

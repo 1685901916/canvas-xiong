@@ -131,8 +131,12 @@ assert.doesNotMatch(guard, /Boolean\(item\.task_id \|\| item\.canvasTaskId\)/,
 //   · 提交 catch（2 处）：上游可能已建任务，故意保持非终态，留给用户手动查询
 // 但两类的共同不变式是——都不能拦截新提交，因为都拿不出真任务 id。
 assert.strictEqual(canvas.split("pending.canvasTaskStatus = 'unknown_submission';").length - 1, 5);
-assert.strictEqual(canvas.split('pending.terminal = true;').length - 1, 3,
-  '恢复阶段的三处要标终态');
+// 按关联性检查，不数全局出现次数——别的恢复逻辑（如同步视频）也会标终态，
+// 全局计数会随无关改动误报。
+const unknownBlocks = canvas.split("pending.canvasTaskStatus = 'unknown_submission';").slice(0, -1);
+assert.strictEqual(unknownBlocks.length, 5, 'unknown_submission 共 5 处');
+const markedTerminal = unknownBlocks.filter(b => b.slice(-400).includes('pending.terminal = true;')).length;
+assert.strictEqual(markedTerminal, 3, '恢复阶段的三处要标终态（提交 catch 的两处故意不标）');
 assert.match(canvas, /pending\.terminal = false;/,
   '提交 catch 处保持非终态是有意的（上游可能已建任务），不要顺手改掉');
 // 共同不变式：两类都拿不出真任务 id，所以都不会走进拦截分支
@@ -143,5 +147,30 @@ assert.strictEqual(serverTaskIdOf({ id: 'p_a_1', canvasTaskId: 'p_a_1' }), '',
 const msg = canvas.slice(canvas.indexOf('任务仍在排队或生成中'), canvas.indexOf('任务仍在排队或生成中') + 260);
 assert.match(msg, /任务 ID：/, '拦截时要告诉用户是哪个任务挡住了');
 assert.match(msg, /删掉它的进度卡片/, '要告诉用户怎么解除');
+
+/* ===== 7. 提交失败的原始报错不能被通用文案盖掉 ===== */
+// 三处 resume 原本无条件写死"提交状态未知..."，把 submit catch 记录的真实原因
+// 抹掉了。下次打开画布只剩一句处理策略，说不出到底为什么失败。
+const ui = canvas.indexOf('const UNKNOWN_SUBMISSION_NOTE');
+assert.ok(ui > 0, '缺少 UNKNOWN_SUBMISSION_NOTE');
+const noteBlock = canvas.slice(ui, canvas.indexOf('function serverTaskIdOf', ui));
+const unknownSubmissionMessage = new Function(noteBlock + '; return unknownSubmissionMessage;')();
+
+const detail = 'MiniMax Design 本机接口错误（400）：Path traversal detected: X';
+const withReason = unknownSubmissionMessage(detail);
+assert.ok(withReason.includes(detail), '原始报错必须保留');
+assert.ok(withReason.includes('不会自动重新提交'), '处理策略也要说明');
+
+assert.strictEqual(unknownSubmissionMessage(''), '提交状态未知，为避免重复扣费不会自动重新提交');
+assert.strictEqual(unknownSubmissionMessage(undefined), '提交状态未知，为避免重复扣费不会自动重新提交');
+// 反复打开画布不能把文案越拼越长
+const once = unknownSubmissionMessage(detail);
+assert.strictEqual(unknownSubmissionMessage(once), once, '已处理过的文案不能重复拼接');
+
+// 三处 resume 都要走这个函数，不能再有写死的赋值
+assert.strictEqual(canvas.split('pending.error = unknownSubmissionMessage(pending.error);').length - 1, 3,
+  '三处 resume 都要保留原始报错');
+assert.doesNotMatch(canvas, /pending\.error = '提交状态未知，为避免重复扣费不会自动重新提交';/,
+  '不能再有写死覆盖原始报错的赋值');
 
 console.log('canvas-delete-and-stuck-task: 全部通过');

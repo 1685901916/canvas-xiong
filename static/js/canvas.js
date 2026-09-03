@@ -922,7 +922,12 @@ function forceFillFatalProviderError(message=''){
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
     applyGeneratorApiDefaults(node);
-    node.apiProvider = resolveImageProviderId(node.apiProvider || '');
+    // 与视频节点同一类问题：平台列表没就绪、或节点指定的平台暂时不在列表里，都不改写，
+    // 否则 65535 / nexus 这类自定义图片平台也会在 /api/config 失败时被静默换成 comfly。
+    if(!apiProviders.length) return;
+    const wantedImageProvider = String(node.apiProvider || '').trim();
+    if(wantedImageProvider && !apiProviders.some(p => p.id === wantedImageProvider)) return;
+    node.apiProvider = resolveImageProviderId(wantedImageProvider);
     const models = providerImageModels(node.apiProvider);
     if(!models.length) node.model = '';
     else if(!models.includes(resolveImageModel(node.model))) node.model = models[0] || '';
@@ -957,8 +962,16 @@ function resolveVideoProviderId(id){
     return providers.find(p => p.id === id)?.id || providers[0]?.id || 'comfly';
 }
 function videoProviderOptions(selectedId){
-    const selected = resolveVideoProviderId(selectedId);
-    return videoApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    const providers = videoApiProviders();
+    const wanted = String(selectedId || '').trim();
+    const known = providers.some(p => p.id === wanted);
+    // 节点指定的平台暂时不在列表里（列表未加载完 / 平台被禁用）时，把它原样列出并保持选中，
+    // 而不是在界面上静默跳到第一个——那正是「明明选了却不让我选」的观感来源。
+    const orphan = (wanted && !known)
+        ? `<option value="${escapeHtml(wanted)}" selected>${escapeHtml(wanted)}（未在列表中）</option>`
+        : '';
+    const selected = known ? wanted : resolveVideoProviderId(wanted);
+    return orphan + providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${(!orphan && provider.id === selected) ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
 }
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
@@ -1013,7 +1026,17 @@ function autodlWorkflowOptions(node){
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
-    node.apiProvider = resolveVideoProviderId(node.apiProvider || 'comfly');
+    // 平台列表还没从后端回来时（apiProviders 为空）不碰节点。
+    if(!apiProviders.length) return;
+    // 节点已经指定了平台、但当前列表里找不到它时：原样保留，绝不改写。
+    // 否则 imode / 火山引擎 / 65535 这类自定义平台会在下面任何一种情况下被静默改掉，
+    // 并跟着自动保存固化到画布里——表现就是「没动它，刷新一下自己变回 AutoDL / comfly」：
+    //   · /api/config 请求失败（例如服务刚重启）→ 前端退到只有 comfly 一项的内置兜底表
+    //   · 平台列表尚未加载完就先渲染了节点
+    //   · 平台被临时禁用
+    const wanted = String(node.apiProvider || '').trim();
+    if(wanted && !videoApiProviders().some(p => p.id === wanted)) return;
+    node.apiProvider = resolveVideoProviderId(wanted || 'comfly');
     const models = providerVideoModels(node.apiProvider);
     if(isAutoDLVideoProvider(node.apiProvider)){
         node.workflowMode = node.workflowMode === 'manual' ? 'manual' : 'auto';
@@ -1814,7 +1837,10 @@ function serializableCanvasPendingItems(items=[]){
             if(item[key] !== undefined) copy[key] = item[key];
         });
         if(taskId) copy.canvasTaskId = String(taskId);
-        copy.canvasTaskType = copy.canvasTaskType || item.type || 'online-image';
+        // 兜底类型按来源节点推断。原来一律 'online-image'，导致视频任务被图片
+        // 恢复逻辑接管；视频生成失败时给出的提示也完全对不上。
+        copy.canvasTaskType = copy.canvasTaskType || item.type
+            || (item?.run?.node?.type === 'video' ? SYNC_VIDEO_TASK_TYPE : 'online-image');
         copy.canvasTaskStatus = copy.canvasTaskStatus || item.status || 'queued';
         try { return JSON.parse(JSON.stringify(copy)); }
         catch(_) { return copy; }
@@ -1990,6 +2016,54 @@ function isUpstreamTaskGone(status, message){
     return /未找到|不存在|已过期|被清理|not\s*found/i.test(String(message || ''));
 }
 
+// 提交没拿到服务端任务 id 时的说明文案。保留原始报错，别用通用话术盖掉它——
+// 那句"提交状态未知"只说明了处理策略，说不出到底为什么失败。
+const UNKNOWN_SUBMISSION_NOTE = '提交状态未知，为避免重复扣费不会自动重新提交';
+function unknownSubmissionMessage(previousError){
+    const reason = String(previousError || '').trim();
+    if(!reason) return UNKNOWN_SUBMISSION_NOTE;
+    // 已经拼过的原样返回：否则每次打开画布都会把后面的原始报错又截掉一次。
+    if(reason.startsWith(UNKNOWN_SUBMISSION_NOTE)) return reason;
+    return `${UNKNOWN_SUBMISSION_NOTE}。原始报错：${reason}`;
+}
+
+// 同步长请求型的视频任务：一个 POST 挂到生成完，上游不给 task_id。
+// 页面刷新/服务重启/网络中断后，这类任务无法查询也无法恢复——但上游很可能
+// 已经生成并计费了。所以恢复时必须明确告诉用户，而不是悄悄消失或报个含糊的错。
+const SYNC_VIDEO_TASK_TYPE = 'canvas-video';
+// 同步视频生成实测 3–8 分钟（MiniMax 官方最慢见过 6m37s）。取 30 分钟做判定线：
+// 比最慢的一次宽松得多，同时又不会让断掉的任务一直挂在"生成中"。
+const SYNC_VIDEO_LOST_AFTER_MS = 30 * 60 * 1000;
+function resumeSyncVideoTasks(){
+    let changed = false;
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.canvasTaskType !== SYNC_VIDEO_TASK_TYPE || pending.terminal) return;
+            // 只处理明显超时的：别的标签页可能正在跑同一个任务，过早判定会把活着的
+            // 任务标成失败。阈值取得比最慢的一次同步生成还宽松。
+            const age = nowMs() - Number(pending.startedAt || 0);
+            if(!(age > SYNC_VIDEO_LOST_AFTER_MS)) return;
+            pending.failed = true;
+            pending.terminal = true;
+            pending.canvasTaskStatus = 'sync_request_lost';
+            pending.status = 'sync_request_lost';
+            pending.error = '这次生成走的是同步请求（上游不返回任务 ID）。页面刷新或服务重启后连接已断开，'
+                + '结果无法再取回。上游可能已经生成并计费，请到对应平台的用量记录里核对后再决定是否重跑。';
+            const videoNode = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+            if(videoNode){
+                videoNode.running = false;
+                videoNode.runStatus = 'failed';
+                videoNode.runError = pending.error;
+            }
+            changed = true;
+        });
+    });
+    if(changed){
+        refreshRunNodes();
+        scheduleSave();
+    }
+}
+
 function serverTaskIdOf(pending){
     const id = String(pending?.task_id || pending?.canvasTaskId || '').trim();
     if(!id) return '';
@@ -2100,7 +2174,12 @@ async function saveCanvas(){
             const data = await res.json().catch(() => ({}));
             const remote = data.detail?.canvas || data.canvas;
             const remoteUpdatedAt = Number(data.detail?.updated_at || data.updated_at || remote?.updated_at || 0);
-            if(shouldMergeLocalCanvasOnConflict()){
+            // 只要本地有未保存的真改动（localCanvasDirty），冲突时一律「合并后重试」，
+            // 不能走下面那条「用远端覆盖本地、清脏标记、显示 Synced」的分支。
+            // 原来只对提示词/媒体/进行中的生成做合并，改 provider、模型、时长这类下拉框
+            // 不算在内——于是你刚选好的平台会在别的写入（生成回写、其它标签页、后台脚本）
+            // 触发 409 的瞬间被静默丢掉，看起来就是「自己又回去了」。
+            if(shouldMergeLocalCanvasOnConflict() || localCanvasDirty){
                 if(remote) mergeRemoteCanvasIntoLocalForSave(remote);
                 if(remoteUpdatedAt){
                     lastCanvasUpdatedAt = remoteUpdatedAt;
@@ -2172,7 +2251,9 @@ async function loadConfig(){
         videoModels = cfg.video_models?.length ? cfg.video_models : DEFAULT_VIDEO_MODELS;
         msChatModels = cfg.ms_chat_models?.length ? cfg.ms_chat_models : msChatModels;
         comfyBackendCount = Math.max(1, (cfg.comfy_instances || []).length || 1);
-        apiProviders = Array.isArray(cfg.api_providers) && cfg.api_providers.length ? cfg.api_providers : defaultApiProviders();
+        apiProviders = Array.isArray(cfg.api_providers) && cfg.api_providers.length
+            ? cfg.api_providers
+            : (apiProviders.length ? apiProviders : defaultApiProviders());
         try {
             const autodlConfig = await fetch('/api/autodl/workflows').then(r => {
                 if(!r.ok) throw new Error('AutoDL workflow metadata unavailable');
@@ -2201,7 +2282,11 @@ async function loadConfig(){
             try { await ensureRunningHubWorkflow(workflowId); } catch(_) {}
         }));
     } catch(e) {
-        apiProviders = defaultApiProviders();
+        // /api/config 偶发失败（最常见是服务刚重启的一两秒）时，如果之前已经拿到过
+        // 完整平台列表，就沿用它；只有从未加载成功过才退到内置兜底表。
+        // 兜底表里只有 comfly 一项，拿它去 sanitize 节点会把 imode / 火山 / 65535
+        // 这类自定义平台全部静默改成 comfly 并保存——这是「provider 自己变了」的来源之一。
+        apiProviders = apiProviders.length ? apiProviders : defaultApiProviders();
     }
 }
 
@@ -2801,6 +2886,7 @@ async function openCanvas(id){
         resumeAutoDLVideoTasks();
         resumeRunningHubVideoTasks();
         resumeMiniMaxDesignVideoTasks();
+        resumeSyncVideoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
@@ -2848,6 +2934,7 @@ function applyRemoteCanvasData(remote){
         resumeAutoDLVideoTasks();
         resumeRunningHubVideoTasks();
         resumeMiniMaxDesignVideoTasks();
+        resumeSyncVideoTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -13991,6 +14078,15 @@ async function runVideoNode(nodeId, opts={}){
         const pending = pendingById(out, pendingId);
         return runRunningHubVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
     }
+    // 通用视频路径（MiniMax 官方 / comfly / 火山 等）：一个 POST 同步挂到生成完，
+    // 上游不返回可查询的 task_id。必须显式标类型——不标的话保存时会被兜底成
+    // 'online-image'，于是被图片恢复逻辑接管，报出"提交状态未知"这种驴唇不对马嘴的错。
+    const syncPending = pendingById(out, pendingId);
+    if(syncPending){
+        syncPending.canvasTaskType = SYNC_VIDEO_TASK_TYPE;
+        syncPending.canvasTaskStatus = 'running';
+        syncPending.provider_id = resolveVideoProviderId(node.apiProvider || 'comfly');
+    }
     try {
         const result = await cascadeFetch('/api/canvas-video', {
             method:'POST',
@@ -16147,7 +16243,9 @@ function resumeAutoDLVideoTasks(){
                 pending.terminal = true;
                 pending.status = 'unknown_submission';
                 pending.canvasTaskStatus = 'unknown_submission';
-                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                // 保留提交时记录的原始报错。之前这里无条件覆盖成通用文案，
+                // 下次打开画布后真正的失败原因就被抹掉了，等于没有信息。
+                pending.error = unknownSubmissionMessage(pending.error);
                 if(node){
                     node.running = false;
                     node.runStatus = 'failed';
@@ -16184,7 +16282,9 @@ function resumeRunningHubVideoTasks(){
                 pending.terminal = true;
                 pending.status = 'unknown_submission';
                 pending.canvasTaskStatus = 'unknown_submission';
-                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                // 保留提交时记录的原始报错。之前这里无条件覆盖成通用文案，
+                // 下次打开画布后真正的失败原因就被抹掉了，等于没有信息。
+                pending.error = unknownSubmissionMessage(pending.error);
                 if(videoNode){
                     videoNode.running = false;
                     videoNode.runStatus = 'failed';
@@ -16223,7 +16323,9 @@ function resumeMiniMaxDesignVideoTasks(){
                 pending.terminal = true;
                 pending.status = 'unknown_submission';
                 pending.canvasTaskStatus = 'unknown_submission';
-                pending.error = '提交状态未知，为避免重复扣费不会自动重新提交';
+                // 保留提交时记录的原始报错。之前这里无条件覆盖成通用文案，
+                // 下次打开画布后真正的失败原因就被抹掉了，等于没有信息。
+                pending.error = unknownSubmissionMessage(pending.error);
                 if(videoNode){
                     videoNode.running = false;
                     videoNode.runStatus = 'failed';

@@ -23,3 +23,10 @@ final-inspection-*.png
 
 # 会话期间的画布/源码快照，本地留存即可，不进版本库
 _backups/
+
+# 密钥文件的任何备份/副本都不能进版本库（曾出现 API/.env.backup_* 未被忽略）
+API/.env*
+*.env.backup*
+# 各种工具留下的源码快照
+*.backup_*
+*.backup

@@ -189,7 +189,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.01-rerun-while-running-1"
+CANVAS_RUNTIME_VERSION = "2026.09.03-sync-video-visibility-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -572,6 +572,17 @@ load_env_file()
 
 COMFYUI_INSTANCES = [s.strip() for s in os.getenv("COMFYUI_INSTANCES", "127.0.0.1:8188").split(",") if s.strip()]
 COMFYUI_ADDRESS = COMFYUI_INSTANCES[0]
+
+
+def comfy_http_base(addr) -> str:
+    """ComfyUI 实例地址既可以写成 host:port（默认 http，本机/局域网用法不变），
+    也可以直接写 http:// 或 https:// 开头的完整地址。
+    AutoDL 等云端实例对外是 https + 8443，必须保留原协议，否则会被拼成
+    http://host:8443 而连不上（表现为 405 / 连接失败）。"""
+    text = str(addr or "").strip().rstrip("/")
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    return f"http://{text}"
 
 AI_BASE_URL = os.getenv("COMFLY_BASE_URL", "https://ai.comfly.chat").rstrip("/")
 AI_API_KEY = os.getenv("COMFLY_API_KEY", "")
@@ -1876,7 +1887,20 @@ def sync_static_html_versions():
         "canvas-list.html": ("/static/js/canvas-list.js",),
         "smart-canvas.html": ("/static/js/smart-canvas.js",),
     }
-    canvas_version = urllib.parse.quote(CANVAS_RUNTIME_VERSION, safe="._-")
+    # 版本号后面再拼一段由这些脚本/样式「文件内容」算出来的短 hash：
+    # 任何一处 JS/CSS 改动都会自动让 ?v= 变化、浏览器强制重新下载，
+    # 不再依赖每次改代码都记得手动改 CANVAS_RUNTIME_VERSION——忘了改的话，
+    # 用户刷新拿到的仍是缓存里的旧脚本，旧逻辑会把画布数据改坏（provider 静默回退就是这么反复出现的）。
+    _asset_hash = hashlib.sha1()
+    for _assets in canvas_runtime_targets.values():
+        for _asset in _assets:
+            _asset_path = os.path.join(STATIC_DIR, _asset.lstrip("/").split("static/", 1)[-1])
+            try:
+                with open(_asset_path, "rb") as _f:
+                    _asset_hash.update(_f.read())
+            except Exception:
+                _asset_hash.update(_asset.encode("utf-8"))
+    canvas_version = urllib.parse.quote(f"{CANVAS_RUNTIME_VERSION}.{_asset_hash.hexdigest()[:10]}", safe="._-")
     for page_name, assets in canvas_runtime_targets.items():
         page_path = os.path.join(STATIC_DIR, page_name)
         try:
@@ -3088,6 +3112,15 @@ class CanvasAgentCommand(BaseModel):
     ratio: str = "source"
     resolution: str = "1k"
     quality: str = "auto"
+    duration: int = 10
+    aspect_ratio: str = "9:16"
+    generate_audio: bool = False
+    multimodal: bool = True
+    use_frame_roles: bool = False
+    enhance_prompt: bool = False
+    enable_upsample: bool = False
+    watermark: bool = False
+    camera_fixed: bool = False
     group_images: bool = False
     compare_providers: bool = False
     parallel_providers: bool = False
@@ -3258,7 +3291,7 @@ def check_images_exist(backend_addr, images):
     if not images: return True
     for img in images:
         try:
-            url = f"http://{backend_addr}/view?filename={urllib.parse.quote(img)}&type=input"
+            url = f"{comfy_http_base(backend_addr)}/view?filename={urllib.parse.quote(img)}&type=input"
             r = requests.get(url, stream=True, timeout=0.5)
             r.close()
             if r.status_code != 200: return False
@@ -3293,7 +3326,7 @@ def get_best_backend(required_images: List[str] = None):
 
     for addr in COMFYUI_INSTANCES:
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            with urllib.request.urlopen(f"{comfy_http_base(addr)}/queue", timeout=1) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 with LOAD_LOCK:
@@ -3320,7 +3353,7 @@ def reserve_best_backend(required_images: List[str] = None):
     backend_stats = {}
     for addr in COMFYUI_INSTANCES:
         try:
-            with urllib.request.urlopen(f"http://{addr}/queue", timeout=1) as response:
+            with urllib.request.urlopen(f"{comfy_http_base(addr)}/queue", timeout=1) as response:
                 data = json.loads(response.read())
                 remote_load = len(data.get('queue_running', [])) + len(data.get('queue_pending', []))
                 has_images = check_images_exist(addr, required_images)
@@ -3345,7 +3378,7 @@ def reserve_best_backend(required_images: List[str] = None):
 def download_image(comfy_address, comfy_url_path, prefix="studio_"):
     filename = f"{prefix}{uuid.uuid4().hex[:10]}.png"
     local_path = output_path_for(filename, "output")
-    full_url = f"http://{comfy_address}{comfy_url_path}"
+    full_url = f"{comfy_http_base(comfy_address)}{comfy_url_path}"
     try:
         with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
@@ -3412,7 +3445,7 @@ def download_comfy_output(comfy_address, item, prefix="studio_"):
     subfolder = urllib.parse.quote(str(item.get("subfolder") or ""))
     file_type = urllib.parse.quote(str(item.get("type") or "output"))
     comfy_url_path = f"/view?filename={urllib.parse.quote(str(item['filename']))}&subfolder={subfolder}&type={file_type}"
-    full_url = f"http://{comfy_address}{comfy_url_path}"
+    full_url = f"{comfy_http_base(comfy_address)}{comfy_url_path}"
     try:
         with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
@@ -3504,7 +3537,7 @@ def save_to_history(record):
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
-        with urllib.request.urlopen(f"http://{comfy_address}/history/{prompt_id}") as response:
+        with urllib.request.urlopen(f"{comfy_http_base(comfy_address)}/history/{prompt_id}") as response:
             return json.loads(response.read())
     except Exception as e:
         return {}
@@ -4790,6 +4823,186 @@ def agent_compose_generation_board(canvas, payload: CanvasAgentCommand):
         "generator_ids": generator_ids,
         "output_ids": output_ids,
         "run_plan": run_plan,
+    }
+
+def agent_normalize_video_targets(payload: CanvasAgentCommand):
+    raw_targets = payload.targets or [{
+        "title": payload.title or "视频任务 1",
+        "prompt": payload.prompt,
+    }]
+    targets = []
+    for index, item in enumerate(raw_targets[:40]):
+        if isinstance(item, str):
+            item = {"title": f"视频任务 {index + 1}", "prompt": item}
+        if not isinstance(item, dict):
+            continue
+        title = agent_clean_text(item.get("title") or item.get("name") or f"视频任务 {index + 1}", 80)
+        prompt = agent_clean_text(item.get("prompt") or item.get("text") or payload.prompt, ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+        provider_id = agent_clean_text(item.get("provider_id") or item.get("provider") or payload.provider_id or "volcengine", 80)
+        provider = get_api_provider(provider_id)
+        video_models = [str(value or "").strip() for value in (provider.get("video_models") or []) if str(value or "").strip()]
+        if not video_models:
+            raise HTTPException(status_code=400, detail=f"API 平台不支持视频生成：{provider.get('name') or provider_id}")
+        model = agent_clean_text(item.get("model") or payload.model or video_models[0], 160)
+        try:
+            duration = max(1, min(60, int(item.get("duration") or payload.duration or 10)))
+        except Exception:
+            duration = 10
+        aspect_ratio = agent_clean_text(
+            item.get("aspect_ratio") or item.get("aspectRatio") or item.get("ratio") or payload.aspect_ratio or payload.ratio or "9:16",
+            24,
+        )
+        resolution = agent_clean_text(item.get("resolution") or payload.resolution or "720p", 24)
+        multimodal = agent_bool(item.get("multimodal", payload.multimodal))
+        use_frame_roles = agent_bool(item.get("use_frame_roles", item.get("useFrameRoles", payload.use_frame_roles))) and not multimodal
+        targets.append({
+            "title": title,
+            "prompt": prompt,
+            "provider_id": provider.get("id") or provider_id,
+            "provider_name": provider.get("name") or provider_id,
+            "model": model,
+            "duration": duration,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "generate_audio": agent_bool(item.get("generate_audio", item.get("generateAudio", payload.generate_audio))),
+            "multimodal": multimodal,
+            "use_frame_roles": use_frame_roles,
+            "enhance_prompt": agent_bool(item.get("enhance_prompt", item.get("enhancePrompt", payload.enhance_prompt))),
+            "enable_upsample": agent_bool(item.get("enable_upsample", item.get("enableUpsample", payload.enable_upsample))),
+            "watermark": agent_bool(item.get("watermark", payload.watermark)),
+            "camera_fixed": agent_bool(item.get("camera_fixed", item.get("cameraFixed", payload.camera_fixed))),
+            "image_indexes": item.get("image_indexes") or item.get("image_indices") or item.get("image_index") or [],
+            "image_ids": item.get("image_ids") or item.get("image_node_ids") or item.get("image_id") or [],
+        })
+    if not targets:
+        raise HTTPException(status_code=400, detail="没有可用的视频任务。")
+    return targets
+
+def agent_layout_video_images(base_image_nodes, nodes, group_x, group_y, used_image_ids=None):
+    used_image_ids = used_image_ids if used_image_ids is not None else set()
+    row_images = []
+    for index, source in enumerate(base_image_nodes or []):
+        col = index % 3
+        row = index // 3
+        x = group_x + 60 + col * 330
+        y = group_y + 90 + row * 560
+        source_id = source.get("id")
+        if source_id not in used_image_ids:
+            node = source
+            used_image_ids.add(source_id)
+        else:
+            node = {
+                "id": agent_uid("img"),
+                "type": "image",
+                "url": source.get("url"),
+                "name": source.get("name") or f"reference-{index + 1}.png",
+                "role": source.get("role") or "",
+            }
+            for key in ("mediaKind", "originalLocalUrl", "natural_w", "natural_h"):
+                if source.get(key):
+                    node[key] = source.get(key)
+            nodes.append(node)
+        node.update({"x": x, "y": y, "w": 300, "h": 533})
+        row_images.append(node)
+    return row_images
+
+def agent_compose_video_board(canvas, payload: CanvasAgentCommand):
+    nodes = canvas.setdefault("nodes", [])
+    connections = canvas.setdefault("connections", [])
+    logs = canvas.setdefault("logs", [])
+    origin_x, origin_y = agent_board_origin(nodes, payload)
+    image_nodes, created_images = agent_source_image_nodes(canvas, payload, origin_x, origin_y)
+    targets = agent_normalize_video_targets(payload)
+    target_entries = [
+        (target, agent_target_explicit_image_nodes(target, image_nodes) or image_nodes)
+        for target in targets
+    ]
+    board_title = agent_clean_text(payload.title or canvas.get("title") or "画布视频任务", 80)
+    prompt_ids, group_ids, video_ids, output_ids, run_plan = [], [], [], [], []
+    row_cursor_y = origin_y
+    used_image_ids = set()
+
+    for target, target_image_nodes in target_entries:
+        target_title = agent_clean_text(target.get("title") or board_title, 80)
+        row_images = agent_layout_video_images(target_image_nodes, nodes, origin_x, row_cursor_y, used_image_ids)
+        image_cols = min(3, len(row_images))
+        image_rows = max(1, (len(row_images) + 2) // 3) if row_images else 0
+        image_area_w = image_cols * 300 + max(0, image_cols - 1) * 30
+        prompt_x = origin_x + 60 + image_area_w + (40 if image_cols else 0)
+        group_w = max(840, (prompt_x - origin_x) + 400 + 40)
+        group_h = max(820, 90 + image_rows * 560 + 90)
+        prompt_node = {
+            "id": agent_uid("prompt"), "type": "prompt", "x": prompt_x, "y": row_cursor_y + 90,
+            "w": 400, "h": min(640, group_h - 180), "name": f"{target_title}｜视频提示词",
+            "text": target.get("prompt") or "",
+        }
+        group_node = {
+            "id": agent_uid("grp"), "type": "group", "x": origin_x, "y": row_cursor_y,
+            "w": group_w, "h": group_h,
+            "items": [node.get("id") for node in row_images] + [prompt_node["id"]],
+            "name": f"{target_title} 输入",
+            "title": f"{target_title}｜{len(row_images)}张参考图 + 视频提示词",
+        }
+        video_x = origin_x + group_w + 115
+        video_node = {
+            "id": agent_uid("vid"), "type": "video", "x": video_x, "y": row_cursor_y + 90,
+            "w": 420, "h": 520,
+            "apiProvider": target.get("provider_id") or "volcengine",
+            "model": target.get("model") or "", "duration": target.get("duration") or 10,
+            "aspectRatio": target.get("aspect_ratio") or "9:16",
+            "resolution": target.get("resolution") or "720p",
+            "enhancePrompt": bool(target.get("enhance_prompt")),
+            "enableUpsample": bool(target.get("enable_upsample")),
+            "watermark": bool(target.get("watermark")), "cameraFixed": bool(target.get("camera_fixed")),
+            "generateAudio": bool(target.get("generate_audio")),
+            "useFrameRoles": bool(target.get("use_frame_roles")), "multimodal": bool(target.get("multimodal")),
+            "tempShLinks": [], "inputs": [], "generatedOutputs": [], "running": False,
+            "name": f"{target.get('provider_name') or target.get('provider_id')}｜{target_title}",
+        }
+        output_node = {
+            "id": agent_uid("out"), "type": "output", "x": video_x + 500, "y": row_cursor_y + 20,
+            "w": 760, "h": 680, "images": [], "name": f"{target_title}｜视频输出",
+        }
+        nodes.extend([prompt_node, group_node, video_node, output_node])
+        agent_connect(connections, group_node["id"], video_node["id"])
+        agent_connect(connections, video_node["id"], output_node["id"])
+        video_node["inputs"] = [
+            *[f"{group_node['id']}:{node.get('id')}" for node in row_images],
+            f"{group_node['id']}:prompts",
+        ]
+        refs = agent_reference_images_from_nodes(row_images)
+        prompt_ids.append(prompt_node["id"])
+        group_ids.append(group_node["id"])
+        video_ids.append(video_node["id"])
+        output_ids.append(output_node["id"])
+        run_plan.append({
+            "target_title": target_title, "prompt": target.get("prompt") or "",
+            "provider_id": video_node["apiProvider"], "provider_name": target.get("provider_name") or video_node["apiProvider"],
+            "model": video_node["model"], "duration": video_node["duration"],
+            "aspect_ratio": video_node["aspectRatio"], "resolution": video_node["resolution"],
+            "generate_audio": video_node["generateAudio"], "multimodal": video_node["multimodal"],
+            "use_frame_roles": video_node["useFrameRoles"], "reference_images": refs,
+            "reference_count": len(refs), "group_id": group_node["id"],
+            "video_id": video_node["id"], "output_id": output_node["id"],
+        })
+        row_cursor_y += group_h + 120
+
+    canvas.setdefault("agent_logs", []).insert(0, {
+        "id": agent_uid("agentlog"), "action": "compose_video_board", "created_at": now_ms(),
+        "title": board_title, "image_count": len(image_nodes), "created_image_count": len(created_images),
+        "target_count": len(target_entries), "video_count": len(video_ids), "run": False,
+    })
+    canvas["agent_logs"] = canvas["agent_logs"][:100]
+    logs.insert(0, {
+        "id": agent_uid("log"), "createdAt": now_ms(), "status": "info", "nodeType": "canvas-agent",
+        "model": "compose_video_board", "prompt": payload.prompt or board_title,
+        "outputs": [], "error": "", "platform": "canvas-agent",
+    })
+    canvas["logs"] = logs[:500]
+    return {
+        "title": board_title, "image_count": len(image_nodes), "created_image_count": len(created_images),
+        "prompt_ids": prompt_ids, "group_ids": group_ids, "video_ids": video_ids,
+        "output_ids": output_ids, "run_plan": run_plan,
     }
 
 def agent_create_recreate_flow(canvas, payload: CanvasAgentCommand):
@@ -14448,7 +14661,7 @@ def view_image(filename: str, type: str = "input", subfolder: str = ""):
     # 先按原逻辑去各 ComfyUI 后端找
     for addr in COMFYUI_INSTANCES:
         try:
-            url = f"http://{addr}/view"
+            url = f"{comfy_http_base(addr)}/view"
             params = {"filename": filename, "type": type, "subfolder": subfolder}
             r = requests.get(url, params=params, timeout=1)
             if r.status_code == 200:
@@ -14528,7 +14741,7 @@ async def upload_image(files: List[UploadFile] = File(...)):
         for addr in COMFYUI_INSTANCES:
             try:
                 files_data = {'image': (file.filename, content, file.content_type)}
-                response = requests.post(f"http://{addr}/upload/image", files=files_data, timeout=5)
+                response = requests.post(f"{comfy_http_base(addr)}/upload/image", files=files_data, timeout=5)
                 if response.status_code == 200:
                     last_result = response.json()
                     success_count += 1
@@ -14638,7 +14851,7 @@ async def upload_comfyui_base64(payload: Base64UploadRequest):
     comfy_name = None
     for addr in COMFYUI_INSTANCES:
         try:
-            resp = requests.post(f"http://{addr}/upload/image",
+            resp = requests.post(f"{comfy_http_base(addr)}/upload/image",
                                  files={'image': (filename, content, ct or 'image/png')}, timeout=10)
             if resp.status_code == 200:
                 comfy_name = resp.json().get("name", filename)
@@ -18392,9 +18605,206 @@ async def generate_minimax_video(payload: CanvasVideoRequest, provider):
     return {"videos": [local_url], "task_id": task_id, "raw": final_raw}
 
 
+# ─────────────────────────────────────────────────────────────
+# imodel space（api.imodel.space）视频接入
+# 它跑的是 Minimax-H3，但路径/字段与 MiniMax 官方完全不同：
+#   提交 POST {base}/v1/videos/generations  → 202 {"id": ...}
+#   轮询 GET  {base}/v1/tasks/{task_no}     → {"status","outputs":[{"url"}],"error"}
+# 参考图只吃公网 URL，所以本地图先走 upload_local_video_to_cloud 换成外链。
+# ─────────────────────────────────────────────────────────────
+IMODEL_RESOLUTIONS = ("480P", "608P", "768P", "832P", "1080P", "1440P")
+IMODEL_ASPECTS = {"16:9", "1:1", "9:16"}
+IMODEL_DEFAULT_BASE_URL = "https://api.imodel.space"
+
+
+def is_imodel_provider(provider):
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return (
+        provider_protocol(provider) == "imodel"
+        or provider_id in {"imode", "imodel"}
+        or "api.imodel.space" in base_url
+    )
+
+
+def imodel_video_resolution(value) -> str:
+    """画布用的是 720p/1080p/4k 这类小写档位，imodel 强校验「数字+大写P」白名单。"""
+    text = str(value or "").strip().upper()
+    if not text:
+        return "768P"
+    alias = {"4K": "1440P", "2K": "1440P", "AUTO": "768P", "SOURCE": "768P"}
+    if text in alias:
+        return alias[text]
+    if not text.endswith("P"):
+        text = f"{text}P"
+    if text in IMODEL_RESOLUTIONS:
+        return text
+    digits = re.sub(r"[^0-9]", "", text)
+    if not digits:
+        return "768P"
+    num = int(digits)
+    # 白名单里没有的档位就近取，例如 720P → 768P
+    return min(IMODEL_RESOLUTIONS, key=lambda item: abs(int(item[:-1]) - num))
+
+
+def imodel_video_aspect(value) -> str:
+    """imodel 只认 16:9 / 1:1 / 9:16，其余比例按横竖方向就近折算。"""
+    text = str(value or "").strip()
+    if text in IMODEL_ASPECTS:
+        return text
+    fallback = {
+        "4:3": "16:9", "3:2": "16:9", "21:9": "16:9", "5:4": "1:1",
+        "3:4": "9:16", "2:3": "9:16", "4:5": "9:16", "9:21": "9:16",
+    }
+    if text in fallback:
+        return fallback[text]
+    try:
+        left, right = text.split(":")
+        return "9:16" if float(left) < float(right) else "16:9"
+    except Exception:
+        return "9:16"
+
+
+def imodel_error_message(response) -> str:
+    try:
+        raw = response.json()
+    except Exception:
+        return (response.text or "")[:300]
+    if isinstance(raw, dict):
+        error = raw.get("error")
+        if isinstance(error, dict):
+            code = str(error.get("code") or "").strip()
+            message = str(error.get("message") or "").strip()
+            return f"{code} {message}".strip() or str(raw)[:300]
+        for key in ("msg", "message", "detail"):
+            if raw.get(key):
+                return str(raw.get(key))[:300]
+    return str(raw)[:300]
+
+
+async def imodel_download_video(url: str, authorization: str) -> str:
+    filename = f"video_{uuid.uuid4().hex[:10]}.mp4"
+    path = output_path_for(filename, "output")
+    timeout = httpx.Timeout(connect=20.0, read=600.0, write=120.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(url, headers={"Authorization": authorization})
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"imodel 视频下载失败：HTTP {response.status_code}")
+        with open(path, "wb") as fh:
+            fh.write(response.content)
+    return output_url_for(filename, "output")
+
+
+async def wait_imodel_video(client, base_url: str, authorization: str, task_id: str):
+    poll_url = f"{base_url.rstrip('/')}/v1/tasks/{urllib.parse.quote(str(task_id), safe='')}"
+    deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+    while time.monotonic() < deadline:
+        response = await client.get(poll_url, headers={"Authorization": authorization})
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"imodel 任务查询失败：{imodel_error_message(response)}")
+        raw = response.json() if response.content else {}
+        status = str((raw or {}).get("status") or "").strip().lower()
+        if status == "succeeded":
+            outputs = (raw or {}).get("outputs") or []
+            video_url = ""
+            if outputs and isinstance(outputs[0], dict):
+                video_url = str(outputs[0].get("url") or "").strip()
+            if not video_url:
+                raise HTTPException(status_code=502, detail="imodel 任务成功但没有返回视频地址")
+            if video_url.startswith("/"):
+                video_url = f"{base_url.rstrip('/')}{video_url}"
+            return await imodel_download_video(video_url, authorization), raw
+        if status in {"failed", "cancelled"}:
+            error = (raw or {}).get("error") or {}
+            code = str(error.get("code") or status).strip()
+            message = str(error.get("message") or "").strip()
+            raise HTTPException(status_code=502, detail=f"imodel 生成{status}：{code} {message}".strip())
+        await asyncio.sleep(5.0)
+    raise HTTPException(status_code=504, detail="imodel 视频生成超时，请稍后在平台任务列表确认")
+
+
+async def generate_imodel_video(payload: CanvasVideoRequest, provider):
+    provider_id = str((provider or {}).get("id") or "imode").strip().lower()
+    provider_name = (provider or {}).get("name") or provider_id
+    api_key = provider_env_key_value(provider_id)
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未配置 {provider_name} 的 API Key，请在「API 设置」里填写（环境变量 {provider_key_env(provider_id)}）。",
+        )
+    base_url = (video_api_root(provider) or IMODEL_DEFAULT_BASE_URL).rstrip("/")
+    authorization = f"Bearer {api_key}"
+    headers = {"Authorization": authorization, "Content-Type": "application/json"}
+
+    prompt = str(payload.prompt or "").strip()[:7000]
+    images = [item for item in (payload.images or []) if getattr(item, "url", "")]
+    image_roles = [str(getattr(item, "role", "") or "").strip() for item in images]
+    frame_mode = any(role in {"first_frame", "last_frame"} for role in image_roles)
+
+    # imodel 的 worker 会直接 GET 参考图，本地路径必须先换成公网外链
+    public_urls = []
+    for ref in images[:9]:
+        info = await upload_local_video_to_cloud(str(getattr(ref, "url", "") or ""))
+        url = str((info or {}).get("url") or "").strip()
+        if url:
+            public_urls.append(url)
+
+    body = {
+        "model": (str(payload.model or "").strip() or "minimax-h3"),
+        "duration": max(4, min(15, int(payload.duration or 6))),
+        "resolution": imodel_video_resolution(payload.resolution),
+        "aspect": imodel_video_aspect(payload.aspect_ratio),
+        "fps": 24,
+    }
+    if prompt:
+        body["prompt"] = prompt
+    if payload.seed is not None:
+        try:
+            body["seed"] = int(payload.seed)
+        except Exception:
+            pass
+
+    metadata = {}
+    if public_urls:
+        body["image"] = public_urls[0]
+        if frame_mode and len(public_urls) >= 2:
+            metadata["mode"] = "first_last_frame"
+            metadata["last_frame"] = public_urls[1]
+        else:
+            metadata["mode"] = "reference"
+    if payload.videos:
+        info = await upload_local_video_to_cloud(str(payload.videos[0] or ""))
+        video_ref = str((info or {}).get("url") or "").strip()
+        if video_ref:
+            body["video"] = video_ref
+    if metadata:
+        body["metadata"] = metadata
+    if not (body.get("prompt") or body.get("image") or body.get("video")):
+        raise HTTPException(status_code=400, detail="imodel 视频至少需要提示词、参考图或参考视频其中一项")
+
+    submit_url = f"{base_url}/v1/videos/generations"
+    timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=120.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(submit_url, headers=headers, json=body)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"imodel 视频接口错误：{imodel_error_message(response)}")
+        raw = response.json() if response.content else {}
+        task_id = str((raw or {}).get("id") or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=502, detail="imodel 提交成功但没有返回任务 id")
+        local_url, final_raw = await wait_imodel_video(client, base_url, authorization, task_id)
+    return {"videos": [local_url], "task_id": task_id, "raw": final_raw}
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
+    if is_imodel_provider(provider):
+        try:
+            return await generate_imodel_video(payload, provider)
+        except httpx.HTTPError as exc:
+            log_net_error(f"视频(imodel) 网络/TLS错误 model={payload.model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求 imodel 视频接口失败：{exc}") from exc
     if is_minimax_provider(provider):
         try:
             return await generate_minimax_video(payload, provider)
@@ -18598,7 +19008,13 @@ async def canvas_video(payload: CanvasVideoRequest):
                     # 火山方舟视频接口（含 Seedance 2.0 图生视频）均通过 body 的 duration 字段控制时长；
                     # 之前对 seedance-2.0 + 参考图的情况省略了 duration，导致接口回退到默认 5s。
                     body["duration"] = volcengine_video_duration(payload.duration, volc_model)
-                    if payload.aspect_ratio:
+                    # 方舟首帧/首尾帧生成时输出比例强制跟随首帧图；此时再传 ratio 接口会直接报
+                    # InvalidParameter.TaskTypeConstraint，因此必须跳过。
+                    _volc_frame_mode = any(
+                        volcengine_content_role(ref.role, "image") in {"first_frame", "last_frame"}
+                        for ref in payload.images
+                    )
+                    if payload.aspect_ratio and not _volc_frame_mode:
                         body["ratio"] = payload.aspect_ratio
                     resolution = volcengine_video_resolution(payload.resolution, volc_model)
                     if resolution:
@@ -19096,20 +19512,35 @@ async def canvas_agent_inspect(canvas_id: str):
     canvas = load_canvas(canvas_id)
     return {"canvas": agent_canvas_snapshot(canvas)}
 
+def backup_canvas_before_agent_action(canvas, action):
+    source_path = canvas_path(canvas.get("id") or "")
+    stem, _ = os.path.splitext(source_path)
+    safe_action = re.sub(r"[^a-z0-9_-]+", "-", str(action or "action").strip().lower()).strip("-") or "action"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{stem}.before-{safe_action}-{stamp}-{now_ms() % 1000:03d}.json"
+    write_json_atomic(backup_path, canvas, indent=2)
+    return os.path.relpath(backup_path, BASE_DIR).replace("\\", "/")
+
 @app.post("/api/canvas-agent/canvases/{canvas_id}/actions")
 async def canvas_agent_action(canvas_id: str, payload: CanvasAgentCommand):
     canvas = load_canvas(canvas_id)
     action = (payload.action or "").strip().lower()
     if action in {"inspect", "status"}:
         return {"ok": True, "canvas": agent_canvas_snapshot(canvas)}
+    backup_path = ""
     if action in {"create_recreate_flow", "recreate_flow", "reference_recreate"}:
         result = agent_create_recreate_flow(canvas, payload)
     elif action in {"compose_generation_board", "compose_board", "create_generation_board", "visual_plan"}:
         result = agent_compose_generation_board(canvas, payload)
+    elif action in {"compose_video_board", "compose_video", "create_video_board", "video_plan"}:
+        backup_path = backup_canvas_before_agent_action(canvas, action)
+        result = agent_compose_video_board(canvas, payload)
     elif action in {"fix_generators", "fix_model", "use_nano"}:
         result = agent_fix_generators(canvas, payload)
     else:
         raise HTTPException(status_code=400, detail="不支持的 Agent 动作")
+    if backup_path:
+        result["backup_path"] = backup_path
     save_canvas(canvas)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), "canvas-agent")
     return {"ok": True, "result": result, "canvas": agent_canvas_snapshot(canvas)}
@@ -21106,7 +21537,7 @@ def generate(req: GenerateRequest):
         for image_name in required_images:
             need_sync = False
             try:
-                check_url = f"http://{target_backend}/view?filename={urllib.parse.quote(image_name)}&type=input"
+                check_url = f"{comfy_http_base(target_backend)}/view?filename={urllib.parse.quote(image_name)}&type=input"
                 resp = requests.get(check_url, stream=True, timeout=0.5)
                 resp.close()
                 if resp.status_code != 200:
@@ -21120,7 +21551,7 @@ def generate(req: GenerateRequest):
                 for addr in COMFYUI_INSTANCES:
                     if addr == target_backend: continue
                     try:
-                        src_url = f"http://{addr}/view?filename={urllib.parse.quote(image_name)}&type=input"
+                        src_url = f"{comfy_http_base(addr)}/view?filename={urllib.parse.quote(image_name)}&type=input"
                         r = requests.get(src_url, timeout=5)
                         if r.status_code == 200:
                             image_content = r.content
@@ -21131,7 +21562,7 @@ def generate(req: GenerateRequest):
                 if image_content:
                     try:
                         files = {'image': (image_name, image_content, image_type)}
-                        requests.post(f"http://{target_backend}/upload/image", files=files, timeout=10)
+                        requests.post(f"{comfy_http_base(target_backend)}/upload/image", files=files, timeout=10)
                     except Exception as e:
                         print(f"Sync upload failed: {e}")
 
@@ -21175,7 +21606,7 @@ def generate(req: GenerateRequest):
         p = {"prompt": workflow, "client_id": CLIENT_ID}
         data = json.dumps(p).encode('utf-8')
         try:
-            post_req = urllib.request.Request(f"http://{target_backend}/prompt", data=data)
+            post_req = urllib.request.Request(f"{comfy_http_base(target_backend)}/prompt", data=data)
             prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=10).read())['prompt_id']
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
