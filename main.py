@@ -18956,6 +18956,9 @@ class CanvasNodeCreate(BaseModel):
     type: str = Field(min_length=1, max_length=40)
     x: Optional[float] = None
     y: Optional[float] = None
+    # 显式尺寸：给了就等于前端手动拖过大小（节点会带 sized 类），组框也按这个算包围盒
+    w: Optional[float] = Field(default=None, ge=80, le=4000)
+    h: Optional[float] = Field(default=None, ge=80, le=4000)
     # 各类型可选字段；未给的按前端工厂默认值补齐
     name: str = ""
     text: str = ""
@@ -19042,6 +19045,10 @@ def canvas_prim_build_node(nodes: List[Dict[str, Any]], payload: CanvasNodeCreat
     y = float(payload.y) if payload.y is not None else canvas_prim_default_point(nodes, dx, dy)[1]
     prefix = {"image": "img", "prompt": "prompt", "output": "out", "video": "vid", "generator": "gen", "group": "grp"}[node_type]
     node: Dict[str, Any] = {"id": canvas_prim_uid(prefix), "type": node_type, "x": x, "y": y}
+    if payload.w is not None:
+        node["w"] = float(payload.w)
+    if payload.h is not None:
+        node["h"] = float(payload.h)
 
     if node_type == "image":
         node.update({"url": "", "name": payload.name or "空白图片"})
@@ -19050,7 +19057,9 @@ def canvas_prim_build_node(nodes: List[Dict[str, Any]], payload: CanvasNodeCreat
     elif node_type == "output":
         node.update({"images": []})
     elif node_type == "group":
-        node.update({"w": 300, "h": 220, "items": []})
+        node.setdefault("w", 300)
+        node.setdefault("h", 220)
+        node["items"] = []
     elif node_type == "generator":
         node.update({
             "apiProvider": payload.apiProvider or "", "model": payload.model or "",

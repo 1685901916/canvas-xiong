@@ -30,10 +30,14 @@ BASE = os.environ.get("CANVAS_BASE", "http://127.0.0.1:3001")
 
 # 节点未被手动调整时的实测渲染尺寸；服务端 CANVAS_PRIM_NODE_SIZES 用的是同一组数。
 # 量小了组框会把成员裁掉，量大了中间留一片空白，所以这几个数不要凭感觉改。
-IMAGE_W, IMAGE_H = 260, 336
-PROMPT_H = 238
-GAP_X, GAP_Y = 80, 24          # 图片之间的横向间距 / 图片到提示词的纵向间距
-VIDEO_DX, VIDEO_DY = 120, 40   # 视频节点相对图片行右端的偏移
+# --size big 是照 G3 量的板子尺寸：成员排成一行，看得清、不用放大。
+# --size small 是节点未被拖动过时的默认渲染尺寸。
+SIZES = {
+    "big":   {"image": (360, 560), "prompt": (360, 560)},
+    "small": {"image": (260, 336), "prompt": (310, 238)},
+}
+GAP_X = 40                     # 同一行里成员之间的间距
+VIDEO_DX, VIDEO_DY = 120, 40   # 视频节点相对成员行右端的偏移
 
 
 def call(method, path, body=None, timeout=60):
@@ -83,7 +87,7 @@ def place(canvas_id, args):
     if not nodes:
         return 0.0, 0.0
     left = min(float(n.get("x") or 0) for n in nodes)
-    bottom = max(float(n.get("y") or 0) + float(n.get("h") or IMAGE_H) for n in nodes)
+    bottom = max(float(n.get("y") or 0) + float(n.get("h") or 336) for n in nodes)
     return left, bottom + 160
 
 
@@ -106,7 +110,21 @@ def main():
     p.add_argument("--resolution", default="720p")
     p.add_argument("--audio", action="store_true", help="开生成音频")
     p.add_argument("--at", metavar="x,y", help="左上角坐标；不给就自动放到现有内容下方")
+    p.add_argument("--size", choices=["big", "small"], default="big",
+                   help="big=照 G3 的大板子（默认）；small=节点默认尺寸")
+    p.add_argument("--set-prompt", metavar="节点id",
+                   help="只替换某个提示词节点的正文，不建新板；配 --prompt-file 用")
     args = p.parse_args()
+
+    if args.set_prompt:
+        text = read_prompt(args)
+        if not text:
+            raise SystemExit("--set-prompt 需要配 --prompt 或 --prompt-file")
+        t = time.perf_counter()
+        call("PATCH", "/api/canvases/%s/nodes/%s" % (args.canvas, args.set_prompt),
+             {"fields": {"text": text}})
+        print("提示词已替换 %d 字，%.0f ms" % (len(text), (time.perf_counter() - t) * 1000))
+        return 0
 
     prompt_text = read_prompt(args)
     if not args.image and not prompt_text:
@@ -124,24 +142,29 @@ def main():
 
     x0, y0 = place(args.canvas, args)
     P = "/api/canvases/%s" % args.canvas
+    iw, ih = SIZES[args.size]["image"]
+    pw, ph = SIZES[args.size]["prompt"]
 
+    # 成员排成一行：图片…图片、提示词。一行比上下堆更好读，也贴近 G3 的样子。
+    cursor = x0
     image_ids = []
     for i, src in enumerate(args.image):
         name = args.image_name[i] if i < len(args.image_name) else ""
         key, value = normalize_source(src)
-        body = {"type": "image", key: value, "x": x0 + i * (IMAGE_W + GAP_X), "y": y0}
+        body = {"type": "image", key: value, "x": cursor, "y": y0, "w": iw, "h": ih}
         if name:
             body["name"] = name
         image_ids.append(timed("POST", P + "/nodes", body)["node"]["id"])
+        cursor += iw + GAP_X
 
     members = list(image_ids)
-    prompt_y = y0 + (IMAGE_H + GAP_Y if image_ids else 0)
     if prompt_text:
         members.append(timed("POST", P + "/nodes",
                              {"type": "prompt", "text": prompt_text,
-                              "x": x0, "y": prompt_y})["node"]["id"])
+                              "x": cursor, "y": y0, "w": pw, "h": ph})["node"]["id"])
+        cursor += pw + GAP_X
 
-    row_w = max(len(image_ids), 1) * IMAGE_W + max(len(image_ids) - 1, 0) * GAP_X
+    row_w = max(cursor - GAP_X - x0, iw)
     video = timed("POST", P + "/nodes", {
         # 视频节点和组的标题由前端写死（「视频生成」/「G3」），传 name 也不会显示；
         # 想给板子做标记就用 --image-name，图片下面的说明文字是会显示的。
@@ -162,8 +185,8 @@ def main():
         print("  %-6s %-14s %6.1f ms" % (m, tail[:14], ms))
     print("")
     print("%d 次调用，端到端 %.0f ms" % (len(calls), total))
-    print("位置 (%.0f, %.0f)  参考图 %d 张  模式 %s  音频 %s"
-          % (x0, y0, len(image_ids), args.mode, "开" if args.audio else "关"))
+    print("位置 (%.0f, %.0f)  尺寸 %s  参考图 %d 张  模式 %s  音频 %s"
+          % (x0, y0, args.size, len(image_ids), args.mode, "开" if args.audio else "关"))
     print("group=%s" % group["id"])
     print("video=%s" % video["id"])
     print("没有开跑；要生成就在页面上点这个节点的「视频生成」。")
