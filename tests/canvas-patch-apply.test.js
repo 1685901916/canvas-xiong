@@ -48,3 +48,10 @@ assert.match(shell, /ws\.onclose = \(\) => \{\s*setTimeout\(connectStats, statsR
 assert.match(shell, /ws\.onopen = \(\) => \{ statsRetryMs = 1000; \};/, '连上后退避归零');
 
 console.log('canvas-patch-apply: 全部通过');
+
+// 单独打开 canvas.html 时没有 shell 转发 WebSocket，必须自己连一条，
+// 否则 agent 改了画布页面完全没反应（用户实测「没变化」）。
+assert.match(canvas, /function startStandaloneCanvasSocket\(\)/);
+assert.match(canvas, /if\(window\.top !== window\.self\) return;/, '在 iframe 里要让 shell 转发，别重复连');
+assert.match(canvas, /ws\/stats\?client_id=\$\{CLIENT_ID\}/);
+assert.match(canvas, /data\?\.type === 'canvas_patch'\) handleCanvasPatchMessage\(data\)/);

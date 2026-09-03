@@ -226,6 +226,31 @@ window.addEventListener('message', event => {
         if(canvas) syncRemoteCanvasNow();
     }
 });
+// 单独打开 canvas.html 时（不是被主程序的 iframe 套着），没有 shell 帮忙转发 WebSocket，
+// canvas_updated / canvas_patch 一条都收不到，页面只能靠 2.5 秒轮询整档比对版本号。
+// 这里自己连一条，行为和 shell 转发的完全一致。
+function startStandaloneCanvasSocket(){
+    if(window.top !== window.self) return;          // 在 iframe 里，shell 会转发
+    if(!location.host) return;
+    let retryMs = 1000;
+    const connect = () => {
+        let ws;
+        try { ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/stats?client_id=${CLIENT_ID}`); }
+        catch(e){ setTimeout(connect, retryMs); retryMs = Math.min(retryMs * 2, 10000); return; }
+        ws.onopen = () => { retryMs = 1000; };
+        ws.onclose = () => { setTimeout(connect, retryMs); retryMs = Math.min(retryMs * 2, 10000); };
+        ws.onerror = () => { try { ws.close(); } catch(e){} };
+        ws.onmessage = event => {
+            let data;
+            try { data = JSON.parse(event.data); } catch(e){ return; }
+            if(data?.type === 'canvas_updated') handleCanvasUpdatedMessage(data);
+            else if(data?.type === 'canvas_patch') handleCanvasPatchMessage(data);
+        };
+    };
+    connect();
+}
+startStandaloneCanvasSocket();
+
 window.addEventListener('studio-lang-change', () => {
     document.title = tr('canvas.title');
     refreshGateViewControls();
