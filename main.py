@@ -206,7 +206,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.03-canvas-standalone-ws-1"
+CANVAS_RUNTIME_VERSION = "2026.09.03-no-idle-save-loop-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -3668,7 +3668,17 @@ def write_json_atomic(path, data, indent=2):
                 json.dump(data, f, ensure_ascii=False, indent=indent)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            # Windows 上目标文件被别的进程（另一个请求、杀软、索引器）短暂持有时，
+            # os.replace 会抛 WinError 5，一次就 500 掉整个保存请求。退避重试几次，
+            # 几十毫秒内基本都能拿到。
+            for attempt in range(8):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError:
+                    if attempt == 7:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:

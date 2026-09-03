@@ -193,3 +193,27 @@ def test_html_is_not_silently_cached():
         res = client.get("/static/canvas.html")
         assert res.status_code == 200
         assert "no-cache" in res.headers.get("cache-control", ""), "HTML 必须要求回源校验"
+
+
+def test_atomic_write_retries_on_windows_lock():
+    """Windows 上目标文件被短暂占用时 os.replace 抛 WinError 5，
+    不重试的话一次保存失败就 500，用户的改动直接丢。"""
+    import os as _os
+
+    calls = {"n": 0}
+    real_replace = _os.replace
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(5, "拒绝访问")
+        return real_replace(src, dst)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "c.json")
+        _os.replace = flaky
+        try:
+            main.write_json_atomic(target, {"ok": True})
+        finally:
+            _os.replace = real_replace
+    assert calls["n"] == 3, "前两次被拒后应继续重试"

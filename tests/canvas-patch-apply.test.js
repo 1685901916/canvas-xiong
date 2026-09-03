@@ -55,3 +55,11 @@ assert.match(canvas, /function startStandaloneCanvasSocket\(\)/);
 assert.match(canvas, /if\(window\.top !== window\.self\) return;/, '在 iframe 里要让 shell 转发，别重复连');
 assert.match(canvas, /ws\/stats\?client_id=\$\{CLIENT_ID\}/);
 assert.match(canvas, /data\?\.type === 'canvas_patch'\) handleCanvasPatchMessage\(data\)/);
+
+// 空转保存死循环：每次远端同步都会重渲染节点，重渲染走到 updateSourceRatioFromFirstRef，
+// 它以前无条件 scheduleSave() -> 版本号变 -> 轮询发现更新 -> 再同步，永不停歇。
+// 副作用是页面拿着旧数据把 agent 刚改好的东西盖回去。
+const ratioFn = canvas.slice(canvas.indexOf('const updateSourceRatioFromFirstRef'),
+                             canvas.indexOf('const syncSizeControls'));
+assert.doesNotMatch(ratioFn, /\n\s*scheduleSave\(\);/, '不能无条件保存');
+assert.match(ratioFn, /if\(changed\) scheduleSave\(\);/, '值没变就不要保存');

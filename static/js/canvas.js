@@ -10771,12 +10771,22 @@ function renderGeneratorBody(node){
             const dims = await getImageDimensions(ref.url);
             if(requestId !== sourceRatioRequest || node.ratio !== 'source') return;
             const parts = ratioPartsFromDimensions(dims.width, dims.height);
-            node.customRatioWidth = String(parts.width);
-            node.customRatioHeight = String(parts.height);
-            node.customRatio = `${parts.width}:${parts.height}`;
-            customRatioWInput.value = node.customRatioWidth;
-            customRatioHInput.value = node.customRatioHeight;
-            scheduleSave();
+            const nextW = String(parts.width);
+            const nextH = String(parts.height);
+            const nextRatio = `${parts.width}:${parts.height}`;
+            // 只有真的变了才存。以前这里无条件 scheduleSave()，而每次远端同步都会重渲染
+            // 节点、重渲染又会走到这里，于是：存 -> 版本号变 -> 轮询发现更新 -> 同步 ->
+            // 重渲染 -> 又存，空转也停不下来（实测闲置 10 秒整档上传 6.2MB）。
+            // 副作用是页面老拿着旧数据把别处的改动盖回去。
+            const changed = node.customRatioWidth !== nextW
+                || node.customRatioHeight !== nextH
+                || node.customRatio !== nextRatio;
+            node.customRatioWidth = nextW;
+            node.customRatioHeight = nextH;
+            node.customRatio = nextRatio;
+            customRatioWInput.value = nextW;
+            customRatioHInput.value = nextH;
+            if(changed) scheduleSave();
         } catch(_) {}
     };
     const syncSizeControls = () => {
