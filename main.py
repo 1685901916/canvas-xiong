@@ -1739,6 +1739,22 @@ os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
 
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    """HTML 一律要求回源校验。
+
+    StaticFiles 只给 etag/last-modified，不给 Cache-Control，浏览器会按启发式
+    自己缓存 HTML；而 canvas.js 的 ?v= 版本号就写在 HTML 里，HTML 一旦被缓存，
+    改了前端代码用户那边永远是旧的（实测就是「页面根本没更新」）。
+    带指纹的静态资源不受影响，继续随便缓存。
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path.endswith(".html") or path == "/" or path.endswith("/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")

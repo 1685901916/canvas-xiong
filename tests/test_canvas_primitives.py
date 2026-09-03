@@ -183,3 +183,13 @@ def test_group_box_encloses_a_prompt_member():
     main.canvas_prim_layout_group(nodes, group, ["img", "p"])
     assert group["y"] + group["h"] >= 460 + 238, "组框底边必须盖住提示词节点"
     assert group["x"] + group["w"] >= 100 + 310
+
+
+def test_html_is_not_silently_cached():
+    """canvas.js 的 ?v= 写在 HTML 里；HTML 被浏览器缓存住的话，前端改了用户永远看不到。"""
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app) as client:
+        res = client.get("/static/canvas.html")
+        assert res.status_code == 200
+        assert "no-cache" in res.headers.get("cache-control", ""), "HTML 必须要求回源校验"
