@@ -18944,9 +18944,11 @@ CANVAS_PRIM_CREATABLE_TYPES = {"image", "prompt", "output", "video", "group", "g
 LOCAL_VIDEO_IMPORT_EXTS = {".mp4", ".mov", ".webm", ".m4v", ".mkv"}
 LOCAL_AUDIO_IMPORT_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 # 与前端 defaultNodeSize 对齐，建组时算包围盒用
+# 节点未被手动调整过时的实测渲染尺寸（在真实画布上量的，不是估的）。
+# 这些值只在节点自己没有 w/h 时兜底；量小了会让组框把成员裁掉，所以宁可略大。
 CANVAS_PRIM_NODE_SIZES = {
-    "image": (260, 336), "prompt": (310, 160), "output": (460, 220), "video": (400, 520),
-    "generator": (380, 420), "group": (300, 220), "llm": (420, 590), "rh": (430, 420),
+    "image": (260, 336), "prompt": (310, 238), "output": (460, 580), "video": (400, 610),
+    "generator": (380, 488), "group": (300, 220), "llm": (420, 590), "rh": (430, 420),
 }
 
 

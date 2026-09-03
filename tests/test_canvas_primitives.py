@@ -165,3 +165,21 @@ def test_commit_round_trip_does_not_deadlock():
         p = main.canvas_path(cid)
         if os.path.isfile(p):
             os.remove(p)
+
+
+def test_node_sizes_match_measured_defaults():
+    """组框按这张表算包围盒；量小了成员会被裁掉（G9 的提示词就露在框外 46px）。
+    数值是在真实画布上量未被手动调整过的节点得到的。"""
+    sizes = main.CANVAS_PRIM_NODE_SIZES
+    assert sizes["image"] == (260, 336)
+    assert sizes["prompt"] == (310, 238), "提示词节点 textarea 固定 140px，整块 238px，不随文字变高"
+    for kind in ("video", "output", "generator"):
+        assert sizes[kind][1] >= 488, f"{kind} 高度不能再按旧的估值"
+
+
+def test_group_box_encloses_a_prompt_member():
+    nodes = [_node("img", "image", x=100, y=100), _node("p", "prompt", x=100, y=460)]
+    group = _node("grp", "group")
+    main.canvas_prim_layout_group(nodes, group, ["img", "p"])
+    assert group["y"] + group["h"] >= 460 + 238, "组框底边必须盖住提示词节点"
+    assert group["x"] + group["w"] >= 100 + 310
