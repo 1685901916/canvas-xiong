@@ -318,3 +318,128 @@ def test_unchanged_logs_are_not_rewritten():
         for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
             if os.path.isfile(p):
                 os.remove(p)
+
+
+# ---- 第 1 步止血：列表/元数据/保存不再拖着日志跑，打开不升版本 ----
+
+def _scratch_canvas(title):
+    return main.new_canvas(title, "🧩", "classic", None, None, None)
+
+
+def _remove_canvas_files(cid):
+    for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
+        if os.path.isfile(p):
+            os.remove(p)
+
+
+def test_canvas_list_skips_log_sidecars_and_junk():
+    """日志拆到 <id>.logs.json 后，列表遍历把它当画布 json.load 出来是个 list，
+    data.get 直接炸，整个 /api/canvases 500——而页面每次保存后都会拉一次列表。"""
+    canvas = _scratch_canvas("列表跳过日志(可删)")
+    cid = canvas["id"]
+    junk = os.path.join(main.CANVAS_DIR, f"{cid}.junk.json")
+    try:
+        canvas["logs"] = [{"id": "l1"}]
+        main.save_canvas(canvas)
+        assert os.path.isfile(main.canvas_logs_path(cid))
+        with open(junk, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        records = main.list_canvases()
+        assert [r["id"] for r in records].count(cid) == 1
+        assert not main.is_canvas_document_filename(f"{cid}.logs.json")
+        assert not main.is_canvas_document_filename(f"{cid}.before-x-1.json")
+        assert main.is_canvas_document_filename(f"{cid}.json")
+    finally:
+        _remove_canvas_files(cid)
+        if os.path.isfile(junk):
+            os.remove(junk)
+
+
+def test_canvas_list_record_cache_follows_file_changes():
+    canvas = _scratch_canvas("列表缓存(可删)")
+    cid = canvas["id"]
+    try:
+        first = next(r for r in main.list_canvases() if r["id"] == cid)
+        assert first["node_count"] == 0
+        canvas["nodes"].append({"id": "n", "type": "prompt", "x": 0, "y": 0})
+        main.save_canvas(canvas)
+        second = next(r for r in main.list_canvases() if r["id"] == cid)
+        assert second["node_count"] == 1, "文件变了，缓存必须失效"
+    finally:
+        _remove_canvas_files(cid)
+    assert all(r["id"] != cid for r in main.list_canvases()), "文件删了缓存也得跟着清"
+
+
+def test_touch_records_open_without_bumping_version():
+    """打开画布不再刷新 updated_at：否则别的标签页每次都整份重拉重绘、没存完的改动撞 409。"""
+    canvas = _scratch_canvas("touch不升版本(可删)")
+    cid = canvas["id"]
+    try:
+        before = main.load_canvas(cid)["updated_at"]
+        touched = main.touch_canvas_opened(cid)
+        after = main.load_canvas(cid)
+        assert after["updated_at"] == before
+        assert after["opened_at"] >= before and touched["opened_at"] == after["opened_at"]
+        record = main.canvas_record(after)
+        assert record["last_active_at"] == after["opened_at"], "列表按最近活动排，打开也算活动"
+        raw = open(main.canvas_path(cid), encoding="utf-8").read()
+        assert '"logs"' not in raw and "_logs" not in raw, "本体文件不能混进日志或内部字段"
+    finally:
+        _remove_canvas_files(cid)
+
+
+def test_meta_update_does_not_inline_logs_into_body():
+    """改标题/置顶直接写本体。日志拆出去后，这里要是把 load 进来的日志一起写回本体，
+    等于把拆分撤销了，还会带上 _logs_fp 这类内部字段。"""
+    from fastapi.testclient import TestClient
+
+    canvas = _scratch_canvas("meta不带日志(可删)")
+    cid = canvas["id"]
+    try:
+        canvas["logs"] = [{"id": "keep_me"}]
+        main.save_canvas(canvas)
+        with TestClient(main.app) as client:
+            res = client.post(f"/api/canvases/{cid}/meta", json={"title": "新标题"})
+            assert res.status_code == 200, res.text
+        raw = open(main.canvas_path(cid), encoding="utf-8").read()
+        assert "keep_me" not in raw and "_logs_fp" not in raw
+        assert main.load_canvas(cid)["logs"][0]["id"] == "keep_me"
+    finally:
+        _remove_canvas_files(cid)
+
+
+def test_save_round_trip_returns_no_logs_and_merges_log_delta():
+    """页面 PUT 只带新增的日志，回包不带日志：3MB 的日志不该跟着每次自动保存来回跑。"""
+    from fastapi.testclient import TestClient
+
+    canvas = _scratch_canvas("保存不带日志(可删)")
+    cid = canvas["id"]
+    try:
+        canvas["logs"] = [{"id": "old", "createdAt": 1}]
+        main.save_canvas(canvas)
+        base = main.load_canvas(cid)
+        body = {
+            "title": base["title"], "icon": base["icon"],
+            "nodes": [{"id": "n1", "type": "prompt", "x": 0, "y": 0, "text": "hi"}],
+            "connections": [], "viewport": {"x": 0, "y": 0, "scale": 1},
+            "logs": [{"id": "new", "createdAt": 2}],
+            "client_id": "test", "base_updated_at": base["updated_at"],
+        }
+        with TestClient(main.app) as client:
+            res = client.put(f"/api/canvases/{cid}", json=body)
+            assert res.status_code == 200, res.text
+            assert "logs" not in res.json()["canvas"]
+            assert "logs" not in client.get(f"/api/canvases/{cid}?logs=0").json()["canvas"]
+            assert "logs" in client.get(f"/api/canvases/{cid}").json()["canvas"], "打开画布仍要拿到日志"
+            assert client.get(f"/api/canvases/{cid}/meta").json()["updated_at"] > base["updated_at"]
+            # 没有新日志的保存：不读也不写日志文件
+            stamp = os.stat(main.canvas_logs_path(cid)).st_mtime_ns
+            body["logs"] = []
+            body["base_updated_at"] = main.load_canvas(cid)["updated_at"]
+            assert client.put(f"/api/canvases/{cid}", json=body).status_code == 200
+            assert os.stat(main.canvas_logs_path(cid)).st_mtime_ns == stamp
+        stored = main.load_canvas(cid)
+        assert [l["id"] for l in stored["logs"]] == ["new", "old"], "新增日志要并进服务器那份"
+        assert any(n["id"] == "n1" for n in stored["nodes"])
+    finally:
+        _remove_canvas_files(cid)

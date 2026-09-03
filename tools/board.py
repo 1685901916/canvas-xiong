@@ -73,6 +73,75 @@ def normalize_source(src):
     return "path", str(src)
 
 
+def row_layout(members, tpl, origin=None):
+    """把组成员排成一行并算出组框。图片按当前 x 排序在前，提示词在后。
+
+    返回 (放好的成员列表, 组框)。成员是 {"id","type","x","y","w","h"}。
+    手动删过节点之后组里会留一个洞、组框也不再贴合，这个函数负责收拢。
+    """
+    iw, ih = tpl["image"]
+    pw, ph = tpl["prompt"]
+    gap = tpl["gap"]
+    pad_l, pad_t, pad_r, pad_b = tpl["pad"]
+
+    images = sorted([m for m in members if m.get("type") == "image"],
+                    key=lambda m: (float(m.get("x") or 0), str(m.get("id"))))
+    others = [m for m in members if m.get("type") != "image"]
+    ordered = images + others
+    if not ordered:
+        return [], None
+
+    x0 = float(origin[0]) if origin else min(float(m.get("x") or 0) for m in ordered)
+    y0 = float(origin[1]) if origin else min(float(m.get("y") or 0) for m in ordered)
+
+    placed = []
+    cursor = x0
+    for m in ordered:
+        w, h = (iw, ih) if m.get("type") == "image" else (pw, ph)
+        placed.append({"id": m.get("id"), "type": m.get("type"),
+                       "x": cursor, "y": y0, "w": w, "h": h})
+        cursor += w + gap
+
+    right = max(p["x"] + p["w"] for p in placed)
+    bottom = max(p["y"] + p["h"] for p in placed)
+    box = {"x": x0 - pad_l, "y": y0 - pad_t,
+           "w": (right - x0) + pad_l + pad_r, "h": (bottom - y0) + pad_t + pad_b}
+    return placed, box
+
+
+def do_relayout(args, tpl):
+    """把一个已有的组重新排齐：成员排成一行、尺寸归位、组框重新贴合。"""
+    P = "/api/canvases/%s" % args.canvas
+    doc = call("GET", P)
+    body = doc.get("canvas") or doc
+    by_id = {str(n.get("id")): n for n in body.get("nodes") or []}
+    group = by_id.get(args.relayout)
+    if not group or group.get("type") != "group":
+        raise SystemExit("找不到组 %s" % args.relayout)
+    members = [by_id[m] for m in (group.get("items") or []) if m in by_id]
+    if not members:
+        raise SystemExit("这个组里没有成员")
+
+    origin = None
+    if args.at:
+        origin = [float(v) for v in args.at.split(",")]
+    placed, box = row_layout(members, tpl, origin)
+
+    t = time.perf_counter()
+    for p in placed:
+        call("PATCH", P + "/nodes/" + p["id"],
+             {"fields": {"x": p["x"], "y": p["y"], "w": p["w"], "h": p["h"]}})
+    call("PATCH", P + "/nodes/" + group["id"], {"fields": box})
+    ms = (time.perf_counter() - t) * 1000
+
+    print("组 %s 已排齐，%d 个成员，%.0f ms" % (args.relayout[:14], len(placed), ms))
+    for p in placed:
+        print("  %-7s (%.0f, %.0f) %dx%d" % (p["type"], p["x"], p["y"], p["w"], p["h"]))
+    print("组框 (%.0f, %.0f) %.0fx%.0f  间距 %d  边距 左%d 上%d 右%d 下%d"
+          % (box["x"], box["y"], box["w"], box["h"], tpl["gap"], *tpl["pad"]))
+    return 0
+
+
 def read_prompt(args):
     if args.prompt_file:
         with open(args.prompt_file, encoding="utf-8") as f:
@@ -101,6 +170,9 @@ def main():
                    help="参考图，可重复；/assets/... 或本机文件")
     p.add_argument("--image-name", action="append", default=[], metavar="名字",
                    help="对应 --image 的显示名，可省略")
+    p.add_argument("--blank-image", action="append", default=[], metavar="占位名",
+                   help="建一个空的图片节点占位，可重复；素材还没出来时先把板子搭好，"
+                        "之后往节点上拖文件，或用 /nodes/<id>/media 接口挂上去")
     p.add_argument("--prompt", default="", help="提示词正文")
     p.add_argument("--prompt-file", help="从文件读提示词（长文案用这个，省得被 shell 转义坑）")
     p.add_argument("--model", default="volcengine:doubao-seedance-2-0-260128",
@@ -114,10 +186,16 @@ def main():
     p.add_argument("--audio", action="store_true", help="开生成音频")
     p.add_argument("--at", metavar="x,y", help="左上角坐标；不给就自动放到现有内容下方")
     p.add_argument("--size", choices=["big", "small"], default="big",
-                   help="big=照 G3 的大板子（默认）；small=节点默认尺寸")
+                   help="big=照画布上 G5/G6 量的大板子（默认）；small=节点默认尺寸")
     p.add_argument("--set-prompt", metavar="节点id",
                    help="只替换某个提示词节点的正文，不建新板；配 --prompt-file 用")
+    p.add_argument("--relayout", metavar="组id",
+                   help="把已有的组重新排齐：成员排成一行、尺寸按 --size 归位、"
+                        "组框重新贴合。手动删过或拖乱过节点之后用这个收拾")
     args = p.parse_args()
+
+    if args.relayout:
+        return do_relayout(args, SIZES[args.size])
 
     if args.set_prompt:
         text = read_prompt(args)
@@ -130,8 +208,8 @@ def main():
         return 0
 
     prompt_text = read_prompt(args)
-    if not args.image and not prompt_text:
-        raise SystemExit("至少要给 --image 或 --prompt")
+    if not args.image and not args.blank_image and not prompt_text:
+        raise SystemExit("至少要给 --image / --blank-image / --prompt")
     provider, _, model = args.model.partition(":")
 
     t0 = time.perf_counter()
@@ -161,6 +239,12 @@ def main():
         if name:
             body["name"] = name
         image_ids.append(timed("POST", P + "/nodes", body)["node"]["id"])
+        cursor += iw + GAP_X
+
+    for label in args.blank_image:
+        image_ids.append(timed("POST", P + "/nodes", {
+            "type": "image", "name": label, "x": cursor, "y": y0, "w": iw, "h": ih,
+        })["node"]["id"])
         cursor += iw + GAP_X
 
     members = list(image_ids)
@@ -200,8 +284,11 @@ def main():
         print("  %-6s %-14s %6.1f ms" % (m, tail[:14], ms))
     print("")
     print("%d 次调用，端到端 %.0f ms" % (len(calls), total))
-    print("位置 (%.0f, %.0f)  尺寸 %s  参考图 %d 张  模式 %s  音频 %s"
-          % (x0, y0, args.size, len(image_ids), args.mode, "开" if args.audio else "关"))
+    print("位置 (%.0f, %.0f)  尺寸 %s  参考图 %d 张（其中占位 %d）  模式 %s  音频 %s"
+          % (x0, y0, args.size, len(image_ids), len(args.blank_image),
+             args.mode, "开" if args.audio else "关"))
+    for i, nid in enumerate(image_ids):
+        print("image[%d]=%s" % (i, nid))
     print("group=%s" % group["id"])
     print("video=%s" % video["id"])
     print("没有开跑；要生成就在页面上点这个节点的「视频生成」。")
