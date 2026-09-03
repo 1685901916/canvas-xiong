@@ -32,11 +32,14 @@ BASE = os.environ.get("CANVAS_BASE", "http://127.0.0.1:3001")
 # 量小了组框会把成员裁掉，量大了中间留一片空白，所以这几个数不要凭感觉改。
 # --size big 是照 G3 量的板子尺寸：成员排成一行，看得清、不用放大。
 # --size small 是节点未被拖动过时的默认渲染尺寸。
+# big 是照画布上 G5/G6 量的：成员排一行、顶端对齐，提示词比图片高一截。
+# 组框的内边距也照它们来（左 60 上 90 右 40 下 90），比默认的紧凑边距松得多。
 SIZES = {
-    "big":   {"image": (360, 560), "prompt": (360, 560)},
-    "small": {"image": (260, 336), "prompt": (310, 238)},
+    "big":   {"image": (300, 533), "prompt": (400, 640), "gap": 30,
+              "pad": (60, 90, 40, 90)},
+    "small": {"image": (260, 336), "prompt": (310, 238), "gap": 40,
+              "pad": (24, 58, 24, 32)},
 }
-GAP_X = 40                     # 同一行里成员之间的间距
 VIDEO_DX, VIDEO_DY = 120, 40   # 视频节点相对成员行右端的偏移
 
 
@@ -142,8 +145,11 @@ def main():
 
     x0, y0 = place(args.canvas, args)
     P = "/api/canvases/%s" % args.canvas
-    iw, ih = SIZES[args.size]["image"]
-    pw, ph = SIZES[args.size]["prompt"]
+    tpl = SIZES[args.size]
+    iw, ih = tpl["image"]
+    pw, ph = tpl["prompt"]
+    GAP_X = tpl["gap"]
+    pad_l, pad_t, pad_r, pad_b = tpl["pad"]
 
     # 成员排成一行：图片…图片、提示词。一行比上下堆更好读，也贴近 G3 的样子。
     cursor = x0
@@ -178,6 +184,15 @@ def main():
     })["node"]
 
     group = timed("POST", P + "/groups", {"items": members})["node"]
+    # 服务端按前端的紧凑边距算框（左 24 上 58 下 32），成员一放大就贴边了；
+    # 这里按模板的边距重新框一次，看起来才和手动框选出来的 G5/G6 一致。
+    if members:
+        x2 = x0 + row_w
+        y2 = y0 + max(ih if image_ids else 0, ph if prompt_text else 0)
+        timed("PATCH", P + "/nodes/" + group["id"], {"fields": {
+            "x": x0 - pad_l, "y": y0 - pad_t,
+            "w": (x2 - x0) + pad_l + pad_r, "h": (y2 - y0) + pad_t + pad_b,
+        }})
     timed("POST", P + "/connections", {"from": group["id"], "to": video["id"]})
 
     total = (time.perf_counter() - t0) * 1000
