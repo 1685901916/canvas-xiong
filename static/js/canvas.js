@@ -1972,8 +1972,10 @@ function preserveLocalRuntimeNodeState(remoteNodes=[]){
             merged.text = localNode.text || '';
         }
         if(localNode.type === 'output'){
-            const localPending = activePendingItems(localNode._pending || []);
-            if(keepLocalMedia && localPending.length) merged._pending = clonePlain(localPending, localPending);
+            // 同 mergeRemoteCanvasIntoLocalForSave：本地那份未必更新。没在跑任务的
+            // 标签页手里可能还停在 submitting，直接覆盖会把真 task_id 弄丢。
+            const mergedPending = mergePendingLists(remoteNode._pending || [], localNode._pending || []);
+            if(keepLocalMedia || mergedPending.length) merged._pending = clonePlain(mergedPending, mergedPending);
             if(keepLocalMedia && (localNode.images || []).length) merged.images = mergeUniqueOutputItems(remoteNode.images || [], localNode.images || []);
         }
         if(keepLocalMedia && (localNode.generatedOutputs || []).length){
@@ -2072,6 +2074,58 @@ function serverTaskIdOf(pending){
     return id;
 }
 
+// 合并两边的 pending。原来无条件保留本地那份，结果是：没在跑任务的标签页
+// 手里拿着旧快照（还停在 submitting、只有本地兜底 id），一保存就把另一个标签页
+// 刚拿到的真 task_id 覆盖掉，服务端在新旧之间来回震荡，任务也就没法恢复了。
+// 现在按"信息量"取胜者：拿得出真任务 id 的优先，其次取更晚更新的那份。
+function pendingProgressScore(pending){
+    if(!pending) return -1;
+    let score = 0;
+    if(serverTaskIdOf(pending)) score += 100;   // 有真任务 id 最关键
+    if(pending.terminal) score += 10;           // 终态是确定结论，别退回中间态
+    if(pending.failed) score += 5;
+    return score;
+}
+
+function pickBetterPending(a, b){
+    if(!a) return b;
+    if(!b) return a;
+    const sa = pendingProgressScore(a);
+    const sb = pendingProgressScore(b);
+    if(sa !== sb) return sa > sb ? a : b;
+    return Number(b.updatedAt || b.startedAt || 0) > Number(a.updatedAt || a.startedAt || 0) ? b : a;
+}
+
+// 远端独有的 pending 只在"足够新"时接纳。任务完成时本地会把它移除，但远端还留着
+// 旧副本；无条件取并集会把已了结的任务当成僵尸加回来，输出节点上永远挂着一张
+// "生成中"的卡片。移除点有二十多处，逐个打墓碑不现实，按时间判定更稳。
+const REMOTE_ONLY_PENDING_GRACE_MS = 2 * 60 * 1000;
+function mergePendingLists(remotePendings, localPendings){
+    const localIds = new Set((localPendings || []).map(item => item?.id).filter(Boolean));
+    const remoteById = new Map();
+    (remotePendings || []).forEach(item => { if(item?.id) remoteById.set(item.id, item); });
+
+    // 本地列表决定"还有哪些"，远端同 id 的那份只用来补更完整的信息（比如真 task_id）。
+    // 本地自身也可能因为历史上的错误合并留下同 id 重复项，一并按 id 收敛。
+    const mergedById = new Map();
+    const order = [];
+    (localPendings || []).forEach(item => {
+        if(!item?.id) return;
+        if(!mergedById.has(item.id)) order.push(item.id);
+        const better = pickBetterPending(mergedById.get(item.id) || item, item);
+        mergedById.set(item.id, pickBetterPending(better, remoteById.get(item.id)));
+    });
+    const merged = order.map(id => mergedById.get(id));
+
+    // 远端独有且很新的，认为是别的标签页刚提交的，接纳；旧的视为已了结，丢弃
+    const now = nowMs();
+    (remotePendings || []).forEach(item => {
+        if(!item?.id || localIds.has(item.id)) return;
+        if(now - Number(item.startedAt || 0) <= REMOTE_ONLY_PENDING_GRACE_MS) merged.push(item);
+    });
+    return merged.filter(isResumableCanvasPending);
+}
+
 function mergeRemoteCanvasIntoLocalForSave(remote){
     if(!remote || !canvas || remote.id !== canvas.id) return false;
     const prunedRemote = dropDeletedFromRemote(remote.nodes, remote.connections);
@@ -2099,10 +2153,7 @@ function mergeRemoteCanvasIntoLocalForSave(remote){
                 if(Object.keys(remoteComparisons).length || Object.keys(localComparisons).length){
                     merged.imageComparisons = {...remoteComparisons, ...localComparisons};
                 }
-                const localPending = activePendingItems(localNode._pending || []);
-                if(localPending.length){
-                    merged._pending = localPending;
-                }
+                merged._pending = mergePendingLists(remoteNode._pending || [], localNode._pending || []);
             }
             if((remoteNode.generatedOutputs || []).length || (localNode.generatedOutputs || []).length){
                 merged.generatedOutputs = mergeUniqueOutputItems(remoteNode.generatedOutputs || [], localNode.generatedOutputs || []);
@@ -2887,6 +2938,7 @@ async function openCanvas(id){
         resumeRunningHubVideoTasks();
         resumeMiniMaxDesignVideoTasks();
         resumeSyncVideoTasks();
+        resumeMinimaxVideoTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
     } catch(e) {
@@ -2935,6 +2987,7 @@ function applyRemoteCanvasData(remote){
         resumeRunningHubVideoTasks();
         resumeMiniMaxDesignVideoTasks();
         resumeSyncVideoTasks();
+        resumeMinimaxVideoTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -14014,6 +14067,238 @@ async function runAutoDLCloudVideoNode(node, snapshot, out, pending, opts={}){
     }
 }
 
+// —— MiniMax 官方：提交 / 轮询 / 恢复 ——
+// 上游本来就是异步的（提交返回 task_id，另有查询接口），但以前服务端把两步塞进
+// 一个长请求，task_id 直到出片才随响应返回。连接一断就什么都不剩：任务查不到、
+// 恢复不了，而上游照样在跑、照样计费。拆开之后 task_id 立刻落到画布上。
+const MINIMAX_VIDEO_TASK_TYPE = 'minimax-video';
+const activeMinimaxVideoPolls = new Set();
+
+function findMinimaxVideoPending(node){
+    for(const out of nodes.filter(item => item.type === 'output')){
+        const pending = (out._pending || []).find(item =>
+            item?.canvasTaskType === MINIMAX_VIDEO_TASK_TYPE
+            && item?.run?.node?.id === node.id
+            && !item?.terminal
+            && Boolean(serverTaskIdOf(item))
+        );
+        if(pending) return {out, pending};
+    }
+    return null;
+}
+
+async function pollMinimaxVideoTask(node, out, pending, opts={}){
+    const taskId = serverTaskIdOf(pending);
+    if(!taskId) return 'unknown_submission';
+    if(activeMinimaxVideoPolls.has(taskId)) return 'RUNNING';
+    activeMinimaxVideoPolls.add(taskId);
+    node.running = true;
+    try {
+        for(let attempt = 0; attempt < 5760; attempt++){
+            const latest = pendingById(out, pending.id);
+            if(!latest) return 'missing';
+            const response = await fetch(`/api/minimax/tasks/${encodeURIComponent(taskId)}`);
+            if(!response.ok){
+                const failMsg = await responseErrorMessage(response, 'MiniMax 官方任务查询失败');
+                if(isUpstreamTaskGone(response.status, failMsg)){
+                    latest.failed = true;
+                    latest.terminal = true;
+                    latest.error = failMsg;
+                    latest.canvasTaskStatus = 'task_gone';
+                    latest.recoverTaskId = taskId;
+                    node.runStatus = 'failed';
+                    node.runError = failMsg;
+                    node.running = false;
+                    refreshRunNodes(node, out);
+                    scheduleSave();
+                    return 'FAILED';
+                }
+                throw new Error(failMsg);
+            }
+            const result = await response.json();
+            const status = String(result.status || '').toUpperCase();
+            latest.status = status.toLowerCase();
+            latest.canvasTaskStatus = latest.status;
+            latest.message = status === 'QUEUED' ? 'MiniMax 官方排队中' : status === 'RUNNING' ? 'MiniMax 官方生成中' : '';
+            latest.error = '';
+            latest.failed = false;
+            node.runStatus = status === 'QUEUED' ? 'queued' : 'running';
+            node.runError = '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(status === 'QUEUED' || status === 'RUNNING'){
+                await sleep(5000);
+                continue;
+            }
+            if(status === 'SUCCESS'){
+                const videos = (result.videos || []).map(item => ({
+                    url:outputUrlValue(item),
+                    kind:'video',
+                    provider_id:'minimax',
+                    status:'SUCCESS'
+                })).filter(item => item.url);
+                if(!videos.length) throw new Error('MiniMax 官方任务成功但没有返回视频');
+                const meta = collectRunMeta(out, latest.id);
+                meta.run.request = {
+                    ...(meta.run.request || {}),
+                    provider_id:'minimax',
+                    provider_name:'MiniMax 官方',
+                    model:node.model || 'MiniMax-H3',
+                    task_id:taskId,
+                    status:'SUCCESS'
+                };
+                out._pending = (out._pending || []).filter(item => item.id !== latest.id);
+                appendOutputImages(out, videos, meta.run?.refs?.[0], [{...meta, kind:'video'}]);
+                mergeGeneratedOutputs(node, videos, Boolean(opts.cascade));
+                addGenerationLog({run:meta.run, outputs:videos, runMs:meta.runMs || 0});
+                node.runStatus = 'done';
+                node.runError = '';
+                node.running = false;
+                refreshRunNodes(node, out);
+                markCanvasMediaMutation();
+                scheduleSave();
+                return 'SUCCESS';
+            }
+            if(status === 'FAILED'){
+                const message = result.error || 'MiniMax 官方视频任务失败';
+                latest.failed = true;
+                latest.terminal = true;
+                latest.error = message;
+                latest.recoverTaskId = taskId;
+                node.runStatus = 'failed';
+                node.runError = message;
+                node.running = false;
+                refreshRunNodes(node, out);
+                scheduleSave();
+                if(opts.cascade) throw new Error(message);
+                return 'FAILED';
+            }
+            throw new Error(`MiniMax 官方返回未知任务状态：${status || 'UNKNOWN'}`);
+        }
+        throw new Error('MiniMax 官方任务仍在后台运行，已保存任务 ID，可稍后继续查询');
+    } catch(err) {
+        const latest = pendingById(out, pending.id);
+        if(latest && !latest.terminal){
+            latest.failed = false;
+            latest.error = err.message || 'MiniMax 官方任务查询暂时中断';
+            latest.recoverTaskId = taskId;
+            latest.canvasTaskStatus = 'query_error';
+        }
+        node.runStatus = latest?.terminal ? 'failed' : 'queued';
+        node.runError = err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade && latest?.terminal) throw err;
+        return latest?.terminal ? 'FAILED' : 'QUERY_ERROR';
+    } finally {
+        activeMinimaxVideoPolls.delete(taskId);
+    }
+}
+
+async function runMinimaxVideoNode(node, snapshot, out, pending, opts={}){
+    pending.provider_id = 'minimax';
+    pending.canvasTaskType = MINIMAX_VIDEO_TASK_TYPE;
+    pending.canvasTaskStatus = 'submitting';
+    pending.status = 'submitting';
+    pending.run.request = {
+        ...(pending.run.request || {}),
+        provider_id:'minimax',
+        provider_name:'MiniMax 官方',
+        model:node.model || 'MiniMax-H3'
+    };
+    await saveCanvas();
+    try {
+        const response = await fetch('/api/minimax/video-submit', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                prompt:snapshot.prompt,
+                provider_id:'minimax',
+                model:node.model || 'MiniMax-H3',
+                duration:Number(node.duration || 5),
+                aspect_ratio:node.aspectRatio || '16:9',
+                resolution:node.resolution || '',
+                images:snapshot.refs,
+                videos:manualVideoUrlForNode(node)
+                    ? [manualVideoUrlForNode(node)]
+                    : snapshot.videoRefs.map(ref => ref.url).filter(Boolean),
+                audios:snapshot.audioRefs.map(ref => ref.url).filter(Boolean),
+                watermark:Boolean(node.watermark),
+                generate_audio:Boolean(node.generateAudio),
+                multimodal:Boolean(node.multimodal || snapshot.videoRefs.length || snapshot.audioRefs.length)
+            })
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'MiniMax 官方视频提交失败'));
+        const submission = await response.json();
+        if(!submission.task_id) throw new Error('MiniMax 官方提交成功但没有返回 task_id');
+        pending.task_id = submission.task_id;
+        pending.canvasTaskId = submission.task_id;
+        pending.status = String(submission.status || 'QUEUED').toLowerCase();
+        pending.canvasTaskStatus = pending.status;
+        pending.run.request = {
+            ...(pending.run.request || {}),
+            task_id:submission.task_id,
+            status:submission.status || 'QUEUED'
+        };
+        // 先落盘再轮询：这一步之后就算刷新/重启，也能靠 task_id 把结果找回来。
+        await saveCanvas();
+        return pollMinimaxVideoTask(node, out, pending, opts);
+    } catch(err) {
+        if(!pending.task_id){
+            pending.failed = true;
+            pending.status = 'unknown_submission';
+            pending.canvasTaskStatus = 'unknown_submission';
+            pending.error = `提交状态未知，为避免重复扣费不会自动重试：${err.message || String(err)}`;
+        }
+        node.runStatus = 'failed';
+        node.runError = pending.error || err.message || String(err);
+        node.running = false;
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw err;
+        return 'unknown_submission';
+    }
+}
+
+function resumeMinimaxVideoTasks(){
+    let changed = false;
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.canvasTaskType !== MINIMAX_VIDEO_TASK_TYPE || pending.terminal) return;
+            const videoNode = nodes.find(item => item.id === pending?.run?.node?.id && item.type === 'video');
+            const taskId = serverTaskIdOf(pending);
+            if(!taskId){
+                pending.failed = true;
+                pending.terminal = true;
+                pending.status = 'unknown_submission';
+                pending.canvasTaskStatus = 'unknown_submission';
+                pending.error = unknownSubmissionMessage(pending.error);
+                if(videoNode){
+                    videoNode.running = false;
+                    videoNode.runStatus = 'failed';
+                    videoNode.runError = pending.error;
+                }
+                changed = true;
+                return;
+            }
+            pending.task_id = taskId;
+            pending.canvasTaskId = taskId;
+            pending.failed = false;
+            if(videoNode){
+                videoNode.running = true;
+                videoNode.runStatus = pending.canvasTaskStatus || pending.status || 'queued';
+                videoNode.runError = '';
+            }
+            pollMinimaxVideoTask(videoNode, out, pending, {resume:true});
+        });
+    });
+    if(changed){
+        refreshRunNodes();
+        scheduleSave();
+    }
+}
+
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade && !opts.force)) return;
@@ -14034,6 +14319,16 @@ async function runVideoNode(nodeId, opts={}){
         refreshRunNodes(node, activePaid.out);
         if(!opts.cascade) showErrorModal(message, '任务仍在运行');
         return 'RUNNING';
+    }
+    if(isMinimaxVideoProvider(node.apiProvider)){
+        const existing = findMinimaxVideoPending(node);
+        if(existing){
+            node.running = true;
+            node.runStatus = existing.pending.canvasTaskStatus || existing.pending.status || 'queued';
+            node.runError = '';
+            refreshRunNodes(node, existing.out);
+            return pollMinimaxVideoTask(node, existing.out, existing.pending, opts);
+        }
     }
     if(isRunningHubVideoProvider(node.apiProvider)){
         const existing = findRunningHubVideoPending(node);
@@ -14077,6 +14372,10 @@ async function runVideoNode(nodeId, opts={}){
     if(isRunningHubVideoProvider(node.apiProvider)){
         const pending = pendingById(out, pendingId);
         return runRunningHubVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
+    }
+    if(isMinimaxVideoProvider(node.apiProvider)){
+        const pending = pendingById(out, pendingId);
+        return runMinimaxVideoNode(node, {prompt, refs, videoRefs, audioRefs, run, cascadeTargetId}, out, pending, opts);
     }
     // 通用视频路径（MiniMax 官方 / comfly / 火山 等）：一个 POST 同步挂到生成完，
     // 上游不返回可查询的 task_id。必须显式标类型——不标的话保存时会被兜底成

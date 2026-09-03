@@ -189,7 +189,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.03-sync-video-visibility-1"
+CANVAS_RUNTIME_VERSION = "2026.09.03-minimax-async-2"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -18540,7 +18540,11 @@ async def silence_minimax_video(local_url: str) -> str:
         return local_url
 
 
-async def generate_minimax_video(payload: CanvasVideoRequest, provider):
+async def prepare_minimax_video_request(payload: CanvasVideoRequest, provider):
+    """准备提交所需的 base_url / headers / body。
+
+    提交与轮询共用同一套鉴权，抽出来避免两处各写一遍。
+    """
     api_key = provider_env_key_value(provider.get("id") or "minimax")
     if not api_key:
         raise HTTPException(status_code=400, detail="未配置 MiniMax 官方 API Key，请在 API/.env 设置 MINIMAX_API_KEY。")
@@ -18589,9 +18593,20 @@ async def generate_minimax_video(payload: CanvasVideoRequest, provider):
         "ratio": minimax_video_ratio(payload.aspect_ratio, content_mode),
         "aigc_watermark": bool(payload.watermark),
     }
-    submit_url = f"{base_url}/v2/video_generation"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0), follow_redirects=True) as client:
-        response = await client.post(submit_url, headers=headers, json=body)
+    return base_url, headers, body
+
+
+async def submit_minimax_video(payload: CanvasVideoRequest, provider) -> Dict[str, Any]:
+    """只提交，拿到 task_id 就返回；生成在 MiniMax 侧异步进行。
+
+    以前提交和等待挤在同一个请求里，task_id 直到生成完才随最终响应返回。
+    连接一断（刷新/重启/代理抖动）这个 id 就永远见不到了：任务查不到也恢复不了，
+    而上游其实已经在跑、也会计费。拆开之后 task_id 立刻就能落到画布上。
+    """
+    base_url, headers, body = await prepare_minimax_video_request(payload, provider)
+    timeout = httpx.Timeout(connect=20.0, read=120.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(f"{base_url}/v2/video_generation", headers=headers, json=body)
         if response.status_code >= 400:
             detail = minimax_error_message(response) or response.text[:500]
             raise HTTPException(status_code=502, detail=f"MiniMax 官方视频接口错误：{detail}")
@@ -18599,6 +18614,60 @@ async def generate_minimax_video(payload: CanvasVideoRequest, provider):
         task_id = str(raw.get("task_id") or "").strip()
         if not task_id:
             raise HTTPException(status_code=502, detail="MiniMax 官方提交成功但没有返回 task_id")
+    return {"task_id": task_id, "raw": raw}
+
+
+async def query_minimax_video_once(task_id: str, provider) -> Dict[str, Any]:
+    """查一次任务状态，不等待。成功时把视频存到本地并返回 /assets 地址。"""
+    api_key = provider_env_key_value(provider.get("id") or "minimax")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="未配置 MiniMax 官方 API Key，请在 API/.env 设置 MINIMAX_API_KEY。")
+    base_url = video_api_root(provider).rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="MiniMax 官方未配置 Base URL")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    safe_id = urllib.parse.quote(str(task_id), safe="")
+    url = f"{base_url}/v2/query/video_generation/{safe_id}"
+    timeout = httpx.Timeout(connect=20.0, read=60.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            detail = minimax_error_message(response) or response.text[:300]
+            raise HTTPException(status_code=502, detail=f"MiniMax 官方任务查询失败：{detail}")
+        raw = response.json()
+    task = raw.get("task") if isinstance(raw.get("task"), dict) else raw
+    status = str(task.get("status") or "").strip().lower()
+    if status == "succeeded":
+        content = task.get("content") if isinstance(task.get("content"), dict) else {}
+        video_url = str(content.get("url") or "").strip()
+        if not video_url:
+            raise HTTPException(status_code=502, detail="MiniMax 官方任务成功但没有返回视频地址")
+        local_url = await save_remote_video_to_output(video_url, prefix="minimax_", category="output")
+        if str(os.getenv("MINIMAX_MUTE_AUDIO", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+            local_url = await silence_minimax_video(local_url)
+        return {"status": "SUCCESS", "task_id": task_id,
+                "videos": [{"url": local_url, "kind": "video"}], "raw": raw}
+    if status in {"failed", "cancelled"}:
+        error = task.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")[:500]
+        else:
+            message = str(error or task.get("message") or "")[:500]
+        return {"status": "FAILED", "task_id": task_id, "videos": [],
+                "error": message or "MiniMax 官方视频任务失败", "raw": raw}
+    normalized = "RUNNING" if status in {"processing", "running"} else "QUEUED"
+    return {"status": normalized, "task_id": task_id, "videos": [], "raw": raw}
+
+
+async def generate_minimax_video(payload: CanvasVideoRequest, provider):
+    """同步版本：提交后原地等到出片。保留它是为了旧的 /api/canvas-video 路径可回退。"""
+    submitted = await submit_minimax_video(payload, provider)
+    task_id = submitted["task_id"]
+    api_key = provider_env_key_value(provider.get("id") or "minimax")
+    base_url = video_api_root(provider).rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         local_url, final_raw = await wait_minimax_video(client, base_url, headers, task_id)
         if str(os.getenv("MINIMAX_MUTE_AUDIO", "1")).strip().lower() not in {"0", "false", "no", "off"}:
             local_url = await silence_minimax_video(local_url)
@@ -18794,6 +18863,49 @@ async def generate_imodel_video(payload: CanvasVideoRequest, provider):
             raise HTTPException(status_code=502, detail="imodel 提交成功但没有返回任务 id")
         local_url, final_raw = await wait_imodel_video(client, base_url, authorization, task_id)
     return {"videos": [local_url], "task_id": task_id, "raw": final_raw}
+
+
+@app.post("/api/minimax/video-submit")
+async def minimax_submit_video_task(payload: CanvasVideoRequest):
+    """提交 MiniMax 官方视频任务，立刻返回 task_id，不等生成。
+
+    旧的 /api/canvas-video 会把提交和等待挤在一个请求里，连接一断 task_id 就丢了。
+    拆开之后画布能先把 id 存下来，刷新、重启、断网都能靠它恢复。
+    """
+    provider = get_api_provider(payload.provider_id or "minimax")
+    if not is_minimax_provider(provider):
+        raise HTTPException(status_code=400, detail="该平台不是 MiniMax 官方，无法使用此接口")
+    try:
+        submitted = await submit_minimax_video(payload, provider)
+    except httpx.HTTPError as exc:
+        log_net_error(f"视频(MiniMax官方) 提交网络/TLS错误 model={payload.model}", exc)
+        raise HTTPException(status_code=502, detail=f"请求 MiniMax 官方视频接口失败：{exc}") from exc
+    return {
+        "provider_id": "minimax",
+        "provider_name": "MiniMax 官方",
+        "model": "MiniMax-H3",
+        "task_id": submitted["task_id"],
+        "status": "QUEUED",
+    }
+
+
+@app.get("/api/minimax/tasks/{task_id}")
+async def minimax_video_task_status(task_id: str, provider_id: str = "minimax"):
+    """查询一次 MiniMax 官方视频任务；成功时视频已落到本地 /assets/output。"""
+    safe_task_id = str(task_id or "").strip()
+    if not safe_task_id or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", safe_task_id):
+        raise HTTPException(status_code=400, detail="MiniMax 官方 task_id 无效")
+    provider = get_api_provider(provider_id or "minimax")
+    if not is_minimax_provider(provider):
+        raise HTTPException(status_code=400, detail="该平台不是 MiniMax 官方，无法使用此接口")
+    try:
+        result = await query_minimax_video_once(safe_task_id, provider)
+    except httpx.HTTPError as exc:
+        log_net_error(f"视频(MiniMax官方) 查询网络/TLS错误 task={safe_task_id}", exc)
+        raise HTTPException(status_code=502, detail=f"查询 MiniMax 官方视频任务失败：{exc}") from exc
+    result.pop("raw", None)
+    result["provider_id"] = "minimax"
+    return result
 
 
 @app.post("/api/canvas-video")
