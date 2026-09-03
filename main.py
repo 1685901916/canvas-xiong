@@ -3788,8 +3788,17 @@ def save_canvas(canvas):
         logs = canvas.get("logs")
         if isinstance(logs, list) and canvas_logs_fingerprint(logs) != canvas.get("_logs_fp"):
             write_json_atomic(canvas_logs_path(canvas["id"]), logs, indent=0)
+    write_canvas_body(canvas)
+
+def write_canvas_body(canvas):
+    """只写画布本体（节点/连线/元数据）：不碰日志旁文件，不刷新 updated_at，
+    也不把 load 进来的日志和 _logs_* 内部字段一起写回去。"""
     body = {k: v for k, v in canvas.items() if k not in CANVAS_INTERNAL_KEYS}
     write_json_atomic(canvas_path(canvas["id"]), body, indent=2)
+
+def canvas_without_logs(canvas):
+    """给页面回包用：日志几 MB，页面手里本来就有一份，回包不必再带一遍。"""
+    return {k: v for k, v in canvas.items() if k not in CANVAS_INTERNAL_KEYS}
 
 def normalize_canvas_kind(kind="classic"):
     return "smart" if str(kind or "").strip().lower() == "smart" else "classic"
@@ -3942,46 +3951,78 @@ def canvas_record(data):
         "board_y": data.get("board_y"),
         "created_at": data.get("created_at", 0),
         "updated_at": data.get("updated_at", 0),
+        # 打开画布只记 opened_at，不再刷新 updated_at；列表按两者中较晚的排
+        "opened_at": data.get("opened_at", 0),
+        "last_active_at": max(int(data.get("updated_at") or 0), int(data.get("opened_at") or 0)),
         "deleted_at": data.get("deleted_at", 0),
         "node_count": len(data.get("nodes", [])),
     }
+
+def is_canvas_document_filename(filename):
+    """只有 <id>.json 才是画布本体：旁边的 <id>.logs.json、.before-/.bak 快照都不是。
+    把日志文件当画布 json.load 出来是个 list，data.get 直接炸，列表接口就 500 了。"""
+    name = str(filename or "")
+    if not name.endswith(".json") or name.endswith(".logs.json"):
+        return False
+    return bool(re.fullmatch(r"[a-zA-Z0-9_-]+\.json", name))
 
 def cleanup_expired_canvas_trash():
     cutoff = now_ms() - CANVAS_TRASH_RETENTION_MS
     with CANVAS_LOCK:
         for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
+            if not is_canvas_document_filename(filename):
                 continue
             path = os.path.join(CANVAS_DIR, filename)
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                deleted_at = int(data.get("deleted_at") or 0)
+                deleted_at = int(data.get("deleted_at") or 0) if isinstance(data, dict) else 0
                 if deleted_at and deleted_at < cutoff:
                     os.remove(path)
+                    logs_path = path[:-len(".json")] + ".logs.json"
+                    if os.path.isfile(logs_path):
+                        os.remove(logs_path)
             except Exception:
                 continue
+
+# 列表接口每次都要把 200 多个画布文件全读一遍再解析（实测 300ms），页面又是每次保存后都拉一次。
+# 文件没变（mtime + size 一样）就直接用上次算好的记录。键是文件路径。
+_CANVAS_RECORD_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 
 def iter_canvas_records(include_deleted=False):
     cleanup_expired_canvas_trash()
     records = []
+    seen_paths = set()
     for filename in os.listdir(CANVAS_DIR):
-        if not filename.endswith(".json"):
+        if not is_canvas_document_filename(filename):
             continue
-        if ".before-" in filename or filename.endswith(".bak.json"):
-            continue
+        path = os.path.join(CANVAS_DIR, filename)
         try:
-            with open(os.path.join(CANVAS_DIR, filename), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception:
+            st = os.stat(path)
+        except OSError:
             continue
-        expected_filename = f"{data.get('id') or ''}.json"
-        if filename != expected_filename:
+        seen_paths.add(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = _CANVAS_RECORD_CACHE.get(path)
+        if cached and (cached[0], cached[1]) == stamp:
+            record = cached[2]
+        else:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if filename != f"{data.get('id') or ''}.json":
+                continue
+            record = canvas_record(data)
+            _CANVAS_RECORD_CACHE[path] = (stamp[0], stamp[1], record)
+        if include_deleted != bool(record.get("deleted_at")):
             continue
-        is_deleted = bool(data.get("deleted_at"))
-        if include_deleted != is_deleted:
-            continue
-        records.append(canvas_record(data))
+        records.append(dict(record))
+    for path in [p for p in _CANVAS_RECORD_CACHE if p not in seen_paths]:
+        _CANVAS_RECORD_CACHE.pop(path, None)
     return records
 
 def list_canvases():
@@ -3990,7 +4031,7 @@ def list_canvases():
         records,
         key=lambda item: (
             0 if item.get("pinned") else 1,
-            -int(item.get("updated_at") or item.get("created_at") or 0),
+            -int(item.get("last_active_at") or item.get("updated_at") or item.get("created_at") or 0),
         ),
     )
 
@@ -20059,7 +20100,8 @@ async def delete_conversation(conversation_id: str, request: Request, x_user_id:
 
 @app.get("/api/canvases")
 async def canvases():
-    return {"canvases": list_canvases()}
+    # 要读几百个文件，别在事件循环里做
+    return {"canvases": await run_in_threadpool(list_canvases)}
 
 @app.get("/api/projects")
 async def get_projects():
@@ -20097,7 +20139,7 @@ async def delete_project(project_id: str):
     moved = 0
     with CANVAS_LOCK:
         for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
+            if not is_canvas_document_filename(filename):
                 continue
             path = os.path.join(CANVAS_DIR, filename)
             try:
@@ -20105,10 +20147,11 @@ async def delete_project(project_id: str):
                     data = json.load(f)
             except Exception:
                 continue
+            if not isinstance(data, dict):
+                continue
             if str(data.get("project") or "") == project_id:
                 data["project"] = DEFAULT_PROJECT_ID
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                write_json_atomic(path, data, indent=2)
                 moved += 1
     return {"ok": True, "moved": moved}
 
@@ -20122,7 +20165,9 @@ async def create_canvas(payload: CanvasCreateRequest):
 
 @app.get("/api/canvases/{canvas_id}/meta")
 async def get_canvas_meta(canvas_id: str):
-    canvas = load_canvas(canvas_id)
+    # 页面每 2.5 秒轮询一次这里，只为比对版本号：别为此把几 MB 的日志读进来，
+    # 也别在事件循环里同步读盘（会把 WebSocket 广播和别的请求一起卡住）。
+    canvas = await run_in_threadpool(load_canvas, canvas_id, False)
     return {
         "id": canvas.get("id"),
         "updated_at": canvas.get("updated_at", 0),
@@ -20135,7 +20180,7 @@ async def get_canvas_meta(canvas_id: str):
 async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
     """更新画布的轻量元数据（标题/图标/负责人/颜色/置顶）。
     刻意不走 save_canvas（它会刷新 updated_at），以免打标签/置顶把画布顶到列表最前。"""
-    canvas = load_canvas(canvas_id)
+    canvas = load_canvas(canvas_id, with_logs=False)
     if payload.title is not None:
         canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
     if payload.icon is not None:
@@ -20152,17 +20197,30 @@ async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
         canvas["board_x"] = float(payload.board_x)
     if payload.board_y is not None:
         canvas["board_y"] = float(payload.board_y)
-    write_json_atomic(canvas_path(canvas["id"]), canvas, indent=2)
+    write_canvas_body(canvas)
     return {"canvas": canvas_record(canvas)}
 
 @app.get("/api/canvases/{canvas_id}")
-async def get_canvas(canvas_id: str):
-    return {"canvas": load_canvas(canvas_id)}
+async def get_canvas(canvas_id: str, logs: int = 1):
+    """logs=0 只要节点和连线。页面同步远端改动时用它：日志几 MB，页面手里本来就有一份。"""
+    return {"canvas": await run_in_threadpool(load_canvas, canvas_id, bool(logs))}
+
+def touch_canvas_opened(canvas_id):
+    """记录「刚打开过」，供列表按最近活动排序。
+
+    以前直接 save_canvas：刷新 updated_at 并重写整档。结果每打开一次，其它开着同一张
+    画布的标签页都收到 canvas_updated、整份重拉重绘，手里没存完的改动还会撞 409。
+    现在只写 opened_at，版本号不动，也不广播。
+    """
+    with CANVAS_LOCK:
+        canvas = load_canvas(canvas_id, with_logs=False)
+        canvas["opened_at"] = now_ms()
+        write_canvas_body(canvas)
+    return canvas
 
 @app.post("/api/canvases/{canvas_id}/touch")
 async def touch_canvas(canvas_id: str):
-    canvas = load_canvas(canvas_id)
-    save_canvas(canvas)
+    canvas = await run_in_threadpool(touch_canvas_opened, canvas_id)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
 @app.get("/api/canvas-agent/canvases/{canvas_id}")
@@ -21348,9 +21406,20 @@ def merge_dirty_canvas_nodes(canvas, payload):
     return nodes, conns
 
 
-@app.put("/api/canvases/{canvas_id}")
-async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
-    canvas = load_canvas(canvas_id)
+def apply_canvas_save(canvas_id: str, payload: CanvasSaveRequest):
+    """页面保存：读 → 合并 → 存，整段持锁、跑在线程池里。返回存好的画布（含日志时带日志）。
+
+    以前这些活直接在 async 路由里同步做：读盘、合并、带缩进序列化、fsync，一次 100 多毫秒，
+    期间整个事件循环停摆，WebSocket 广播和轮询全部排队，页面看起来就是一顿一顿的。
+    整段持锁是因为节点原语也在线程池里读改写同一个文件，不锁就会互相丢改动。
+    """
+    with CANVAS_LOCK:
+        return _apply_canvas_save_locked(canvas_id, payload)
+
+
+def _apply_canvas_save_locked(canvas_id: str, payload: CanvasSaveRequest):
+    # 页面现在只发「上次保存之后新增的日志」；一条没有就压根不读日志文件（几 MB）
+    canvas = load_canvas(canvas_id, with_logs=bool(payload.logs))
     current_updated_at = int(canvas.get("updated_at") or 0)
     base_updated_at = int(payload.base_updated_at or 0)
     has_server_canvas_state = bool(canvas.get("nodes") or canvas.get("connections"))
@@ -21368,7 +21437,7 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
         mark_canvas_save_conflict(canvas_id, payload.client_id, current_updated_at)
         raise HTTPException(status_code=409, detail={
             "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
-            "canvas": canvas,
+            "canvas": canvas_without_logs(canvas),
             "updated_at": current_updated_at,
         })
     canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
@@ -21390,11 +21459,18 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
         canvas["viewport"] = payload.viewport
     else:
         canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-    canvas["logs"] = merge_canvas_logs(canvas.get("logs") or [], payload.logs or [])
+    if payload.logs:
+        canvas["logs"] = merge_canvas_logs(canvas.get("logs") or [], payload.logs)
     canvas["settings"] = payload.settings or {}
     save_canvas(canvas)
+    return canvas
+
+
+@app.put("/api/canvases/{canvas_id}")
+async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
+    canvas = await run_in_threadpool(apply_canvas_save, canvas_id, payload)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)
-    return {"canvas": canvas}
+    return {"canvas": canvas_without_logs(canvas)}
 
 @app.delete("/api/canvases/{canvas_id}")
 async def delete_canvas(canvas_id: str):

@@ -18388,7 +18388,11 @@ function endDrag(event=null){
     document.body.classList.remove('canvas-node-drag', 'canvas-node-resize', 'canvas-selecting', 'canvas-board-pan');
     window.onmousemove = null;
     window.onmouseup = null;
+    const draggedGroupIds = [...nodeDragCompletedIds, ...resizeCompletedIds]
+        .filter(id => nodes.find(n => n.id === id)?.type === 'group');
+    const fitted = fitGroupsContaining([...nodeDragCompletedIds, ...resizeCompletedIds], draggedGroupIds);
     if(shouldRenderKnife) render();
+    else if(fitted) render();
     else if(!groupMembershipChanged){
         if(nodeDragCompletedIds.length) refreshGeometryAfterLayout(nodeDragCompletedIds);
         else if(resizeCompletedIds.length) refreshGeometryAfterLayout(resizeCompletedIds);
@@ -18404,6 +18408,36 @@ function nodeRect(n){
     const w = el?.offsetWidth || n.w || 260;
     const h = el?.offsetHeight || n.h || 200;
     return {x:n.x, y:n.y, w, h, cx:n.x + w/2, cy:n.y + h/2};
+}
+// 组框只在建组那一刻算过一次包围盒，之后成员被拖动、被改大小、被删掉，框都不会跟着动，
+// 于是越用越对不上——用户反复说「框还是不行」。这里在拖拽/缩放结束时把框重新贴合成员。
+// 内边距用的是 groupSelectedImages 建组时那一套，保证自动贴合出来的和手动框选的长一样。
+const GROUP_FIT_PAD = {left:24, top:58, right:24, bottom:32};
+function fitGroupToMembers(group){
+    if(!group || group.type !== 'group') return false;
+    const ids = (group.items || []).filter(id => nodes.some(n => n.id === id));
+    if(!ids.length) return false;
+    const box = nodeBounds(ids);
+    const next = {
+        x: box.x - GROUP_FIT_PAD.left,
+        y: box.y - GROUP_FIT_PAD.top,
+        w: box.w + GROUP_FIT_PAD.left + GROUP_FIT_PAD.right,
+        h: box.h + GROUP_FIT_PAD.top + GROUP_FIT_PAD.bottom,
+    };
+    const same = ['x','y','w','h'].every(k => Math.abs(Number(group[k] || 0) - next[k]) < 1);
+    if(same) return false;
+    Object.assign(group, next);
+    return true;
+}
+function fitGroupsContaining(nodeIds, skipIds=[]){
+    const touched = new Set((nodeIds || []).filter(Boolean));
+    if(!touched.size) return false;
+    const skip = new Set(skipIds || []);
+    let changed = false;
+    nodes.filter(n => n.type === 'group' && !skip.has(n.id)).forEach(group => {
+        if((group.items || []).some(id => touched.has(id)) && fitGroupToMembers(group)) changed = true;
+    });
+    return changed;
 }
 function connectedClusterIds(seedId){
     const ids = new Set(nodes.map(n => n.id));
