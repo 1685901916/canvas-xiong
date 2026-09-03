@@ -210,6 +210,8 @@ async function refreshCanvasConfigFromSettings(){
         sanitizeImageNodeProviderModel(node);
         sanitizeVideoNodeProviderModel(node);
     });
+    // 和远端对齐之后重记快照：这些节点现在等于服务器上的样子，下次保存不该再报它们脏
+    rememberSavedNodes();
     if(typeof render === 'function') render();
 }
 window.addEventListener('message', event => {
@@ -2020,6 +2022,33 @@ function preserveLocalRuntimeNodeState(remoteNodes=[]){
 // 分不清"别的客户端新增"和"我刚删了"，不挡就会把刚删的节点又加回来。
 // 保存成功后清空——那时删除已经落库，远端不会再带回来。
 const deletedNodeIds = new Set();
+// 上次和服务器对齐时每个节点的样子（id -> 序列化后的字符串）。
+// 保存时拿它比一遍，只把真的改过的节点报给服务器，没改过的一律不发——
+// 不发就不可能覆盖别人。以前整份 PUT，页面手里几秒前的旧节点会连带写回去，
+// agent 刚改好的东西就这么被盖掉。
+const savedNodeSignatures = new Map();
+function nodeSignature(node){
+    try { return JSON.stringify(node); } catch(e){ return String(Math.random()); }
+}
+function rememberSavedNodes(list){
+    savedNodeSignatures.clear();
+    serializableCanvasNodes(list || nodes).forEach(n => {
+        if(n?.id) savedNodeSignatures.set(n.id, nodeSignature(n));
+    });
+}
+function rememberSavedNode(node){
+    if(!node?.id) return;
+    const [clean] = serializableCanvasNodes([node]);
+    if(clean?.id) savedNodeSignatures.set(clean.id, nodeSignature(clean));
+}
+function dirtyNodeIdsFrom(payloadNodes){
+    const dirty = [];
+    payloadNodes.forEach(n => {
+        if(!n?.id) return;
+        if(savedNodeSignatures.get(n.id) !== nodeSignature(n)) dirty.push(n.id);
+    });
+    return dirty;
+}
 function markNodesDeleted(ids){
     (ids || []).forEach(id => { if(id) deletedNodeIds.add(id); });
 }
@@ -2232,6 +2261,8 @@ async function saveCanvas(){
     sanitizeConnections();
     savingCanvasNow = true;
     saveCanvasAgain = false;
+    const payloadNodes = serializableCanvasNodes();
+    const dirtyIds = dirtyNodeIdsFrom(payloadNodes);
     try {
         const res = await fetch(`/api/canvases/${canvas.id}`, {
             method:'PUT',
@@ -2239,12 +2270,15 @@ async function saveCanvas(){
             body:JSON.stringify({
                 title:canvas.title,
                 icon:canvas.icon || '🧩',
-                nodes:serializableCanvasNodes(),
+                nodes:payloadNodes,
                 connections,
                 viewport,
                 logs:canvas.logs || [],
                 client_id:CLIENT_ID,
-                base_updated_at:Number(lastCanvasUpdatedAt || canvas.updated_at || 0)
+                base_updated_at:Number(lastCanvasUpdatedAt || canvas.updated_at || 0),
+                // 服务器只会采用这几个节点，其余保持它自己的版本
+                dirty_node_ids:dirtyIds,
+                removed_node_ids:[...deletedNodeIds]
             })
         });
         if(res.status === 409){
@@ -2281,6 +2315,7 @@ async function saveCanvas(){
         if(!res.ok) throw new Error('save failed');
         // 删除已经落库，远端不会再把它们带回来，墓碑可以清了。
         clearDeletedNodeMarks();
+        rememberSavedNodes();
         const data = await res.json().catch(() => ({}));
         const localViewport = {...viewport};
         if(data.canvas){
@@ -3223,6 +3258,11 @@ function handleCanvasPatchMessage(data){
             lastAppliedCanvasPatchAt = at;
         }
         sanitizeConnections();
+        (patch.nodes || []).forEach(remote => {
+            const local = nodes.find(n => n.id === remote.id);
+            if(local) rememberSavedNode(local);
+        });
+        removed.forEach(id => savedNodeSignatures.delete(id));
         if(changedIds.length) refreshNodes(changedIds);
         syncGeneratorInputs();
         refreshGeneratorInputViews();
@@ -10758,6 +10798,12 @@ function renderGeneratorBody(node){
     const updateSourceRatioFromFirstRef = async () => {
         if(node.ratio !== 'source') return;
         const ref = referenceImages.find(item => item.url);
+        // 渲染是「读状态画界面」，不该反过来改数据。同一张参考图已经量过就别再量：
+        // 否则每次重绘都跑一遍异步测量，回来再写节点、触发保存，而 scheduleSave 的
+        // applyingRemoteCanvas 守卫只挡同步代码，挡不住 await 之后的续行，于是
+        // 存 -> 版本号变 -> 轮询同步 -> 重绘 -> 又存，空转也停不下来。
+        const signature = ref ? String(ref.url) : '';
+        if(node._sourceRatioFor === signature && (signature ? node.customRatio : !node.customRatio)) return;
         const requestId = ++sourceRatioRequest;
         if(!ref){
             node.customRatio = '';
@@ -10765,6 +10811,7 @@ function renderGeneratorBody(node){
             node.customRatioHeight = '';
             customRatioWInput.value = '';
             customRatioHInput.value = '';
+            node._sourceRatioFor = signature;
             return;
         }
         try {
@@ -10784,6 +10831,7 @@ function renderGeneratorBody(node){
             node.customRatioWidth = nextW;
             node.customRatioHeight = nextH;
             node.customRatio = nextRatio;
+            node._sourceRatioFor = signature;
             customRatioWInput.value = nextW;
             customRatioHInput.value = nextH;
             if(changed) scheduleSave();

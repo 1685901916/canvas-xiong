@@ -217,3 +217,104 @@ def test_atomic_write_retries_on_windows_lock():
         finally:
             _os.replace = real_replace
     assert calls["n"] == 3, "前两次被拒后应继续重试"
+
+
+def test_logs_live_in_a_sidecar_file():
+    """日志曾占画布文件的 98%（500 条 3.1MB，节点只有 0.13MB），
+    每改一个节点都要整档读写。拆到旁文件后主文件只剩节点和连线。"""
+    canvas = main.new_canvas("日志拆分回归(可删)", "🧩", "classic", None, None, None)
+    cid = canvas["id"]
+    try:
+        canvas["logs"] = [{"id": "log_1", "prompt": "x" * 4000}]
+        canvas["nodes"] = [{"id": "n1", "type": "prompt", "x": 0, "y": 0, "text": "hi"}]
+        main.save_canvas(canvas)
+
+        raw = open(main.canvas_path(cid), encoding="utf-8").read()
+        assert "log_1" not in raw, "主文件里不该再有日志"
+        assert os.path.isfile(main.canvas_logs_path(cid)), "日志要写到旁文件"
+
+        again = main.load_canvas(cid)
+        assert again["logs"][0]["id"] == "log_1", "读回来时日志要接上"
+        assert again["nodes"][0]["text"] == "hi"
+    finally:
+        for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_old_canvases_keep_working_without_sidecar():
+    """老档的日志还在主文件里，不能因为没有旁文件就把它清空。"""
+    canvas = main.new_canvas("老档兼容(可删)", "🧩", "classic", None, None, None)
+    cid = canvas["id"]
+    try:
+        legacy = {"id": cid, "title": "老档", "nodes": [], "connections": [],
+                  "logs": [{"id": "old_log"}], "updated_at": 1}
+        main.write_json_atomic(main.canvas_path(cid), legacy, indent=2)
+        loaded = main.load_canvas(cid)
+        assert loaded["logs"][0]["id"] == "old_log"
+    finally:
+        for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_purge_removes_the_log_sidecar():
+    canvas = main.new_canvas("彻底删除回归(可删)", "🧩", "classic", None, None, None)
+    cid = canvas["id"]
+    canvas["logs"] = [{"id": "log_x"}]
+    main.save_canvas(canvas)
+    assert os.path.isfile(main.canvas_logs_path(cid))
+
+    import asyncio
+
+    asyncio.run(main.purge_canvas(cid))
+    assert not os.path.isfile(main.canvas_path(cid))
+    assert not os.path.isfile(main.canvas_logs_path(cid)), "旁文件不能留成孤儿"
+
+
+def test_primitives_do_not_touch_the_log_file():
+    """原语只改节点。日志有 7.6MB，每次调用都读写它的话再怎么拆文件也快不起来。"""
+    canvas = main.new_canvas("原语不碰日志(可删)", "🧩", "classic", None, None, None)
+    cid = canvas["id"]
+    try:
+        canvas["logs"] = [{"id": "log_keep", "prompt": "x" * 2000}]
+        main.save_canvas(canvas)
+        side = main.canvas_logs_path(cid)
+        stamp = os.stat(side).st_mtime_ns
+
+        main.canvas_prim_commit(cid, lambda c: c["nodes"].append(
+            {"id": "n1", "type": "prompt", "x": 0, "y": 0, "text": "hi"}))
+
+        assert os.stat(side).st_mtime_ns == stamp, "原语不该重写日志文件"
+        raw = open(main.canvas_path(cid), encoding="utf-8").read()
+        assert "log_keep" not in raw and "_logs_detached" not in raw
+        again = main.load_canvas(cid)
+        assert again["logs"][0]["id"] == "log_keep", "日志不能被原语弄丢"
+        assert any(n["id"] == "n1" for n in again["nodes"])
+    finally:
+        for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_unchanged_logs_are_not_rewritten():
+    canvas = main.new_canvas("日志不重复写(可删)", "🧩", "classic", None, None, None)
+    cid = canvas["id"]
+    try:
+        canvas["logs"] = [{"id": "a"}]
+        main.save_canvas(canvas)
+        side = main.canvas_logs_path(cid)
+        stamp = os.stat(side).st_mtime_ns
+
+        fresh = main.load_canvas(cid)
+        fresh["nodes"].append({"id": "n", "type": "prompt", "x": 0, "y": 0})
+        main.save_canvas(fresh)
+        assert os.stat(side).st_mtime_ns == stamp, "日志没变就不该重写"
+
+        fresh["logs"].insert(0, {"id": "b"})
+        main.save_canvas(fresh)
+        assert os.stat(side).st_mtime_ns != stamp, "日志变了必须写"
+    finally:
+        for p in (main.canvas_path(cid), main.canvas_logs_path(cid)):
+            if os.path.isfile(p):
+                os.remove(p)

@@ -63,3 +63,13 @@ const ratioFn = canvas.slice(canvas.indexOf('const updateSourceRatioFromFirstRef
                              canvas.indexOf('const syncSizeControls'));
 assert.doesNotMatch(ratioFn, /\n\s*scheduleSave\(\);/, '不能无条件保存');
 assert.match(ratioFn, /if\(changed\) scheduleSave\(\);/, '值没变就不要保存');
+
+// 页面保存只报改过的节点：没报的服务器保持自己的版本，页面的旧副本覆盖不了别人
+assert.match(canvas, /const savedNodeSignatures = new Map\(\)/);
+assert.match(canvas, /dirty_node_ids:dirtyIds/, '保存要带上脏节点清单');
+assert.match(canvas, /removed_node_ids:\[\.\.\.deletedNodeIds\]/, '删除要显式告诉服务器');
+assert.match(canvas, /const dirtyIds = dirtyNodeIdsFrom\(payloadNodes\)/);
+// 快照必须在三个地方对齐，否则要么整份都算脏、要么改动被漏掉
+assert.match(canvas, /clearDeletedNodeMarks\(\);\s*\n\s*rememberSavedNodes\(\);/, '保存成功后对齐');
+assert.match(canvas, /rememberSavedNodes\(\);\s*\n\s*if\(typeof render === 'function'\) render\(\);/, '整份同步后对齐');
+assert.match(canvas, /removed\.forEach\(id => savedNodeSignatures\.delete\(id\)\)/, '增量补丁后对齐');
