@@ -216,6 +216,7 @@ window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
     if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
     if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
+    if(event.data?.type === 'canvas_patch') handleCanvasPatchMessage(event.data);
     if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
         refreshCanvasConfigFromSettings();
     }
@@ -3140,12 +3141,85 @@ function stopCanvasRemotePolling(){
         remoteSyncInterval = null;
     }
 }
+// —— 画布增量补丁（配合服务端节点级原语）——
+// agent 通过原语接口改画布时，服务端只广播被触及的节点（canvas_patch），
+// 这里按 id 增量落地：新增的直接 append 一个节点 DOM，已有的只刷新那一个。
+// 不再走 applyRemoteCanvasData 的全量 render()（实测 358ms 冻结），
+// 也顺手把 lastCanvasUpdatedAt 对齐，避免页面自己的下一次保存撞 409。
+let lastAppliedCanvasPatchAt = 0;
+
+function handleCanvasPatchMessage(data){
+    if(!canvas || !data || data.type !== 'canvas_patch') return;
+    if(data.client_id && data.client_id === CLIENT_ID) return;
+    if(data.canvas_id !== canvas.id) return;
+    const at = Number(data.updated_at || 0);
+    if(at && at <= lastAppliedCanvasPatchAt) return;
+    const patch = data.patch || {};
+    const removed = new Set((patch.removed || []).map(String));
+    const changedIds = [];
+
+    applyingRemoteCanvas = true;
+    try {
+        if(removed.size){
+            // 打墓碑：本地若还有待保存的合并，别把刚删的节点又加回来
+            markNodesDeleted([...removed]);
+            nodes = nodes.filter(n => !removed.has(n.id));
+            connections = connections.filter(c => !removed.has(c.from) && !removed.has(c.to));
+            nodesEl.querySelectorAll('.node').forEach(el => { if(removed.has(el.dataset.id)) el.remove(); });
+            removed.forEach(id => selected.delete(id));
+        }
+        (patch.nodes || []).forEach(remote => {
+            if(!remote?.id) return;
+            const idx = nodes.findIndex(n => n.id === remote.id);
+            if(idx === -1){
+                nodes.push(remote);
+                // 新节点先挂 DOM，随后 refreshNodes 就能按 id 找到它，不会回退成全量 render
+                try { nodesEl.appendChild(renderNode(remote)); }
+                catch(err){ console.error('[canvas] 增量新增节点渲染失败：', remote.id, err); }
+            } else {
+                // 保留本地的瞬态运行字段（running/_pending 等），只吸收远端的持久字段
+                const local = nodes[idx];
+                const runtime = {};
+                ['running','runStatus','runError','_pending','_cascadeIdx','_cascadeFailed'].forEach(k => {
+                    if(local[k] !== undefined) runtime[k] = local[k];
+                });
+                nodes[idx] = {...local, ...remote, ...runtime};
+                if(remote.type === 'output' && Array.isArray(remote.images)){
+                    nodes[idx].images = mergeUniqueOutputItems(remote.images, local.images || []);
+                }
+            }
+            changedIds.push(remote.id);
+        });
+        if(Array.isArray(patch.connections)) connections = patch.connections;
+
+        if(at){
+            lastCanvasUpdatedAt = Math.max(Number(lastCanvasUpdatedAt || 0), at);
+            canvas.updated_at = lastCanvasUpdatedAt;
+            lastAppliedCanvasPatchAt = at;
+        }
+        sanitizeConnections();
+        if(changedIds.length) refreshNodes(changedIds);
+        syncGeneratorInputs();
+        refreshGeneratorInputViews();
+        scheduleLinksRender();
+        refreshGeometryAfterLayout();
+        refreshIcons();
+        if(typeof renderMinimap === 'function') renderMinimap();
+        if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at);
+        setStatus('Synced');
+    } finally {
+        applyingRemoteCanvas = false;
+    }
+}
+
 function handleCanvasUpdatedMessage(data){
     if(!canvas || !data || data.type !== 'canvas_updated') return;
     if(data.client_id && data.client_id === CLIENT_ID) return;
     if(data.canvas_id !== canvas.id) return;
     const remoteUpdatedAt = Number(data.updated_at || 0);
     if(remoteUpdatedAt && remoteUpdatedAt <= Number(lastCanvasUpdatedAt || 0)) return;
+    // 这个版本已经通过 canvas_patch 增量落地过了，不要再拉整份画布全量重绘
+    if(remoteUpdatedAt && remoteUpdatedAt <= Number(lastAppliedCanvasPatchAt || 0)) return;
     if(shouldDeferRemoteCanvasApply({includePending:false})){
         deferRemoteCanvasSync(1000);
         setStatus('Local changes pending');

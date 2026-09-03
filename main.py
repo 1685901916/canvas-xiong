@@ -30,7 +30,8 @@ import stat
 import warnings
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple, Literal
-from threading import BoundedSemaphore, Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread, RLock
+from starlette.concurrency import run_in_threadpool
 import httpx
 import autodl_support as autodl
 import minimax_design_support as minimax_design
@@ -152,6 +153,22 @@ class ConnectionManager:
                 print(f"Broadcast image error: {e}")
                 self.active_connections.remove(connection)
 
+    async def broadcast_canvas_patch(self, canvas_id: str, updated_at: int, client_id: str, patch: dict):
+        """节点级原语用：只广播被触及的节点，页面按 id 增量刷新，不走全量 render。"""
+        data = json.dumps({
+            "type": "canvas_patch",
+            "canvas_id": canvas_id,
+            "updated_at": updated_at,
+            "client_id": client_id or "",
+            "patch": patch or {},
+        }, ensure_ascii=False)
+        for connection in self.active_connections[:]:
+            try:
+                await connection.send_text(data)
+            except Exception as e:
+                print(f"Broadcast canvas patch error: {e}")
+                self.active_connections.remove(connection)
+
     async def broadcast_canvas_updated(self, canvas_id: str, updated_at: int, client_id: str = ""):
         data = json.dumps({
             "type": "canvas_updated",
@@ -189,7 +206,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.07.17-media-tools-3"
-CANVAS_RUNTIME_VERSION = "2026.09.03-minimax-async-2"
+CANVAS_RUNTIME_VERSION = "2026.09.03-canvas-primitives-1"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -278,7 +295,7 @@ QUEUE_LOCK = Lock()
 HISTORY_LOCK = Lock()
 GLOBAL_CONFIG_LOCK = Lock()
 CONVERSATION_LOCK = Lock()
-CANVAS_LOCK = Lock()
+CANVAS_LOCK = RLock()  # 可重入：save_canvas→write_json_atomic 内部也会拿这把锁
 LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
@@ -18906,6 +18923,438 @@ async def minimax_video_task_status(task_id: str, provider_id: str = "minimax"):
     result.pop("raw", None)
     result["provider_id"] = "minimax"
     return result
+
+
+
+# ─────────────────────────────────────────────────────────────
+# 画布节点级原语（给 AI / 自动化用）
+#
+# 以前 agent 只有 4 个固定"宏"可用，套路之外只能 GET 整画布 → 改 → PUT 整画布。
+# 日志里 9,115 次整画布覆盖 vs 61 次 agent 调用就是这么来的。每次整画布 PUT 都会
+# 让打开的页面全量重绘（实测 358ms）并和它自己的保存打架（409 → 合并 → 再广播）。
+#
+# 这里提供的是意图级原语：加节点 / 改节点 / 删节点 / 连线 / 建组 / 挂素材。
+# 服务端只改动被触及的节点，并把变化以 canvas_patch 广播给页面，页面按 id 增量刷新。
+# ─────────────────────────────────────────────────────────────
+
+CANVAS_PRIM_GENERATOR_TYPES = {"generator", "msgen", "comfy", "ltxDirector", "video", "rh", "realesrgan"}
+CANVAS_PRIM_IMAGE_OUTPUT_TYPES = {"generator", "msgen", "comfy", "ltxDirector", "rh", "realesrgan"}
+CANVAS_PRIM_MEDIA_OUTPUT_TYPES = {"generator", "msgen", "comfy", "ltxDirector", "video", "rh", "realesrgan"}
+CANVAS_PRIM_CREATABLE_TYPES = {"image", "prompt", "output", "video", "group", "generator"}
+LOCAL_VIDEO_IMPORT_EXTS = {".mp4", ".mov", ".webm", ".m4v", ".mkv"}
+LOCAL_AUDIO_IMPORT_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+# 与前端 defaultNodeSize 对齐，建组时算包围盒用
+CANVAS_PRIM_NODE_SIZES = {
+    "image": (260, 336), "prompt": (310, 160), "output": (460, 220), "video": (400, 520),
+    "generator": (380, 420), "group": (300, 220), "llm": (420, 590), "rh": (430, 420),
+}
+
+
+class CanvasNodeCreate(BaseModel):
+    type: str = Field(min_length=1, max_length=40)
+    x: Optional[float] = None
+    y: Optional[float] = None
+    # 各类型可选字段；未给的按前端工厂默认值补齐
+    name: str = ""
+    text: str = ""
+    url: str = ""
+    path: str = ""                      # 本机文件路径：image 节点可直接由此导入素材
+    apiProvider: str = ""
+    model: str = ""
+    duration: Optional[int] = None
+    aspectRatio: str = ""
+    resolution: str = ""
+    multimodal: Optional[bool] = None
+    useFrameRoles: Optional[bool] = None
+    generateAudio: Optional[bool] = None
+    items: List[str] = Field(default_factory=list)   # group 用：成员节点 id
+    client_id: str = "canvas-agent"
+
+
+class CanvasNodePatch(BaseModel):
+    fields: Dict[str, Any] = Field(default_factory=dict)
+    client_id: str = "canvas-agent"
+
+
+class CanvasConnectionCreate(BaseModel):
+    from_id: str = Field(alias="from", min_length=1)
+    to_id: str = Field(alias="to", min_length=1)
+    client_id: str = "canvas-agent"
+    model_config = {"populate_by_name": True}
+
+
+class CanvasGroupCreate(BaseModel):
+    items: List[str] = Field(default_factory=list)
+    x: Optional[float] = None
+    y: Optional[float] = None
+    client_id: str = "canvas-agent"
+
+
+class CanvasNodeMediaAttach(BaseModel):
+    path: str = ""
+    url: str = ""
+    name: str = ""
+    client_id: str = "canvas-agent"
+
+
+def canvas_prim_uid(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}_{now_ms()}"
+
+
+def canvas_prim_node_size(node: Dict[str, Any]):
+    w, h = CANVAS_PRIM_NODE_SIZES.get(str(node.get("type") or ""), (260, 220))
+    return float(node.get("w") or w), float(node.get("h") or h)
+
+
+def canvas_prim_default_point(nodes: List[Dict[str, Any]], dx: float = 0, dy: float = 0):
+    """没给坐标时放在现有节点右侧，避免叠在一起。"""
+    if not nodes:
+        return float(dx), float(dy)
+    max_right = max((float(n.get("x") or 0) + canvas_prim_node_size(n)[0]) for n in nodes if isinstance(n, dict))
+    min_top = min(float(n.get("y") or 0) for n in nodes if isinstance(n, dict))
+    return max_right + 80 + dx, min_top + dy
+
+
+def canvas_prim_default_video_model(provider_id: str) -> str:
+    try:
+        for provider in load_api_providers():
+            if str(provider.get("id") or "") == provider_id:
+                models = provider.get("video_models") or []
+                if models:
+                    return str(models[0])
+    except Exception:
+        pass
+    return ""
+
+
+def canvas_prim_build_node(nodes: List[Dict[str, Any]], payload: CanvasNodeCreate) -> Dict[str, Any]:
+    node_type = str(payload.type or "").strip()
+    if node_type not in CANVAS_PRIM_CREATABLE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"暂不支持创建类型 {node_type!r}；可用：{', '.join(sorted(CANVAS_PRIM_CREATABLE_TYPES))}",
+        )
+    offsets = {"image": (-120, 0), "prompt": (0, 0), "output": (260, 0), "video": (160, 0), "generator": (120, 0), "group": (0, 0)}
+    dx, dy = offsets.get(node_type, (0, 0))
+    x = float(payload.x) if payload.x is not None else canvas_prim_default_point(nodes, dx, dy)[0]
+    y = float(payload.y) if payload.y is not None else canvas_prim_default_point(nodes, dx, dy)[1]
+    prefix = {"image": "img", "prompt": "prompt", "output": "out", "video": "vid", "generator": "gen", "group": "grp"}[node_type]
+    node: Dict[str, Any] = {"id": canvas_prim_uid(prefix), "type": node_type, "x": x, "y": y}
+
+    if node_type == "image":
+        node.update({"url": "", "name": payload.name or "空白图片"})
+    elif node_type == "prompt":
+        node.update({"text": payload.text or ""})
+    elif node_type == "output":
+        node.update({"images": []})
+    elif node_type == "group":
+        node.update({"w": 300, "h": 220, "items": []})
+    elif node_type == "generator":
+        node.update({
+            "apiProvider": payload.apiProvider or "", "model": payload.model or "",
+            "ratio": "square", "resolution": "2k", "quality": "high", "forceFill": False, "count": 1,
+            "customRatio": "", "customSize": "", "customRatioWidth": "", "customRatioHeight": "",
+            "customWidth": "", "customHeight": "", "inputs": [], "running": False,
+        })
+    elif node_type == "video":
+        provider = payload.apiProvider or "runninghub"
+        node.update({
+            "apiProvider": provider,
+            "model": payload.model or canvas_prim_default_video_model(provider) or "rhart-video/sparkvideo-2.0/multimodal-video",
+            "duration": int(payload.duration) if payload.duration is not None else 10,
+            "aspectRatio": payload.aspectRatio or "9:16",
+            "resolution": payload.resolution or "720p",
+            "enhancePrompt": False, "enableUpsample": False, "watermark": False, "cameraFixed": False,
+            "generateAudio": bool(payload.generateAudio) if payload.generateAudio is not None else False,
+            "useFrameRoles": bool(payload.useFrameRoles) if payload.useFrameRoles is not None else False,
+            # 与前端工厂一致：默认开全能参考，否则多张图只有第一张会被当首帧
+            "multimodal": bool(payload.multimodal) if payload.multimodal is not None else True,
+            "tempShLinks": [], "inputs": [], "running": False,
+        })
+        if node["useFrameRoles"]:
+            node["multimodal"] = False
+    return node
+
+
+def canvas_prim_would_cycle(nodes, connections, from_id: str, to_id: str) -> bool:
+    """连线后是否在生成器之间形成环（镜像前端 wouldCreateGeneratorCycle 的保守版本）。"""
+    adjacency: Dict[str, List[str]] = {}
+    for conn in connections:
+        if isinstance(conn, dict) and conn.get("from") and conn.get("to"):
+            adjacency.setdefault(str(conn["from"]), []).append(str(conn["to"]))
+    adjacency.setdefault(from_id, []).append(to_id)
+    seen = set()
+    stack = [to_id]
+    while stack:
+        current = stack.pop()
+        if current == from_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(adjacency.get(current, []))
+    return False
+
+
+def canvas_prim_can_connect(nodes, connections, from_id: str, to_id: str) -> bool:
+    """镜像前端 canConnect：服务端建线时执行同一套规则，别让 AI 连出页面会丢弃的线。"""
+    if not from_id or not to_id or from_id == to_id:
+        return False
+    by_id = {str(n.get("id")): n for n in nodes if isinstance(n, dict) and n.get("id")}
+    src, dst = by_id.get(from_id), by_id.get(to_id)
+    if not src or not dst:
+        return False
+    st, dt = str(src.get("type") or ""), str(dst.get("type") or "")
+    if dt == "realesrgan":
+        if st in CANVAS_PRIM_IMAGE_OUTPUT_TYPES:
+            return not canvas_prim_would_cycle(nodes, connections, from_id, to_id)
+        return st in {"image", "group", "output"}
+    if st in CANVAS_PRIM_GENERATOR_TYPES:
+        if dt == "output":
+            return True
+        if st in CANVAS_PRIM_MEDIA_OUTPUT_TYPES and dt in CANVAS_PRIM_GENERATOR_TYPES:
+            return not canvas_prim_would_cycle(nodes, connections, from_id, to_id)
+        return False
+    if dt == "loop":
+        allow_image = bool(dst.get("imageInput")) and st in {"image", "group", "output"}
+        allow_prompt = bool(dst.get("showPrompt")) and st in {"prompt", "promptGroup", "loop", "llm"}
+        return allow_image or allow_prompt
+    if dt == "llm":
+        return st in {"prompt", "loop", "promptGroup", "llm", "image", "group", "output"}
+    if st == "llm":
+        return dt in CANVAS_PRIM_GENERATOR_TYPES
+    return dt in CANVAS_PRIM_GENERATOR_TYPES and st in {"image", "prompt", "loop", "group", "promptGroup", "output", "llm"}
+
+
+def import_local_media_file(path: str) -> Dict[str, Any]:
+    """把本机文件复制进 assets/input，返回可挂到节点上的 url。图片走已有校验，视频/音频只做扩展名与存在性检查。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in LOCAL_IMAGE_IMPORT_EXTS:
+        return import_local_image_file(path)
+    if ext in LOCAL_VIDEO_IMPORT_EXTS or ext in LOCAL_AUDIO_IMPORT_EXTS:
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="本地媒体文件不存在或无法读取")
+        kind = "video" if ext in LOCAL_VIDEO_IMPORT_EXTS else "audio"
+        filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
+        dest = output_path_for(filename, "input")
+        try:
+            shutil.copyfile(path, dest)
+        except OSError:
+            raise HTTPException(status_code=500, detail="导入本地媒体失败")
+        return {"url": output_url_for(filename, "input"), "name": os.path.basename(path) or filename, "kind": kind}
+    raise HTTPException(status_code=400, detail="仅支持图片(png/jpg/webp/gif)、视频(mp4/mov/webm/m4v/mkv)、音频(mp3/wav/m4a/aac/flac/ogg)")
+
+
+def canvas_prim_resolve_media(path: str = "", url: str = "", name: str = "") -> Dict[str, Any]:
+    text_url = str(url or "").strip()
+    if text_url:
+        resolved = agent_media_url(text_url)
+        if not resolved:
+            raise HTTPException(status_code=400, detail="url 只接受 http(s)、/assets/、/output/ 或 data:image 地址")
+        lower = resolved.lower().split("?", 1)[0]
+        kind = "video" if any(lower.endswith(e) for e in LOCAL_VIDEO_IMPORT_EXTS) else (
+            "audio" if any(lower.endswith(e) for e in LOCAL_AUDIO_IMPORT_EXTS) else "image")
+        return {"url": resolved, "name": name or os.path.basename(lower) or "media", "kind": kind}
+    text_path = str(path or "").strip()
+    if text_path:
+        info = import_local_media_file(normalize_local_image_path(text_path))
+        if name:
+            info["name"] = name
+        return info
+    raise HTTPException(status_code=400, detail="需要提供 path（本机文件）或 url")
+
+
+def canvas_prim_group_handoff(nodes, connections, group: Dict[str, Any], member_ids: List[str]):
+    """入组后把成员→生成器的连线改成组→生成器（镜像前端 handoffExistingInputsToGroup）。"""
+    by_id = {str(n.get("id")): n for n in nodes if isinstance(n, dict) and n.get("id")}
+    child_ids = {mid for mid in member_ids if str(by_id.get(mid, {}).get("type") or "") in {"image", "prompt"}}
+    if not child_ids:
+        return connections
+    target_ids = set()
+    for conn in connections:
+        if not isinstance(conn, dict) or conn.get("from") not in child_ids:
+            continue
+        target = by_id.get(str(conn.get("to") or ""))
+        if target and str(target.get("type") or "") in CANVAS_PRIM_GENERATOR_TYPES:
+            target_ids.add(str(target["id"]))
+    if not target_ids:
+        return connections
+    kept = [c for c in connections if not (isinstance(c, dict) and c.get("from") in child_ids and c.get("to") in target_ids)]
+    for target_id in target_ids:
+        if not any(isinstance(c, dict) and c.get("from") == group["id"] and c.get("to") == target_id for c in kept):
+            if canvas_prim_can_connect(nodes, kept, group["id"], target_id):
+                kept.append({"id": canvas_prim_uid("c"), "from": group["id"], "to": target_id})
+    return kept
+
+
+def canvas_prim_layout_group(nodes, group: Dict[str, Any], member_ids: List[str]):
+    """按成员包围盒放置组框（镜像前端 groupSelectedImages 的 nodeBounds 逻辑）。"""
+    by_id = {str(n.get("id")): n for n in nodes if isinstance(n, dict) and n.get("id")}
+    members = [by_id[m] for m in member_ids if m in by_id]
+    if not members:
+        return
+    xs = [float(m.get("x") or 0) for m in members]
+    ys = [float(m.get("y") or 0) for m in members]
+    rights = [float(m.get("x") or 0) + canvas_prim_node_size(m)[0] for m in members]
+    bottoms = [float(m.get("y") or 0) + canvas_prim_node_size(m)[1] for m in members]
+    group["x"] = min(xs) - 24
+    group["y"] = min(ys) - 58
+    group["w"] = (max(rights) - min(xs)) + 48
+    group["h"] = (max(bottoms) - min(ys)) + 90
+
+
+def canvas_prim_commit(canvas_id: str, mutate):
+    """读 → 改 → 存，整段持锁；返回 (canvas, result)。原语只改被触及的节点。"""
+    with CANVAS_LOCK:
+        canvas = load_canvas(canvas_id)
+        canvas.setdefault("nodes", [])
+        canvas.setdefault("connections", [])
+        result = mutate(canvas)
+        save_canvas(canvas)
+    return canvas, result
+
+
+async def canvas_prim_respond(canvas_id: str, canvas, result: Dict[str, Any], client_id: str):
+    updated_at = int(canvas.get("updated_at") or now_ms())
+    patch = {
+        "nodes": result.get("nodes") or [],
+        "removed": result.get("removed") or [],
+        "connections": canvas.get("connections") or [] if result.get("connections_changed") else None,
+    }
+    await manager.broadcast_canvas_patch(canvas_id, updated_at, client_id, patch)
+    return {"ok": True, "updated_at": updated_at, **{k: v for k, v in result.items() if k != "connections_changed"}}
+
+
+@app.post("/api/canvases/{canvas_id}/nodes")
+async def canvas_prim_create_node(canvas_id: str, payload: CanvasNodeCreate):
+    """新建一个节点。image 节点可同时给 path/url 直接挂素材。"""
+    # 素材复制放在锁外：磁盘拷贝不该占着画布锁
+    media = canvas_prim_resolve_media(payload.path, payload.url, payload.name) if (payload.type == "image" and (payload.path or payload.url)) else None
+    def mutate(canvas):
+        node = canvas_prim_build_node(canvas["nodes"], payload)
+        if node["type"] == "image" and media:
+            node["url"] = media["url"]
+            node["name"] = media["name"]
+            if media["kind"] != "image":
+                node["mediaKind"] = media["kind"]
+        if node["type"] == "group" and payload.items:
+            member_ids = [m for m in payload.items if any(n.get("id") == m for n in canvas["nodes"])]
+            node["items"] = member_ids
+            canvas_prim_layout_group(canvas["nodes"], node, member_ids)
+            canvas["connections"] = canvas_prim_group_handoff(canvas["nodes"], canvas["connections"], node, member_ids)
+        canvas["nodes"].append(node)
+        return {"node": node, "nodes": [node], "connections_changed": node["type"] == "group" and bool(payload.items)}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
+
+
+@app.patch("/api/canvases/{canvas_id}/nodes/{node_id}")
+async def canvas_prim_patch_node(canvas_id: str, node_id: str, payload: CanvasNodePatch):
+    """改节点字段。id/type 不可改；其余字段浅合并。"""
+    forbidden = {"id", "type", "_pending"}
+    fields = {k: v for k, v in (payload.fields or {}).items() if k not in forbidden}
+    if not fields:
+        raise HTTPException(status_code=400, detail="fields 为空或只包含不可修改的字段")
+    def mutate(canvas):
+        node = next((n for n in canvas["nodes"] if n.get("id") == node_id), None)
+        if not node:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        node.update(fields)
+        if fields.get("useFrameRoles"):
+            node["multimodal"] = False
+        elif fields.get("multimodal"):
+            node["useFrameRoles"] = False
+        return {"node": node, "nodes": [node]}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
+
+
+@app.delete("/api/canvases/{canvas_id}/nodes/{node_id}")
+async def canvas_prim_delete_node(canvas_id: str, node_id: str, client_id: str = "canvas-agent"):
+    def mutate(canvas):
+        before = len(canvas["nodes"])
+        removed_ids = {node_id}
+        target = next((n for n in canvas["nodes"] if n.get("id") == node_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        if target.get("type") in {"group", "promptGroup"}:
+            removed_ids.update(str(i) for i in (target.get("items") or []))
+        canvas["nodes"] = [n for n in canvas["nodes"] if n.get("id") not in removed_ids]
+        canvas["connections"] = [c for c in canvas["connections"] if c.get("from") not in removed_ids and c.get("to") not in removed_ids]
+        for n in canvas["nodes"]:
+            if isinstance(n.get("items"), list):
+                n["items"] = [i for i in n["items"] if i not in removed_ids]
+        return {"removed": sorted(removed_ids), "connections_changed": True, "deleted_count": before - len(canvas["nodes"])}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, client_id)
+
+
+@app.post("/api/canvases/{canvas_id}/connections")
+async def canvas_prim_create_connection(canvas_id: str, payload: CanvasConnectionCreate):
+    def mutate(canvas):
+        from_id, to_id = payload.from_id, payload.to_id
+        if any(c.get("from") == from_id and c.get("to") == to_id for c in canvas["connections"]):
+            existing = next(c for c in canvas["connections"] if c.get("from") == from_id and c.get("to") == to_id)
+            return {"connection": existing, "created": False, "connections_changed": False}
+        if not canvas_prim_can_connect(canvas["nodes"], canvas["connections"], from_id, to_id):
+            by_id = {n.get("id"): n.get("type") for n in canvas["nodes"]}
+            raise HTTPException(
+                status_code=400,
+                detail=f"不允许的连线：{by_id.get(from_id, '?')}({from_id}) → {by_id.get(to_id, '?')}({to_id})",
+            )
+        conn = {"id": canvas_prim_uid("c"), "from": from_id, "to": to_id}
+        canvas["connections"].append(conn)
+        return {"connection": conn, "created": True, "connections_changed": True}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
+
+
+@app.delete("/api/canvases/{canvas_id}/connections/{connection_id}")
+async def canvas_prim_delete_connection(canvas_id: str, connection_id: str, client_id: str = "canvas-agent"):
+    def mutate(canvas):
+        before = len(canvas["connections"])
+        canvas["connections"] = [c for c in canvas["connections"] if c.get("id") != connection_id]
+        if len(canvas["connections"]) == before:
+            raise HTTPException(status_code=404, detail="连线不存在")
+        return {"removed_connection": connection_id, "connections_changed": True}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, client_id)
+
+
+@app.post("/api/canvases/{canvas_id}/groups")
+async def canvas_prim_create_group(canvas_id: str, payload: CanvasGroupCreate):
+    """把若干 image/prompt 节点收进一个组，并把它们到生成器的连线改成组→生成器。"""
+    def mutate(canvas):
+        node = canvas_prim_build_node(canvas["nodes"], CanvasNodeCreate(type="group", x=payload.x, y=payload.y, items=payload.items))
+        member_ids = [m for m in payload.items if any(n.get("id") == m for n in canvas["nodes"])]
+        node["items"] = member_ids
+        canvas_prim_layout_group(canvas["nodes"], node, member_ids)
+        canvas["connections"] = canvas_prim_group_handoff(canvas["nodes"], canvas["connections"], node, member_ids)
+        canvas["nodes"].append(node)
+        return {"node": node, "nodes": [node], "connections_changed": bool(member_ids)}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
+
+
+@app.post("/api/canvases/{canvas_id}/nodes/{node_id}/media")
+async def canvas_prim_attach_media(canvas_id: str, node_id: str, payload: CanvasNodeMediaAttach):
+    """给 image 节点挂素材：path（本机文件，自动复制进 assets/input）或 url。视频/音频会标记 mediaKind。"""
+    media = canvas_prim_resolve_media(payload.path, payload.url, payload.name)
+    def mutate(canvas):
+        node = next((n for n in canvas["nodes"] if n.get("id") == node_id), None)
+        if not node:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        if node.get("type") != "image":
+            raise HTTPException(status_code=400, detail="只能给 image 节点挂素材")
+        node["url"] = media["url"]
+        node["name"] = media["name"]
+        if media["kind"] == "image":
+            node.pop("mediaKind", None)
+        else:
+            node["mediaKind"] = media["kind"]
+        return {"node": node, "nodes": [node], "media": media}
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
 
 
 @app.post("/api/canvas-video")
