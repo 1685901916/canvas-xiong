@@ -19072,6 +19072,10 @@ LOCAL_AUDIO_IMPORT_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 # 与前端 defaultNodeSize 对齐，建组时算包围盒用
 # 节点未被手动调整过时的实测渲染尺寸（在真实画布上量的，不是估的）。
 # 这些值只在节点自己没有 w/h 时兜底；量小了会让组框把成员裁掉，所以宁可略大。
+# 组框头部（标题 + 两行说明 + 「设为对话目标」按钮）实测 134px；留 150 让成员不压在按钮上。
+# 前端 canvas.js 的 GROUP_HEADER_H 是同一个数，改一处就要改另一处。
+CANVAS_GROUP_HEADER_H = 150
+
 CANVAS_PRIM_NODE_SIZES = {
     "image": (260, 336), "prompt": (310, 238), "output": (460, 580), "video": (400, 610),
     "generator": (380, 488), "group": (300, 220), "llm": (420, 590), "rh": (430, 420),
@@ -19335,9 +19339,9 @@ def canvas_prim_layout_group(nodes, group: Dict[str, Any], member_ids: List[str]
     rights = [float(m.get("x") or 0) + canvas_prim_node_size(m)[0] for m in members]
     bottoms = [float(m.get("y") or 0) + canvas_prim_node_size(m)[1] for m in members]
     group["x"] = min(xs) - 24
-    group["y"] = min(ys) - 58
+    group["y"] = min(ys) - CANVAS_GROUP_HEADER_H
     group["w"] = (max(rights) - min(xs)) + 48
-    group["h"] = (max(bottoms) - min(ys)) + 90
+    group["h"] = (max(bottoms) - min(ys)) + CANVAS_GROUP_HEADER_H + 32
 
 
 def canvas_prim_commit(canvas_id: str, mutate):

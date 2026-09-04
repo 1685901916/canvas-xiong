@@ -16,12 +16,12 @@ const fit = canvas.slice(canvas.indexOf('function fitGroupToMembers'),
 // 必须用 nodeBounds：它读真实 DOM 尺寸，服务端那套估值在这里会算错
 assert.ok(fit.includes('nodeBounds(ids)'), '包围盒要按真实渲染尺寸算');
 // 内边距和 groupSelectedImages 建组时一致，自动贴合的和手动框选的要长一样
-assert.match(canvas, /GROUP_FIT_PAD = \{left:24, top:58, right:24, bottom:32\}/);
+assert.match(canvas, /GROUP_FIT_PAD = \{left:24, top:GROUP_HEADER_H, right:24, bottom:32\}/);
 const manual = canvas.slice(canvas.indexOf('function groupSelectedImages'),
                             canvas.indexOf('function nodeBounds'));
-assert.ok(manual.includes('box.x - 24') && manual.includes('box.y - 58')
-       && manual.includes('box.w + 48') && manual.includes('box.h + 90'),
-  '手动建组仍是 24/58/48/90，自动贴合要跟它对齐');
+assert.ok(manual.includes('box.x - 24') && manual.includes('box.y - GROUP_HEADER_H')
+       && manual.includes('box.w + 48') && manual.includes('box.h + GROUP_HEADER_H + 32'),
+  '手动建组和自动贴合共用同一套边距');
 // 没变化就不要动，免得每次拖拽都产生一次多余保存
 assert.ok(fit.includes('if(same) return false'), '尺寸没变时不应报告改动');
 
@@ -33,3 +33,12 @@ assert.match(end, /fitGroupsContaining\(\[\.\.\.nodeDragCompletedIds, \.\.\.resi
   '把被拖的组作为跳过名单传进去');
 
 console.log('group-autofit: 全部通过');
+
+// 组框头部实测 134px（标题 42 + 提示行 + 已成组行 + 「设为对话目标」按钮）。
+// 上边距小于它，成员就压在那个蓝色按钮上——原来建组用 58，画布上 12 个组无一幸免。
+assert.match(canvas, /const GROUP_HEADER_H = 150;/, '上边距要盖过 134px 的头部');
+const mk = canvas.slice(canvas.indexOf('function groupSelectedImages'),
+                        canvas.indexOf('function nodeBounds'));
+assert.ok(mk.includes('box.y - GROUP_HEADER_H'), '手动框选建组也要用它');
+assert.ok(mk.includes('box.h + GROUP_HEADER_H + 32'), '高度跟着上边距一起算');
+assert.ok(!/box\.y - 58/.test(mk), '不能再留 58 这个魔数');

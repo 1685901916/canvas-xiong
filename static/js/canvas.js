@@ -967,11 +967,13 @@ function videoApiProviders(){
     const selfHosted = {id:'autodl-cloud', name:'AutoDL 云端部署', video_models:[
         'U02-minimax_h3_图生视频单图版',
         'U02-minimax_h3_图生视频基础版-V2',
-        'U02-minimax_h3_多图视频参考版'
+        'U02-minimax_h3_多图视频参考版',
+        'U03-minimax_h3_全能参考_带参考视频'
     ], model_names:{
         'U02-minimax_h3_图生视频单图版':'MiniMax H3 · 自部署单图视频',
         'U02-minimax_h3_图生视频基础版-V2':'MiniMax H3 · 自部署基础版 V2',
-        'U02-minimax_h3_多图视频参考版':'MiniMax H3 · 自部署多图/视频参考'
+        'U02-minimax_h3_多图视频参考版':'MiniMax H3 · 自部署多图/视频参考',
+        'U03-minimax_h3_全能参考_带参考视频':'MiniMax H3 · 全能参考（参考视频锁机位·原生1344×768）'
     }};
     const list = providers.filter(p => p.id !== selfHosted.id);
     list.push(selfHosted);
@@ -14201,7 +14203,12 @@ async function runMiniMaxDesignVideoNode(node, snapshot, out, pending, opts={}){
 async function runAutoDLCloudVideoNode(node, snapshot, out, pending, opts={}){
     const selectedModel = String(node?.model || '').trim();
     const isReferenceWorkflow = selectedModel === 'U02-minimax_h3_多图视频参考版';
-    const workflowJson = isReferenceWorkflow
+    // U03：B99 全能参考。参考视频接线、ref2va 模型、原生 1344x768 都已焊死在模板里，
+    // 这里只注入提示词 / 参考图 / 参考视频 / 时长 / 步数 / 种子。
+    const isOmniReference = selectedModel === 'U03-minimax_h3_全能参考_带参考视频';
+    const workflowJson = isOmniReference
+        ? 'custom/U03-minimax_h3_全能参考_带参考视频.json'
+        : isReferenceWorkflow
         ? 'custom/U02-minimax_h3_多图视频参考版.json'
         : selectedModel === 'U02-minimax_h3_图生视频基础版-V2'
             ? 'custom/U02-minimax_h3_图生视频基础版-V2.json'
@@ -14214,11 +14221,23 @@ async function runAutoDLCloudVideoNode(node, snapshot, out, pending, opts={}){
     await saveCanvas();
     try {
         const inputName = await comfyNameForRef(snapshot.refs[0]);
-        const params = isReferenceWorkflow
+        const params = isOmniReference
+            ? {'238':{image:inputName},'173':{text:snapshot.prompt}}
+            : isReferenceWorkflow
             ? {'114':{image:inputName},'139':{prompt:snapshot.prompt}}
             : workflowJson.endsWith('基础版-V2.json')
                 ? {'114':{image:inputName},'144':{image:inputName},'139':{prompt:snapshot.prompt}}
                 : {'114':{image:inputName},'139':{prompt:snapshot.prompt}};
+        if(isOmniReference){
+            // 参考视频（可选）：连了就用，没连就沿用模板里的默认
+            const omniVideo = snapshot.videoRefs[0];
+            if(omniVideo) params['275'] = {video: await comfyNameForRef(omniVideo)};
+            // 时长：节点上的秒数，夹到节点允许的 2–15 秒
+            const secs = Number(node.duration || 14);
+            if(Number.isFinite(secs) && secs > 0) params['172'] = {value: Math.min(15, Math.max(2, Math.round(secs)))};
+            // 种子：节点没给就随机，保证每次不同
+            params['129'] = {noise_seed: Number(node.seed) || Math.floor(Math.random() * 4294967295)};
+        }
         if(isReferenceWorkflow){
             const imageNames = [];
             for(const ref of snapshot.refs.slice(0, 9)) imageNames.push(await comfyNameForRef(ref));
@@ -17674,7 +17693,8 @@ function groupSelectedImages(){
     pushUndo();
     if(targets.length){
         const box = nodeBounds(targets.map(n => n.id));
-        group = {id:uid('grp'), type:'group', x:box.x - 24, y:box.y - 58, w:box.w + 48, h:box.h + 90, items:targets.map(n => n.id)};
+        group = {id:uid('grp'), type:'group', x:box.x - 24, y:box.y - GROUP_HEADER_H,
+                 w:box.w + 48, h:box.h + GROUP_HEADER_H + 32, items:targets.map(n => n.id)};
     } else {
         const p = defaultPoint(0, 0);
         group = {id:uid('grp'), type:'group', x:p.x, y:p.y, w:300, h:220, items:[]};
@@ -18412,7 +18432,11 @@ function nodeRect(n){
 // 组框只在建组那一刻算过一次包围盒，之后成员被拖动、被改大小、被删掉，框都不会跟着动，
 // 于是越用越对不上——用户反复说「框还是不行」。这里在拖拽/缩放结束时把框重新贴合成员。
 // 内边距用的是 groupSelectedImages 建组时那一套，保证自动贴合出来的和手动框选的长一样。
-const GROUP_FIT_PAD = {left:24, top:58, right:24, bottom:32};
+// 组框内部头部（标题 42 + 提示行 + 「已成组」行 + 「设为对话目标」按钮）实测占 134px。
+// 上边距原本是 58，成员永远压在那个蓝色按钮上——画布上 12 个组无一幸免，
+// 包括手动框选出来的。留 150 让成员从头部下面开始。
+const GROUP_HEADER_H = 150;
+const GROUP_FIT_PAD = {left:24, top:GROUP_HEADER_H, right:24, bottom:32};
 function fitGroupToMembers(group){
     if(!group || group.type !== 'group') return false;
     const ids = (group.items || []).filter(id => nodes.some(n => n.id === id));
