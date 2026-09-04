@@ -19074,7 +19074,9 @@ LOCAL_AUDIO_IMPORT_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 # 这些值只在节点自己没有 w/h 时兜底；量小了会让组框把成员裁掉，所以宁可略大。
 # 组框头部（标题 + 两行说明 + 「设为对话目标」按钮）实测 134px；留 150 让成员不压在按钮上。
 # 前端 canvas.js 的 GROUP_HEADER_H 是同一个数，改一处就要改另一处。
-CANVAS_GROUP_HEADER_H = 150
+CANVAS_GROUP_HEADER_H = 170
+# 和前端 canvas.js 的 GROUP_FIT_PAD 是同一套：左100 上170 右100 下110
+CANVAS_GROUP_PAD = (100, CANVAS_GROUP_HEADER_H, 100, 110)
 
 CANVAS_PRIM_NODE_SIZES = {
     "image": (260, 336), "prompt": (310, 238), "output": (460, 580), "video": (400, 610),
@@ -19338,10 +19340,11 @@ def canvas_prim_layout_group(nodes, group: Dict[str, Any], member_ids: List[str]
     ys = [float(m.get("y") or 0) for m in members]
     rights = [float(m.get("x") or 0) + canvas_prim_node_size(m)[0] for m in members]
     bottoms = [float(m.get("y") or 0) + canvas_prim_node_size(m)[1] for m in members]
-    group["x"] = min(xs) - 24
-    group["y"] = min(ys) - CANVAS_GROUP_HEADER_H
-    group["w"] = (max(rights) - min(xs)) + 48
-    group["h"] = (max(bottoms) - min(ys)) + CANVAS_GROUP_HEADER_H + 32
+    pad_l, pad_t, pad_r, pad_b = CANVAS_GROUP_PAD
+    group["x"] = min(xs) - pad_l
+    group["y"] = min(ys) - pad_t
+    group["w"] = (max(rights) - min(xs)) + pad_l + pad_r
+    group["h"] = (max(bottoms) - min(ys)) + pad_t + pad_b
 
 
 def canvas_prim_commit(canvas_id: str, mutate):

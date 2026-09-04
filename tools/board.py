@@ -37,13 +37,14 @@ BASE = os.environ.get("CANVAS_BASE", "http://127.0.0.1:3001")
 # 上边距小于它，成员就压在那个蓝色按钮上——画布上 12 个组原本无一幸免，包括手动
 # 框选出来的。canvas.js 的 GROUP_HEADER_H 和 main.py 的 CANVAS_GROUP_HEADER_H
 # 是同一个数，改一处就要改另两处。
-GROUP_HEADER_H = 150
+GROUP_HEADER_H = 170
+GROUP_PAD = (100, GROUP_HEADER_H, 100, 110)   # 左 上 右 下
 
 SIZES = {
     "big":   {"image": (300, 533), "prompt": (400, 640), "gap": 140,
-              "pad": (80, GROUP_HEADER_H, 80, 90)},
+              "pad": GROUP_PAD},
     "small": {"image": (260, 336), "prompt": (310, 238), "gap": 40,
-              "pad": (24, GROUP_HEADER_H, 24, 32)},
+              "pad": GROUP_PAD},
 }
 VIDEO_DX, VIDEO_DY = 120, 40   # 视频节点相对成员行右端的偏移
 

@@ -17693,8 +17693,11 @@ function groupSelectedImages(){
     pushUndo();
     if(targets.length){
         const box = nodeBounds(targets.map(n => n.id));
-        group = {id:uid('grp'), type:'group', x:box.x - 24, y:box.y - GROUP_HEADER_H,
-                 w:box.w + 48, h:box.h + GROUP_HEADER_H + 32, items:targets.map(n => n.id)};
+        group = {id:uid('grp'), type:'group',
+                 x:box.x - GROUP_FIT_PAD.left, y:box.y - GROUP_FIT_PAD.top,
+                 w:box.w + GROUP_FIT_PAD.left + GROUP_FIT_PAD.right,
+                 h:box.h + GROUP_FIT_PAD.top + GROUP_FIT_PAD.bottom,
+                 items:targets.map(n => n.id)};
     } else {
         const p = defaultPoint(0, 0);
         group = {id:uid('grp'), type:'group', x:p.x, y:p.y, w:300, h:220, items:[]};
@@ -18435,8 +18438,10 @@ function nodeRect(n){
 // 组框内部头部（标题 42 + 提示行 + 「已成组」行 + 「设为对话目标」按钮）实测占 134px。
 // 上边距原本是 58，成员永远压在那个蓝色按钮上——画布上 12 个组无一幸免，
 // 包括手动框选出来的。留 150 让成员从头部下面开始。
-const GROUP_HEADER_H = 150;
-const GROUP_FIT_PAD = {left:24, top:GROUP_HEADER_H, right:24, bottom:32};
+const GROUP_HEADER_H = 170;
+// 全画布唯一一套组框边距。上边距必须盖过 134px 的头部；左右下留够，
+// 免得成员贴在框边上看着像没放进组里。改这里，建组和拖动后的自动贴合一起变。
+const GROUP_FIT_PAD = {left:100, top:GROUP_HEADER_H, right:100, bottom:110};
 function fitGroupToMembers(group){
     if(!group || group.type !== 'group') return false;
     const ids = (group.items || []).filter(id => nodes.some(n => n.id === id));
