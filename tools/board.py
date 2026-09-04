@@ -46,7 +46,9 @@ SIZES = {
     "small": {"image": (260, 336), "prompt": (310, 238), "gap": 40,
               "pad": GROUP_PAD},
 }
-VIDEO_DX, VIDEO_DY = 120, 40   # 视频节点相对成员行右端的偏移
+VIDEO_DX, VIDEO_DY = 120, 40   # 生成器节点相对成员行右端的偏移
+# 组能连到的生成器类型；重排组之后这些节点要跟着右移，别被组压住
+GENERATOR_TYPES = {"video", "generator", "msgen", "comfy", "ltxDirector", "rh", "realesrgan", "llm"}
 
 
 def call(method, path, body=None, timeout=60):
@@ -138,6 +140,22 @@ def do_relayout(args, tpl):
         call("PATCH", P + "/nodes/" + p["id"],
              {"fields": {"x": p["x"], "y": p["y"], "w": p["w"], "h": p["h"]}})
     call("PATCH", P + "/nodes/" + group["id"], {"fields": box})
+
+    # 组变宽之后，连出去的生成器节点必须跟着右移，否则会被组里的提示词压住。
+    # 只排组内成员是不够的——这一步漏了，板子看着就是「节点没搞好」。
+    moved = []
+    right = box["x"] + box["w"]
+    for conn in body.get("connections") or []:
+        if str(conn.get("from")) != group["id"]:
+            continue
+        target = by_id.get(str(conn.get("to")))
+        if not target or target.get("type") not in GENERATOR_TYPES:
+            continue
+        nx = right + VIDEO_DX
+        ny = box["y"] + tpl["pad"][1]
+        if abs(float(target.get("x") or 0) - nx) > 1 or abs(float(target.get("y") or 0) - ny) > 1:
+            call("PATCH", P + "/nodes/" + target["id"], {"fields": {"x": nx, "y": ny}})
+            moved.append((target["type"], nx, ny))
     ms = (time.perf_counter() - t) * 1000
 
     print("组 %s 已排齐，%d 个成员，%.0f ms" % (args.relayout[:14], len(placed), ms))
@@ -145,6 +163,8 @@ def do_relayout(args, tpl):
         print("  %-7s (%.0f, %.0f) %dx%d" % (p["type"], p["x"], p["y"], p["w"], p["h"]))
     print("组框 (%.0f, %.0f) %.0fx%.0f  间距 %d  边距 左%d 上%d 右%d 下%d"
           % (box["x"], box["y"], box["w"], box["h"], tpl["gap"], *tpl["pad"]))
+    for kind, nx, ny in moved:
+        print("  跟着右移 %-7s -> (%.0f, %.0f)" % (kind, nx, ny))
     return 0
 
 
