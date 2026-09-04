@@ -16714,7 +16714,36 @@ function failCanvasImageTask(taskId, message, taskData={}){
     refreshRunNodes(gen, out);
     scheduleSave();
 }
+// 点「生成」的瞬间页面先建一个本地占位，等服务器返回再把真 task_id 贴上去。
+// 如果这中间页面刷新了（或者响应丢了），占位就成了孤儿：没有任务号，谁都没法
+// 把结果匹配给它、也没法轮询它，于是永远转圈，还挡着「再跑一次」提示重复计费。
+// 实测画布上攒了 6 个这样的壳，最久的转了 3 天多。
+// 超过这个时间还没拿到任务号的，一律当死壳清掉——提交再慢也不会慢过 10 分钟。
+const ORPHAN_PENDING_MAX_MS = 10 * 60 * 1000;
+function sweepOrphanPendings(){
+    let removed = 0;
+    nodes.filter(n => n.type === 'output').forEach(out => {
+        const list = out._pending || [];
+        if(!list.length) return;
+        const kept = list.filter(p => {
+            if(serverTaskIdOf(p) || p?.canvasTaskId) return true;      // 有任务号，正常在跑
+            const started = Number(p?.startedAt || 0);
+            if(!started || Date.now() - started < ORPHAN_PENDING_MAX_MS) return true;
+            removed += 1;
+            return false;
+        });
+        if(kept.length !== list.length) out._pending = kept;
+    });
+    if(removed){
+        console.warn('[canvas] 清掉 ' + removed + ' 个没有任务号的空壳任务');
+        refreshRunNodes();
+        scheduleSave();
+    }
+    return removed;
+}
+
 function resumeCanvasImageTasks(){
+    sweepOrphanPendings();
     let changed = false;
     nodes.filter(n => n.type === 'output').forEach(out => {
         const originalPending = out._pending || [];
