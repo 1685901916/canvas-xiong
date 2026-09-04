@@ -186,6 +186,43 @@ def do_fix_generators(args, tpl):
     return 0
 
 
+def rewire_feed(P, body, group, video_id, mode, call_fn):
+    """决定「谁真正喂给生成器」。
+
+    画布没有「在组里但不喂给模型」这个开关：组里有什么，生成器就收什么。
+    想让三张图都摆在组里、却只拿第一张当参考，只能绕开组直接接线：
+
+      group  组 → 生成器（默认。组里所有图都是参考）
+      first  首帧图 → 生成器、提示词 → 生成器（组只负责好看，不参与喂图）
+
+    注意：把组里的成员拖进拖出会触发前端的「连线交接」，把直连收回成组 → 生成器。
+    真拖过就再跑一次 --feed first 修回来。
+    """
+    by_id = {str(n.get("id")): n for n in body.get("nodes") or []}
+    gid = str(group.get("id"))
+    members = [by_id[m] for m in (group.get("items") or []) if m in by_id]
+    images = sorted([m for m in members if m.get("type") == "image"],
+                    key=lambda m: float(m.get("x") or 0))
+    prompts = [m for m in members if m.get("type") == "prompt"]
+
+    want = ([images[0]["id"]] if images else []) + [p["id"] for p in prompts]         if mode == "first" else [gid]
+    have = [str(c.get("from")) for c in body.get("connections") or []
+            if str(c.get("to")) == video_id]
+    if sorted(have) == sorted(want):
+        return []
+
+    changed = []
+    for c in body.get("connections") or []:
+        if str(c.get("to")) == video_id and str(c.get("from")) not in want:
+            call_fn("DELETE", P + "/connections/" + c["id"])
+            changed.append("断开 " + str(c.get("from"))[:14])
+    for src in want:
+        if src not in have:
+            call_fn("POST", P + "/connections", {"from": src, "to": video_id})
+            changed.append("接上 " + src[:14])
+    return changed
+
+
 def do_relayout(args, tpl):
     """把一个已有的组重新排齐：成员排成一行、尺寸归位、组框重新贴合。"""
     P = "/api/canvases/%s" % args.canvas
@@ -210,10 +247,29 @@ def do_relayout(args, tpl):
              {"fields": {"x": p["x"], "y": p["y"], "w": p["w"], "h": p["h"]}})
     call("PATCH", P + "/nodes/" + group["id"], {"fields": box})
 
+    # 顺序很重要：先改接线，再摆生成器。反过来的话，改接线新建的那条连接没人管，
+    # 生成器就留在原地压着组——用户看到的又是「节点没搞好」。
+    rewired = []
+    if args.feed:
+        fresh = call("GET", P + "?logs=0")
+        fresh = fresh.get("canvas") or fresh
+        g2 = next((n for n in fresh.get("nodes") or [] if n.get("id") == group["id"]), group)
+        by = {str(n.get("id")): n for n in fresh.get("nodes") or []}
+        for c in fresh.get("connections") or []:
+            src = str(c.get("from"))
+            tgt = by.get(str(c.get("to")))
+            if tgt and tgt.get("type") in GENERATOR_TYPES and (
+                    src == group["id"] or src in (g2.get("items") or [])):
+                rewired = rewire_feed(P, fresh, g2, tgt["id"], args.feed, call)
+                break
+
     # 组变宽之后，连出去的生成器节点必须跟着右移，否则会被组里的提示词压住。
     # 只排组内成员是不够的——这一步漏了，板子看着就是「节点没搞好」。
+    # 用改完接线的最新状态去摆，别用进函数时那份旧快照。
+    latest = call("GET", P + "?logs=0")
+    latest = latest.get("canvas") or latest
     moved = [(k, x, y) for _, k, x, y in
-             move_generators_clear(P, body, {**group, **box}, tpl, call)]
+             move_generators_clear(P, latest, {**group, **box}, tpl, call)]
     ms = (time.perf_counter() - t) * 1000
 
     print("组 %s 已排齐，%d 个成员，%.0f ms" % (args.relayout[:14], len(placed), ms))
@@ -223,6 +279,8 @@ def do_relayout(args, tpl):
           % (box["x"], box["y"], box["w"], box["h"], tpl["gap"], *tpl["pad"]))
     for kind, nx, ny in moved:
         print("  跟着右移 %-7s -> (%.0f, %.0f)" % (kind, nx, ny))
+    for line in rewired:
+        print("  重接 " + line)
     return 0
 
 
@@ -276,6 +334,10 @@ def main():
     p.add_argument("--fix-generators", action="store_true",
                    help="全画布扫一遍，把被组框压住的生成器节点挪出来。只动生成器，"
                         "不碰组里成员，手动排过的组也能安全跑")
+    p.add_argument("--feed", choices=["group", "first"],
+                   help="谁真正喂给生成器。group=组里所有图都当参考（默认接法）；"
+                        "first=只有首帧图和提示词直连生成器，组里其余图只是摆着好看。"
+                        "建板时生效，也可以配 --relayout 修一块已有的板")
     p.add_argument("--relayout", metavar="组id",
                    help="把已有的组重新排齐：成员排成一行、尺寸按 --size 归位、"
                         "组框重新贴合。手动删过或拖乱过节点之后用这个收拾")
@@ -358,6 +420,7 @@ def main():
     })["node"]
 
     group = timed("POST", P + "/groups", {"items": members})["node"]
+    feed_mode = args.feed or "group"
     # 服务端按前端的紧凑边距算框（左 24 上 58 下 32），成员一放大就贴边了；
     # 这里按模板的边距重新框一次，看起来才和手动框选出来的 G5/G6 一致。
     if members:
@@ -367,7 +430,12 @@ def main():
             "x": x0 - pad_l, "y": y0 - pad_t,
             "w": (x2 - x0) + pad_l + pad_r, "h": (y2 - y0) + pad_t + pad_b,
         }})
-    timed("POST", P + "/connections", {"from": group["id"], "to": video["id"]})
+    if feed_mode == "first":
+        # 组只负责好看：首帧图和提示词直连生成器，组里其余图不参与喂图
+        for src in ([image_ids[0]] if image_ids else []) + ([members[-1]] if prompt_text else []):
+            timed("POST", P + "/connections", {"from": src, "to": video["id"]})
+    else:
+        timed("POST", P + "/connections", {"from": group["id"], "to": video["id"]})
 
     total = (time.perf_counter() - t0) * 1000
     for m, tail, ms in calls:

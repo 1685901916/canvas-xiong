@@ -88,3 +88,22 @@ def test_duplicate_connections_do_not_move_a_node_twice():
 
     src = inspect.getsource(board.move_generators_clear)
     assert "seen" in src, "同一对节点可能有重复连线，不能重复挪"
+
+
+def test_rewire_happens_before_generators_are_placed():
+    """先改接线、再摆生成器。反过来的话，改接线新建的那条连接没人管，
+    生成器留在原地压着组——用户连着两轮看到的都是「节点没搞好」。"""
+    import inspect
+
+    src = inspect.getsource(board.do_relayout)
+    assert src.index("rewire_feed(") < src.index("move_generators_clear("), "接线要排在摆位置之前"
+    assert "latest = call(\"GET\"" in src, "摆位置要用改完接线的最新状态，不是进函数时那份快照"
+
+
+def test_feed_first_keeps_the_group_visual_but_feeds_one_image():
+    import inspect
+
+    src = inspect.getsource(board.rewire_feed)
+    assert 'mode == "first"' in src
+    assert "images[0]" in src, "first 模式只喂第一张图"
+    assert "prompts" in src, "提示词也要直连，否则生成器收不到文案"
