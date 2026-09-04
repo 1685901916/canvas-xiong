@@ -117,6 +117,75 @@ def row_layout(members, tpl, origin=None):
     return placed, box
 
 
+def move_generators_clear(P, body, group, tpl, call_fn):
+    """把组连出去的生成器节点挪到组框右边，不动组里的成员。
+
+    组一变宽或成员一改尺寸，生成器就会被压在下面。这一步是安全的：只动生成器，
+    手动排过的组也能用。
+    """
+    by_id = {str(n.get("id")): n for n in body.get("nodes") or []}
+    right = float(group.get("x") or 0) + float(group.get("w") or 0)
+    gid = str(group.get("id"))
+    seen = set()
+    targets = []
+    for conn in body.get("connections") or []:
+        if str(conn.get("from")) != gid:
+            continue
+        target = by_id.get(str(conn.get("to")))
+        if not target or target.get("type") not in GENERATOR_TYPES:
+            continue
+        if target["id"] in seen:      # 同一对节点可能有重复连线
+            continue
+        seen.add(target["id"])
+        targets.append(target)
+
+    def place(node, nx, ny):
+        if abs(float(node.get("x") or 0) - nx) > 1 or abs(float(node.get("y") or 0) - ny) > 1:
+            call_fn("PATCH", P + "/nodes/" + node["id"], {"fields": {"x": nx, "y": ny}})
+            return [(gid[:14], node.get("type"), nx, ny)]
+        return []
+
+    moved = []
+    row_y = float(group.get("y") or 0) + tpl["pad"][1]
+    cursor_x = right + VIDEO_DX
+    for target in targets:
+        # 一个组接了好几个生成器时向右并排，不向下叠：往下长会伸进下面那块板子，
+        # 而且两个输出节点比生成器高，叠出来必然互相压。
+        moved += place(target, cursor_x, row_y)
+        cursor_x += float(target.get("w") or 400) + VIDEO_DX
+        # 链条是「组 → 生成器 → 输出」。只挪生成器的话它会压到自己的输出节点上，
+        # 所以下游也要跟着往右走一格。
+        outs = []
+        for c in body.get("connections") or []:
+            if str(c.get("from")) != target["id"]:
+                continue
+            out = by_id.get(str(c.get("to")))
+            if out and out.get("type") == "output" and out["id"] not in {o["id"] for o in outs}:
+                outs.append(out)
+        for out in outs:
+            moved += place(out, cursor_x, row_y)
+            cursor_x += float(out.get("w") or 460) + VIDEO_DX
+    return moved
+
+
+def do_fix_generators(args, tpl):
+    """全画布扫一遍：所有被组框压住的生成器节点挪出来。"""
+    P = "/api/canvases/%s" % args.canvas
+    body = call("GET", P + "?logs=0")
+    body = body.get("canvas") or body
+    t = time.perf_counter()
+    moved = []
+    for group in [n for n in body.get("nodes") or [] if n.get("type") == "group"]:
+        moved += move_generators_clear(P, body, group, tpl, call)
+    ms = (time.perf_counter() - t) * 1000
+    if not moved:
+        print("没有需要挪的生成器节点")
+    for gid, kind, nx, ny in moved:
+        print("  %s 的 %-7s -> (%.0f, %.0f)" % (gid, kind, nx, ny))
+    print("%d 个生成器节点挪出组框，%.0f ms" % (len(moved), ms))
+    return 0
+
+
 def do_relayout(args, tpl):
     """把一个已有的组重新排齐：成员排成一行、尺寸归位、组框重新贴合。"""
     P = "/api/canvases/%s" % args.canvas
@@ -143,19 +212,8 @@ def do_relayout(args, tpl):
 
     # 组变宽之后，连出去的生成器节点必须跟着右移，否则会被组里的提示词压住。
     # 只排组内成员是不够的——这一步漏了，板子看着就是「节点没搞好」。
-    moved = []
-    right = box["x"] + box["w"]
-    for conn in body.get("connections") or []:
-        if str(conn.get("from")) != group["id"]:
-            continue
-        target = by_id.get(str(conn.get("to")))
-        if not target or target.get("type") not in GENERATOR_TYPES:
-            continue
-        nx = right + VIDEO_DX
-        ny = box["y"] + tpl["pad"][1]
-        if abs(float(target.get("x") or 0) - nx) > 1 or abs(float(target.get("y") or 0) - ny) > 1:
-            call("PATCH", P + "/nodes/" + target["id"], {"fields": {"x": nx, "y": ny}})
-            moved.append((target["type"], nx, ny))
+    moved = [(k, x, y) for _, k, x, y in
+             move_generators_clear(P, body, {**group, **box}, tpl, call)]
     ms = (time.perf_counter() - t) * 1000
 
     print("组 %s 已排齐，%d 个成员，%.0f ms" % (args.relayout[:14], len(placed), ms))
@@ -215,10 +273,16 @@ def main():
                    help="big=照画布上 G5/G6 量的大板子（默认）；small=节点默认尺寸")
     p.add_argument("--set-prompt", metavar="节点id",
                    help="只替换某个提示词节点的正文，不建新板；配 --prompt-file 用")
+    p.add_argument("--fix-generators", action="store_true",
+                   help="全画布扫一遍，把被组框压住的生成器节点挪出来。只动生成器，"
+                        "不碰组里成员，手动排过的组也能安全跑")
     p.add_argument("--relayout", metavar="组id",
                    help="把已有的组重新排齐：成员排成一行、尺寸按 --size 归位、"
                         "组框重新贴合。手动删过或拖乱过节点之后用这个收拾")
     args = p.parse_args()
+
+    if args.fix_generators:
+        return do_fix_generators(args, SIZES[args.size])
 
     if args.relayout:
         return do_relayout(args, SIZES[args.size])

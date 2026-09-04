@@ -70,3 +70,21 @@ def test_origin_can_be_pinned():
 
 def test_empty_group_is_a_no_op():
     assert board.row_layout([], TPL) == ([], None)
+
+
+def test_multiple_generators_go_side_by_side_not_stacked():
+    """一个组接多个生成器时向右并排。向下叠会伸进下面那块板子，
+    而且输出节点比生成器高，叠出来必然互相压。"""
+    import inspect
+
+    src = inspect.getsource(board.move_generators_clear)
+    assert "cursor_x" in src, "按 x 递进，不是按 y"
+    assert "row_y" in src and "stack_y" not in src, "同一行放，不往下堆"
+    assert 'out.get("type") == "output"' in src, "输出节点也要跟着往右挪"
+
+
+def test_duplicate_connections_do_not_move_a_node_twice():
+    import inspect
+
+    src = inspect.getsource(board.move_generators_clear)
+    assert "seen" in src, "同一对节点可能有重复连线，不能重复挪"
