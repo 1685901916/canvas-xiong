@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
-const canvas = fs.readFileSync(path.join(root, 'static', 'js', 'canvas.js'), 'utf8');
+const canvas = fs.readFileSync(path.join(root, 'static', 'js', 'canvas.js'), 'utf8').replace(/\r\n/g, '\n');
 
 /* 生成中也要能再跑一次：原来按钮 disabled + 两道硬拦截，用户只能干等。
    现在改成"可点 + 明确确认"，既不会误触重复计费，也不把人锁死。 */
