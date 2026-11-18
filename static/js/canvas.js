@@ -370,6 +370,11 @@ let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
 let minimapViewportQueued = false;
+// 视口裁剪：只让视野附近（四周各多留 1 屏）的节点参与浏览器的样式/布局/绘制。
+// 节点多时（几百个、上万 DOM 元素）每帧都要处理全部节点是卡顿主因；隐藏远处节点后平移/拖动可到满帧。
+const CULL_MARGIN_SCREENS = 1;
+const nodeSizeCache = new Map();   // 节点最后一次可见时量到的尺寸，隐藏期间给连线/小地图兜底
+let cullFrame = 0;
 let viewportDragFrame = 0;
 let pendingBoardPanEvent = null;
 let pendingMinimapDragEvent = null;
@@ -1560,6 +1565,84 @@ function screenToWorld(clientX, clientY){
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
     scheduleMinimapViewportUpdate();
+    scheduleCulling();
+}
+let lastCullView = null;
+let pendingRevealIds = new Set();
+let revealFlushTimer = 0;
+function scheduleCulling(){
+    if(cullFrame) return;
+    cullFrame = requestAnimationFrame(() => {
+        cullFrame = 0;
+        // 平移中视野只挪了一点点（不到余量的 1/4）就不重算，余量足够覆盖
+        const vr = currentWorldViewRect();
+        if(lastCullView && Math.abs(vr.w - lastCullView.w) < 1 && Math.abs(vr.h - lastCullView.h) < 1
+            && Math.abs(vr.x - lastCullView.x) < vr.w * CULL_MARGIN_SCREENS / 4
+            && Math.abs(vr.y - lastCullView.y) < vr.h * CULL_MARGIN_SCREENS / 4) return;
+        applyCulling();
+    });
+}
+function flushRevealedLinks(){
+    revealFlushTimer = 0;
+    if(dragBoard || dragNode){ revealFlushTimer = setTimeout(flushRevealedLinks, 120); return; }
+    const ids = [...pendingRevealIds];
+    pendingRevealIds.clear();
+    if(ids.length) renderLinksForNodes(ids);
+}
+function nodeIsCulled(el){
+    return Boolean(el && el.classList.contains('is-culled'));
+}
+function cachedNodeSize(node, el){
+    if(el && !nodeIsCulled(el) && el.offsetWidth) return {w:el.offsetWidth, h:el.offsetHeight};
+    const hit = nodeSizeCache.get(node.id);
+    if(hit) return hit;
+    const d = defaultNodeSize(node.type) || {};
+    return {w:node.w || d.w || 260, h:node.h || d.h || 160};
+}
+function applyCulling(){
+    if(!nodesEl || !board) return;
+    const vr = currentWorldViewRect();
+    lastCullView = vr;
+    const mx = vr.w * CULL_MARGIN_SCREENS, my = vr.h * CULL_MARGIN_SCREENS;
+    const L = vr.x - mx, T = vr.y - my, R = vr.x + vr.w + mx, B = vr.y + vr.h + my;
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const pinned = new Set(selected);
+    if(dragNode){
+        pinned.add(dragNode.node?.id);
+        (dragNode.children || []).forEach(c => pinned.add(c.node?.id));
+    }
+    if(resizeNode?.node?.id) pinned.add(resizeNode.node.id);
+    const active = document.activeElement;
+    const els = [...nodesEl.children].filter(el => el.classList?.contains('node'));
+    // 第一遍只读：记下可见节点尺寸，算出每个节点该不该显示
+    const plan = els.map(el => {
+        const id = el.dataset.id;
+        const n = byId.get(id);
+        if(!n) return null;
+        const culled = nodeIsCulled(el);
+        if(!culled && el.offsetWidth) nodeSizeCache.set(id, {w:el.offsetWidth, h:el.offsetHeight});
+        const sz = nodeSizeCache.get(id) || cachedNodeSize(n, null);
+        const x = Number(n.x) || 0, y = Number(n.y) || 0;
+        const near = x + sz.w > L && x < R && y + sz.h > T && y < B;
+        const keep = near || pinned.has(id) || (active && el.contains(active));
+        return {el, id, culled, keep};
+    }).filter(Boolean);
+    // 第二遍只写：切换隐藏标记
+    const revealed = [];
+    plan.forEach(p => {
+        if(p.keep && p.culled){ p.el.classList.remove('is-culled'); revealed.push(p.id); }
+        else if(!p.keep && !p.culled){ p.el.classList.add('is-culled'); }
+    });
+    // 重新出现的节点：连线端点从「估算位置」换回真实端口位置。
+    // 拖动/平移中先不量（避免逐条 getBoundingClientRect 引起卡顿），停下来后统一对准。
+    if(revealed.length){
+        if(dragBoard || dragNode){
+            revealed.forEach(id => pendingRevealIds.add(id));
+            if(!revealFlushTimer) revealFlushTimer = setTimeout(flushRevealedLinks, 120);
+        } else {
+            renderLinksForNodes(revealed);
+        }
+    }
 }
 // 平移/缩放只改视野框：节点多时整张小地图重建一次要几十毫秒，每帧重建会让平移明显卡顿。
 // 视野跑出小地图当前范围、或还没画过时才整张重画；节点增删/移动仍走 scheduleMinimapRender。
@@ -1578,9 +1661,7 @@ function scheduleMinimapViewportUpdate(){
 }
 function estimatedNodeRect(n){
     const el = nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(n.id)}"]`);
-    const size = defaultNodeSize(n.type);
-    const w = el?.offsetWidth || n.w || size.w || 260;
-    const h = el?.offsetHeight || n.h || size.h || 160;
+    const {w, h} = cachedNodeSize(n, el);
     return {x:n.x || 0, y:n.y || 0, w, h};
 }
 function currentWorldViewRect(){
@@ -8041,6 +8122,8 @@ function render(){
     });
     restoreMediaPlaybackStates(mediaStates);
     restoreOutputScrolls(outputScrolls);
+    // 新建的节点 DOM 默认全可见：同步裁剪一次，避免下一帧把几百个节点全部排版绘制
+    applyCulling();
     refreshGeometryAfterLayout();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
@@ -17889,7 +17972,8 @@ function nodeBounds(ids){
         const n = nodes.find(item => item.id === id);
         const el = nodesEl.querySelector(`.node[data-id="${id}"]`);
         if(!n) return null;
-        return {x:n.x, y:n.y, w:el?.offsetWidth || n.w || 260, h:el?.offsetHeight || n.h || 220};
+        const sz = cachedNodeSize(n, el);   // 被视口裁剪隐藏时 offsetWidth 为 0，用最后量到的尺寸
+        return {x:n.x, y:n.y, w:sz.w || 260, h:sz.h || 220};
     }).filter(Boolean);
     const x1 = Math.min(...rects.map(r => r.x));
     const y1 = Math.min(...rects.map(r => r.y));
@@ -18604,8 +18688,9 @@ function endDrag(event=null){
 }
 function nodeRect(n){
     const el = nodesEl.querySelector(`.node[data-id="${n.id}"]`);
-    const w = el?.offsetWidth || n.w || 260;
-    const h = el?.offsetHeight || n.h || 200;
+    const sz = cachedNodeSize(n, el);   // 被视口裁剪隐藏时用最后量到的尺寸，避免组框按默认尺寸误贴
+    const w = sz.w || 260;
+    const h = sz.h || 200;
     return {x:n.x, y:n.y, w, h, cx:n.x + w/2, cy:n.y + h/2};
 }
 // 组框只在建组那一刻算过一次包围盒，之后成员被拖动、被改大小、被删掉，框都不会跟着动，
@@ -18831,14 +18916,15 @@ function portPoint(id, kind){
     const n = nodes.find(x => x.id === id);
     if(!n) return {x:0,y:0};  // 真正的孤儿连线（节点已删除）：renderLinks 会跳过它
     const el = nodesEl.querySelector(`.node[data-id="${CSS.escape(id)}"]`);
-    const port = el?.querySelector(`.port.${kind}`);
+    const port = nodeIsCulled(el) ? null : el?.querySelector(`.port.${kind}`);
     if(port){
         const r = port.getBoundingClientRect();
         return screenToWorld(r.left + r.width / 2, r.top + r.height / 2);
     }
-    // 没有 DOM（节点渲染失败被跳过）或没找到端口时，用节点存储的几何坐标兜底，
+    // 没有 DOM（节点渲染失败被跳过）、节点被视口裁剪隐藏、或没找到端口时，用节点几何坐标兜底，
     // 让连线仍画在节点附近，而不是落到 (0,0) 或干脆消失。
-    const w = (el?.offsetWidth) || n.w || 260, h = (el?.offsetHeight) || n.h || 160;
+    const sz = cachedNodeSize(n, el);
+    const w = sz.w, h = sz.h;
     const nx = Number(n.x) || 0, ny = Number(n.y) || 0;
     return kind === 'out' ? {x:nx + w, y:ny + h / 2} : {x:nx, y:ny + h / 2};
 }

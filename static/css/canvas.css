@@ -203,6 +203,8 @@ body.canvas-board-pan * { cursor:grabbing !important; user-select:none !importan
 /* 拖动画布期间把整个 world 提升成独立合成层：平移只移动这张图层，不再每帧重绘几百个节点和图片。
    只在拖动时开启，平时不常驻，避免缩放后文字按旧倍率栅格化发糊。 */
 body.canvas-board-pan .world { will-change:transform; }
+/* 视口裁剪：远离视野的节点不参与样式/布局/绘制（canvas.js applyCulling） */
+.node.is-culled { display:none !important; }
 .world { position:absolute; left:0; top:0; width:6000px; height:4000px; transform-origin:0 0; }
 .links { position:absolute; inset:0; width:6000px; height:4000px; overflow:visible; pointer-events:none; z-index:1; }
 .link { stroke:var(--faint); stroke-width:2.5; fill:none; opacity:.82; pointer-events:none; }
