@@ -380,6 +380,8 @@
     }
 
     host.addEventListener('pointerdown', event => {
+        // 图层行里的按钮（显示/隐藏、锁定、上移、下移）交给 click 处理；这里先重画会把按钮换掉，click 就丢了
+        if(event.target.closest('[data-fc-layer-action]')) return;
         const handle = event.target.closest('[data-fc-handle]');
         if(handle){ startHandle(event, handle.dataset.fcHandle); return; }
         const layerEl = event.target.closest('.fc-layer');

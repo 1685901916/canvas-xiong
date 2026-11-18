@@ -579,6 +579,7 @@ const DEFAULT_VIDEO_MODELS = [
     // Sora
     'sora-2', 'sora-2-pro',
     // 通义万相
+    'wan3.0-video', 'wan3.0-video-prime',
     'wan2.6-t2v', 'wan2.6-i2v',
     'wan2.5-t2v-preview', 'wan2.5-i2v-preview',
     'wan2.2-t2v-plus', 'wan2.2-i2v-plus', 'wan2.2-i2v-flash',
@@ -842,9 +843,12 @@ async function refreshGeminiCliAccountModels(){
 const GENERATOR_COUNT_MAX = 8;
 const FORCE_FILL_COUNT_MAX = 999;
 function generatorForceFillEnabled(node){
+    if(isNovelAIImageModel(node?.model)) return false;
+    if(window.SeedreamPro?.enabled(node)) return false;
     return Boolean(node?.forceFill);
 }
 function generatorCountLimit(node){
+    if(window.SeedreamPro?.enabled(node) && node.seedreamOptions?.layer_decomposition) return 1;
     return generatorForceFillEnabled(node) ? FORCE_FILL_COUNT_MAX : GENERATOR_COUNT_MAX;
 }
 function normalizeGeneratorCount(node, value){
@@ -1054,6 +1058,8 @@ function autodlWorkflowOptions(node){
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
+    // 老节点没有这个字段时按「生成音频」处理；用户明确点掉过的 false 原样保留。
+    if(node.generateAudio === undefined || node.generateAudio === null) node.generateAudio = true;
     // 平台列表还没从后端回来时（apiProviders 为空）不碰节点。
     if(!apiProviders.length) return;
     // 节点已经指定了平台、但当前列表里找不到它时：原样保留，绝不改写。
@@ -1156,6 +1162,17 @@ function isGptImageAutoSizeModel(model){
 }
 function defaultApiImageResolution(model){
     return isGptImageAutoSizeModel(resolveImageModel(model)) ? '4k' : '1k';
+}
+function isNovelAIImageModel(model){
+    return ['nai-diffusion-5-full', 'nai-diffusion-5-curated'].includes(String(model || ''));
+}
+function novelaiImageSize(ratio, resolution, customRatio='', customSize=''){
+    if(resolution === 'custom') return customSize;
+    const dimensions = parseSizePair(apiImageSize(ratio, '1k', customRatio, customSize));
+    const factor = Math.min(1, Math.sqrt(1048576 / (dimensions.width * dimensions.height)));
+    const width = Math.max(64, Math.floor(dimensions.width * factor / 64) * 64);
+    const height = Math.max(64, Math.floor(dimensions.height * factor / 64) * 64);
+    return `${width}x${height}`;
 }
 function normalizedImageQuality(value){
     const quality = String(value || 'auto').trim().toLowerCase();
@@ -1367,6 +1384,7 @@ function exceedsFourKStandard(width, height){
 }
 function normalizeApiNodeSizeChoice(node){
     if(!node) return;
+    if(isNovelAIImageModel(node.model) && !['1k','custom'].includes(node.resolution)) node.resolution = '1k';
     const allowAuto = isGptImageAutoSizeModel(resolveImageModel(node.model));
     if(allowAuto && node._apiResolutionUserSet !== true && (!node.resolution || node.resolution === '1k' || node.resolution === 'auto')) node.resolution = defaultApiImageResolution(node.model);
     else if(!node.resolution) node.resolution = defaultApiImageResolution(node.model);
@@ -1388,6 +1406,7 @@ async function generatorSizeForRun(gen, refs){
     const ratio = (gen.ratio === 'source' && !gen.customRatio)
         ? 'square'
         : (gen.ratio ?? 'square');
+    if(isNovelAIImageModel(gen.model)) return novelaiImageSize(ratio, gen.resolution, gen.customRatio || '', gen.customSize || '');
     return apiImageSize(ratio, gen.resolution || defaultApiImageResolution(gen.model), gen.customRatio || '', gen.customSize || '');
 }
 function normalizeApiNodeLayout(node){
@@ -3994,7 +4013,9 @@ function addVideoNode(point){
         enableUpsample:false,
         watermark:false,
         cameraFixed:false,
-        generateAudio:false,
+        // 默认开「生成音频」：用户点掉才关。百炼(wan3.0)平台默认就是带声音的，
+        // 这里若默认 false 会把 audio=false 明确发过去，产物连音轨都没有。
+        generateAudio:true,
         useFrameRoles:false,
         // 默认开「全能参考」：不开的话多张图只有第一张会被当首帧提交，其余静默丢弃。
         // 画布上挂多张参考图是常态，默认按参考图走更符合预期。
@@ -5412,13 +5433,67 @@ async function uploadImages(files, point){
 async function uploadImageGroup(files, point){
     return uploadMediaFiles(files, point, false, {group:true});
 }
-function createImageCardFromUrl(url, point, name='image'){
+// ── 图片节点备注 ──────────────────────────────────────────────────────────────
+// node.note         用户手写的备注，画布上直接改；读画布就能看到这张素材是干嘛的
+// node.sourcePrompt 生成这张图/这段视频用的提示词，拖到画布时自动带上，只读展示
+function sourcePromptForUrl(url){
+    if(!url) return '';
+    for(const n of nodes){
+        if(n?.type !== 'output') continue;
+        const item = (n.images || []).find(x => outputUrlValue(x) === url);
+        const prompt = item && typeof item === 'object' ? (item.run?.prompt || '') : '';
+        if(prompt) return String(prompt);
+    }
+    return '';
+}
+function imageNoteText(zh, en){ return langIsEn() ? en : zh; }
+function buildImageNoteBox(node){
+    const box = document.createElement('div');
+    box.className = 'image-note-box';
+    const prompt = String(node.sourcePrompt || '');
+    const promptHtml = prompt
+        ? `<div class="image-note-prompt"><button type="button" class="image-note-prompt-toggle"><i data-lucide="file-text" class="w-3 h-3"></i><span>${escapeHtml(imageNoteText('生成提示词', 'Prompt'))} · ${prompt.length}</span><i data-lucide="chevron-right" class="w-3 h-3 chev"></i></button><div class="image-note-prompt-text">${escapeHtml(prompt)}</div></div>`
+        : '';
+    box.innerHTML = `<textarea class="image-note-input" rows="1" placeholder="${escapeAttr(imageNoteText('添加备注…', 'Add a note…'))}">${escapeHtml(node.note || '')}</textarea>${promptHtml}`;
+    const input = box.querySelector('.image-note-input');
+    const grow = () => {
+        input.style.height = 'auto';
+        input.style.height = Math.min(Math.max(input.scrollHeight, 32), 120) + 'px';
+    };
+    // 和提示词节点一样：textarea 自己吞掉 mousedown，免得点进去变成拖节点
+    bindScrollableText(input);
+    input.oninput = () => {
+        // 复用提示词的「本地正在编辑」保护：远端同步回来时不覆盖手里没存完的字
+        markPromptEditing(node.id);
+        node.note = input.value;
+        grow();
+        scheduleSave();
+    };
+    requestAnimationFrame(grow);
+    const toggle = box.querySelector('.image-note-prompt-toggle');
+    if(toggle){
+        toggle.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            toggle.closest('.image-note-prompt').classList.toggle('open');
+        };
+        bindScrollableText(box.querySelector('.image-note-prompt-text'));
+    }
+    return box;
+}
+function createImageCardFromUrl(url, point, name='image', extra=null){
     if(!ensureCanvas() || !url) return;
     const p = point || defaultPoint(0, 0);
     const mediaKind = isVideoUrl(url) ? 'video' : isAudioUrl(url) ? 'audio' : 'image';
-    nodes.push({id:uid('img'), type:'image', x:p.x, y:p.y, url, name:name || outputImageName(url), mediaKind});
+    // 从生成结果拖过来的素材：把当时那条提示词一起带上，之后还认得出它是怎么来的
+    const sourcePrompt = sourcePromptForUrl(url);
+    const node = {id:uid('img'), type:'image', x:p.x, y:p.y, url, name:name || outputImageName(url), mediaKind};
+    if(sourcePrompt) node.sourcePrompt = sourcePrompt;
+    Object.assign(node, extra || {});
+    nodes.push(node);
     render();
     scheduleSave();
+    return node;
 }
 async function createImageCardsFromLocalPaths(paths, point){
     if(!ensureCanvas()) return [];
@@ -8163,7 +8238,7 @@ function restoreOutputScrolls(state){
     });
 }
 function isNodeControl(target){
-    return !!target.closest('textarea, input, select, option, button, audio, video, [contenteditable="true"], .seg, .gen-btn, .comfy-run, .input-item, .blank-image, .mode-tabs, .ms-model-tabs, .llm-provider, .llm-output, .llm-chat-log, .llm-bubble, .llm-pane-resizer, .loop-preview, .ltx-director-timeline-host, .pr-wrapper, .pr-toolbar, .pr-viewport, .pr-canvas, .pr-player-controls, .pr-prompt-area');
+    return !!target.closest('.image-note-box, textarea, input, select, option, button, audio, video, [contenteditable="true"], .seg, .gen-btn, .comfy-run, .input-item, .blank-image, .mode-tabs, .ms-model-tabs, .llm-provider, .llm-output, .llm-chat-log, .llm-bubble, .llm-pane-resizer, .loop-preview, .ltx-director-timeline-host, .pr-wrapper, .pr-toolbar, .pr-viewport, .pr-canvas, .pr-player-controls, .pr-prompt-area');
 }
 function destroyLTXEditor(node){
     if(!node?._ltxEditor) return;
@@ -8231,6 +8306,8 @@ function renderNode(node){
             const videoCaptureBtn = body.querySelector('.canvas-video-capture');
             const openPreview = e => {
                 if(!node.url || missing) return;
+                // 备注框里双击是选词，不是「打开大图」
+                if(e.target?.closest?.('.image-note-box')) return;
                 e.preventDefault();
                 e.stopPropagation();
                 e.stopImmediatePropagation();
@@ -8289,6 +8366,7 @@ function renderNode(node){
                 }, true);
             }
             if(videoCaptureBtn && mediaKind === 'video') bindVideoFrameCaptureControls(body, node, videoCaptureBtn);
+            body.appendChild(buildImageNoteBox(node));
             body.addEventListener('dblclick', openPreview, true);
             if(loadedImg && loadedImg.complete && loadedImg.naturalHeight > 0){
                 scheduleGeometryRefresh([node.id]);
@@ -10681,6 +10759,7 @@ function renderGeneratorBody(node){
                 <select class="select-lite gemini-cli-account-select" style="flex:1;min-width:0">${accountModelOptions(node.accountModel, node.apiProvider)}</select>
             </div>
             <div class="gemini-cli-engine-note" style="${geminiCliEnabled ? '' : 'display:none'};margin:-2px 2px 4px;color:var(--muted);font-size:10.5px;line-height:1.4">出图工具：Nano Banana 2（Google 账号原生 generate_image）</div>
+            ${isNovelAIImageModel(node.model) ? '<div style="margin:2px;color:var(--muted);font-size:11px">NovelAI V5 文字生图 · 标准尺寸 ≤1MP，按 64 像素对齐 · 23 步 / 引导 7 · 消耗 Anlas；参考图暂未接入。</div>' : ''}
             <div class="gen-settings-row api-size-row">
                 <select class="select-lite resolution compact-select" data-field="resolution">
                     <option value="auto">自动</option>
@@ -10808,7 +10887,8 @@ function renderGeneratorBody(node){
     const fitSizeBtn = wrap.querySelector('.fit-size-btn');
     const referenceImages = ordered.flatMap(src => src.refs || []);
     const syncQualityControls = () => {
-        qualitySelect.disabled = false;
+        qualitySelect.disabled = isNovelAIImageModel(node.model);
+        if(isNovelAIImageModel(node.model)) node.quality = 'auto';
         if(!['auto','low','medium','high'].includes(String(node.quality || 'auto'))) node.quality = 'auto';
         qualitySelect.value = node.quality || 'auto';
     };
@@ -10873,6 +10953,13 @@ function renderGeneratorBody(node){
     };
     const syncSizeControls = () => {
         normalizeApiNodeSizeChoice(node);
+        const novelaiModel = isNovelAIImageModel(node.model);
+        for(const option of resolutionSelect.options){
+            if(['2k','4k'].includes(option.value)) option.disabled = novelaiModel;
+            if(option.value === '1k') option.textContent = novelaiModel ? '标准 ≤1MP' : '1K';
+        }
+        const forceFillButton = wrap.querySelector('.force-fill-toggle');
+        if(forceFillButton) forceFillButton.style.display = novelaiModel ? 'none' : '';
         const autoOption = resolutionSelect.querySelector('option[value="auto"]');
         if(autoOption) autoOption.disabled = !isGptImageAutoSizeModel(resolveImageModel(node.model));
         const squareOption = ratioSelect.querySelector('option[value="square"]');
@@ -11031,6 +11118,7 @@ function renderGeneratorBody(node){
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
     bindCascadeButtons(wrap, node.id);
+    window.SeedreamPro?.mount(wrap, node, scheduleSave);
     return wrap;
 }
 // —— 火山方舟 Seedance 计费估算 ——
@@ -13498,17 +13586,21 @@ async function runGenerator(genId, opts={}){
     const count = normalizeGeneratorCount(gen, gen.count || 1);
     gen.count = count;
     let out = outputForNode(gen, 460);
-    const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
+    const run = runSnapshot(gen, window.SeedreamPro?.enabled(gen) && gen.seedreamOptions?.layer_decomposition ? prompt : (prompt || 'Edit the reference images.'), refs);
     const payload = {
         prompt: prompt || 'Edit the reference images.',
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
         account_model:isGeminiCliProviderId(resolveImageProviderId(gen.apiProvider || 'comfly')) ? resolveAccountModel(gen.accountModel, resolveImageProviderId(gen.apiProvider || 'comfly')) : '',
-        size:await generatorSizeForRun(gen, refs),
+        size:window.SeedreamPro?.enabled(gen) ? '2K' : await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
+    if(window.SeedreamPro?.enabled(gen)){
+        payload.reference_images = refs;
+        window.SeedreamPro.apply(gen, payload, prompt);
+    }
     const quality = normalizedImageQuality(gen.quality);
-    if(quality) payload.quality = quality;
+    if(quality && !window.SeedreamPro?.enabled(gen)) payload.quality = quality;
     run.request = {
         provider_id: payload.provider_id,
         provider_name: providerById(payload.provider_id)?.name || payload.provider_id || '',
@@ -13537,7 +13629,7 @@ async function runGenerator(genId, opts={}){
             let outputs = [];
             for(const task of taskInfos){
                 const result = await waitCanvasImageTaskResult(task.task_id, {cascadeTargetId});
-                outputs.push(...(result.images || []));
+                outputs.push(...(result.image_items?.length ? result.image_items : (result.images || [])));
                 run.request = requestMetaFromResult(result);
             }
             if(!outputs.length) throw new Error(tr('canvas.generationFailed'));
@@ -16333,7 +16425,7 @@ function mergeGeneratedOutputs(node, outputs, append=false){
                 ? 'video'
                 : mediaKindForOutputItem(item);
         if(!keepGeneratedMedia && kind !== 'image') return null;
-        return kind === 'image' ? url : {url, kind};
+        return kind === 'image' ? (item?.layer_bundle ? {...item, url} : url) : {url, kind};
     }).filter(Boolean);
     if(!append){
         node.generatedOutputs = clean;
@@ -16443,7 +16535,7 @@ function providerIdForPending(pending){
 }
 function completeRecoverPendingOutput(out, pending, result){
     if(!out || !pending || !result) return;
-    const images = result.images || [];
+    const images = result.image_items?.length ? result.image_items : (result.images || []);
     if(!images.length) return;
     const meta = {
         runMs: nowMs() - Number(pending.startedAt || nowMs()),
@@ -16660,7 +16752,8 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
-    const images = result.images || [];
+    const images = result.image_items?.length ? result.image_items : (result.images || []);
+    if(result.warnings?.length) out.seedreamWarnings = result.warnings;
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     appendOutputImages(out, images, meta.run?.refs?.[0], [meta]);
     if(images.length) markCanvasMediaMutation();
@@ -16898,7 +16991,8 @@ function renderOutputMedia(item, useGridLayout=false){
         const label = kind === 'text' ? 'TEXT' : 'FILE';
         return `<div class="output-img-wrap output-file-wrap" data-output-url="${safe}"${gridStyle}><div class="output-file-card"><i data-lucide="${icon}" class="w-7 h-7"></i><span>${escapeHtml(meta.name || outputImageName(url))}</span><small>${label}</small></div>${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
-    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasPreviewImgHtml(url, useGridLayout ? 512 : 768, 'alt="generated output"')}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+    const layerTitle = meta.z_index !== undefined ? `<div style="position:absolute;left:4px;top:4px;background:#fffE;color:#111;padding:3px 6px;border-radius:5px;font-size:11px;z-index:2">${escapeHtml(meta.name || 'Base')} · Z ${escapeHtml(String(meta.z_index))}</div>` : '';
+    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasPreviewImgHtml(url, useGridLayout ? 512 : 768, 'alt="generated output"')}${layerTitle}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
 }
 function outputGridLayout(node){
     const images = node?.images || [];
@@ -16912,7 +17006,10 @@ function renderOutputGrid(node, pendingHtml=''){
     const layout = outputGridLayout(node);
     const gridClass = layout ? 'output-grid grid-layout' : 'output-grid';
     const style = layout ? ` style="--grid-cols:${Math.max(1, Number(layout.cols || 1))}"` : '';
-    return `<div class="${gridClass}"${style}>${(node.images || []).filter(item => outputUrlValue(item)).map(item => renderOutputMedia(item, !!layout)).join('')}${pendingHtml}</div>`;
+    const bundles = [...new Map((node.images || []).filter(x=>x?.layer_bundle?.zip).map(x=>[x.layer_bundle.zip,x.layer_bundle])).values()];
+    const downloads = bundles.map(bundle=>`<div style="display:flex;gap:12px;padding:10px;font-size:12px">${[['preview','图层预览'],['zip','PNG + PSD 打包'],['psd','PSD']].map(([key,label])=>`<a href="${escapeHtml(bundle[key])}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${label}</a>`).join('')}</div>`).join('');
+    const warnings = (node.seedreamWarnings || []).map(text=>`<div style="padding:8px;color:#b45309;font-size:12px">${escapeHtml(text)}</div>`).join('');
+    return downloads + warnings + `<div class="${gridClass}"${style}>${(node.images || []).filter(item => outputUrlValue(item)).map(item => renderOutputMedia(item, !!layout)).join('')}${pendingHtml}</div>`;
 }
 function outputImageName(url){
     const clean = (url || '').split('?')[0];
@@ -16944,6 +17041,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
         const meta = metas[i] || metas[0] || {};
         const source = url && typeof url === 'object' ? url : {};
         const item = {url:outputUrlValue(url), viewed:false, runMs:meta.runMs || 0, run:meta.run || null};
+        for(const key of ['layer_bundle','z_index','bounding_box','description','output_format']) if(source[key] !== undefined) item[key]=source[key];
         if(source.name) item.name = source.name;
         if(source.kind || source.mediaKind) item.kind = source.kind || source.mediaKind;
         if(source.error || source.message) item.error = source.error || source.message;
@@ -16956,7 +17054,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
     if(compareRef?.url){
         out.imageComparisons = out.imageComparisons || {};
         list.forEach(url => {
-            out.imageComparisons[url] = {url:compareRef.url, name:compareRef.name || 'input image'};
+            out.imageComparisons[outputUrlValue(url)] = {url:compareRef.url, name:compareRef.name || 'input image'};
         });
     }
 }
@@ -17586,6 +17684,50 @@ function initOutputMediaToolEvents(){
         });
     });
 }
+// 预览框按素材自己的宽高比定大小：竖屏视频不再两边一大片黑，
+// 同时先把下面提示词面板的高度让出来，面板不会再被挤出屏幕。
+const OUTPUT_PROMPT_PANEL_RESERVE = 124;   // 放下方时面板最高就这么高：文字区 CSS 已封顶 92px + 内边距
+const OUTPUT_PROMPT_SIDE_WIDTH = 360;      // 放右边时的面板宽度：够放下两个按钮和一段正常宽度的正文
+const OUTPUT_PROMPT_SIDE_GAP = 10;         // 与 .output-lightbox-shell 的 gap 一致
+let outputPreviewMediaSize = {w:0, h:0};
+function fitOutputPreview(mediaW=0, mediaH=0){
+    if(!outputPreview) return;
+    if(mediaW > 0 && mediaH > 0) outputPreviewMediaSize = {w:mediaW, h:mediaH};
+    const {w:mw, h:mh} = outputPreviewMediaSize;
+    const shell = outputPreview.parentElement;
+    const panelOpen = !!outputPromptPanel?.classList.contains('open');
+    const maxW = Math.min(1280, Math.round(window.innerWidth * 0.96));
+    const ratio = mw > 0 && mh > 0 ? mw / mh : 0;
+    // 在给定的可用宽高里，按素材比例算出画面框的尺寸
+    const fitBox = (availW, availH) => {
+        let w = availW;
+        let h = Math.min(availH, 960);
+        if(ratio){
+            h = Math.min(availH, 960, Math.round(availW / ratio));
+            w = Math.round(h * ratio);
+            if(w > availW){ w = availW; h = Math.round(w / ratio); }
+        }
+        return {w, h};
+    };
+    // 先假设面板放右边（此时画面能用满整屏高度），放不下再退回放下方
+    const fullH = Math.max(220, window.innerHeight - 40);
+    let size = fitBox(maxW, fullH);
+    const side = panelOpen && (size.w + OUTPUT_PROMPT_SIDE_GAP + OUTPUT_PROMPT_SIDE_WIDTH) <= maxW;
+    if(panelOpen && !side){
+        size = fitBox(maxW, Math.max(220, window.innerHeight - 40 - OUTPUT_PROMPT_PANEL_RESERVE - OUTPUT_PROMPT_SIDE_GAP));
+    }
+    shell?.classList.toggle('side-prompt', side);
+    outputPreview.style.width = `${size.w}px`;
+    outputPreview.style.height = `${size.h}px`;
+    if(outputPromptPanel){
+        // 放右边就用固定宽度、跟着画面一样高；放下方则与画面同宽，但别窄到按钮放不下
+        outputPromptPanel.style.width = side ? `${OUTPUT_PROMPT_SIDE_WIDTH}px` : `${Math.max(size.w, Math.min(420, maxW))}px`;
+        outputPromptPanel.style.height = side ? `${size.h}px` : '';
+    }
+}
+window.addEventListener('resize', () => {
+    if(outputLightbox?.classList.contains('open')) fitOutputPreview();
+});
 function openOutputLightbox(url, out){
     if(!url) return;
     resetOutputPreviewZoom();
@@ -17597,6 +17739,8 @@ function openOutputLightbox(url, out){
     outputResolutionText('--', meta);
     currentOutputCompareUrl = outputCompareUrlFor(url, out);
     setOutputCompareMode(false);
+    outputPreviewMediaSize = {w:0, h:0};
+    fitOutputPreview();
     const groupDownloadItems = out?.type === 'group' ? groupImageItems(out) : [];
     if(outputDownloadAllBtn){
         outputDownloadAllBtn.style.display = groupDownloadItems.length > 1 ? 'flex' : 'none';
@@ -17619,6 +17763,7 @@ function openOutputLightbox(url, out){
             outputResolutionText(outputLightboxVideo.videoWidth && outputLightboxVideo.videoHeight
                 ? `${outputLightboxVideo.videoWidth} x ${outputLightboxVideo.videoHeight}`
                 : 'Video', meta);
+            fitOutputPreview(outputLightboxVideo.videoWidth, outputLightboxVideo.videoHeight);
         };
         outputLightboxVideo.src = canvasDisplayMediaUrl(url, outputDownloadName(url));
         outputPreview.ondblclick = null;
@@ -17637,6 +17782,7 @@ function openOutputLightbox(url, out){
     outputCompareOriginal.draggable = false;
     outputLightboxImg.onload = () => {
         outputResolutionText(`${outputLightboxImg.naturalWidth} x ${outputLightboxImg.naturalHeight}`, meta);
+        fitOutputPreview(outputLightboxImg.naturalWidth, outputLightboxImg.naturalHeight);
     };
     outputLightboxImg.src = canvasDisplayMediaUrl(url, outputDownloadName(url));
     outputCompareResult.src = canvasDisplayMediaUrl(url, outputDownloadName(url));
@@ -17656,6 +17802,14 @@ function openOutputLightbox(url, out){
 function closeOutputLightbox(){
     outputLightbox.classList.remove('open');
     setOutputCompareMode(false);
+    outputPreviewMediaSize = {w:0, h:0};
+    outputPreview.parentElement?.classList.remove('side-prompt');
+    outputPreview.style.width = '';
+    outputPreview.style.height = '';
+    if(outputPromptPanel){
+        outputPromptPanel.style.width = '';
+        outputPromptPanel.style.height = '';
+    }
     outputLightboxImg.src = '';
     outputLightboxVideo.pause();
     outputLightboxVideo.src = '';

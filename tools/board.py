@@ -334,6 +334,8 @@ def main():
     p.add_argument("--fix-generators", action="store_true",
                    help="全画布扫一遍，把被组框压住的生成器节点挪出来。只动生成器，"
                         "不碰组里成员，手动排过的组也能安全跑")
+    p.add_argument("--quiet", action="store_true",
+                   help="不打印「多图 + 全能参考」的提示词写法提醒")
     p.add_argument("--feed", choices=["group", "first"],
                    help="谁真正喂给生成器。group=组里所有图都当参考（默认接法）；"
                         "first=只有首帧图和提示词直连生成器，组里其余图只是摆着好看。"
@@ -362,6 +364,17 @@ def main():
     prompt_text = read_prompt(args)
     if not args.image and not args.blank_image and not prompt_text:
         raise SystemExit("至少要给 --image / --blank-image / --prompt")
+    # 多图 + multimodal：全能参考会把每张图都当成必须命中的关键帧。这本身是要的效果
+    # （三张图一起锁角色和场景），坑在提示词——写「不许改变构图」就是在跟模式对着干，
+    # 模型只能靠硬切来同时满足两边。月亮那条就是这么废掉一次 ¥9.94 的：2 秒跳大特写、
+    # 8 秒切回全景、9 秒对着第三张的背影原地转身。提示词要写成编排：三张图是一个镜头里
+    # 先后经过的三个瞬间，构图差异全部归因于角色在动，并写明每段过渡怎么走、走多久。
+    if (args.mode == "multimodal"
+            and (len(args.image) + len(args.blank_image)) > 1
+            and not args.quiet):
+        sys.stderr.write(
+            "提醒：多图 + 全能参考。提示词必须把三张图编排成一个镜头里的三个瞬间，"
+            "写清每段过渡的动作和时长；只写「不许跳」会换来硬切。\n")
     provider, _, model = args.model.partition(":")
 
     t0 = time.perf_counter()

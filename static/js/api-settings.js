@@ -105,7 +105,7 @@ const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const GEMINI_CLI_MODEL_NAMES = {auto:'Nano Banana 2（Google 账号）'};
 const GEMINI_CLI_DEFAULT_ACCOUNT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
-const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
+const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli', 'novelai'];
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},
@@ -2557,6 +2557,11 @@ function renderEditor(){
     keyInput.value = '';
     keyInput.placeholder = item.has_key ? `${tr('api.keepCurrentKey')} ${item.key_preview || ''}` : tr('api.enterKey');
     keyHint.textContent = item.has_key ? `${tr('api.keySaved')}${item.key_env || 'API/.env'}` : tr('api.noKey');
+    if(item.protocol === 'novelai'){
+        keyHint.textContent = (item.has_key ? 'NovelAI Token 已保存。' : '填写 NovelAI Persistent API Token。') + ' 验证地址只检查认证和余额，不扣点；当前支持 V5 文字生图。';
+        if(imageRequestModeInput) imageRequestModeInput.disabled = true;
+        if(imageEditRouteInput) imageEditRouteInput.disabled = true;
+    }
     const isModelScope = item.id === 'modelscope';
     const isRunningHub = item.id === 'runninghub';
     const isVolcengine = item.id === 'volcengine' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'volcengine';
@@ -3024,6 +3029,7 @@ function runninghubModelSourceNote(data){
 async function probeAsync(){
     const item = provider();
     if(!item) return;
+    if((protocolInput?.value || item.protocol) === 'novelai') return testConnection();
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
     const isCliProtocol = CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
@@ -3162,7 +3168,9 @@ async function testConnection(){
             const jimengNote = isJimeng ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">即梦 CLI 已可用，可在画布里选择“即梦 CLI”生成。</div>` : '';
             const codexNote = currentProtocol === 'codex' ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">OpenAI Codex CLI 已可用，可在画布里选择“OpenAI CLI”聊天或生成图片。</div>` : '';
             const geminiCliNote = currentProtocol === 'gemini-cli' ? `<div style="margin-top:6px;color:#15803d;font-size:11px;font-weight:700">Antigravity CLI 已可用，可在画布里选择“Antigravity CLI”聊天或测试生图。</div>` : '';
-            const imageModeNote = ` · 图片接口：${imageRequestModeLabel(imageRequestModeInput?.value || item.image_request_mode)}`;
+            const imageModeNote = detectedProtocol === 'novelai'
+                ? ` · ${escapeHtml(data.message || 'NovelAI 认证成功')}`
+                : ` · 图片接口：${imageRequestModeLabel(imageRequestModeInput?.value || item.image_request_mode)}`;
             const runninghubNote = isRunningHubNow
                 ? ` · RunningHub OpenAPI${runninghubModelSourceNote(data)}`
                 : imageModeNote;
@@ -3463,7 +3471,7 @@ async function clearKeyOnly(){
 }
 const FIXED_PROTOCOL_PROVIDER_IDS = new Set(['modelscope', 'volcengine', 'runninghub']);
 function providerSupportsModelProtocol(item){
-    return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
+    return Boolean(item) && item.protocol !== 'novelai' && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
 }
 function modelProtocolSelectHtml(kind, index, model, item){
     if(kind === 'video' || !providerSupportsModelProtocol(item)) return '';

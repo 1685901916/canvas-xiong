@@ -384,7 +384,9 @@ function compareCanvasRecords(a, b){
         );
         if(cmp !== 0) return cmp;
     }
-    return Number(b.updated_at || b.created_at || 0) - Number(a.updated_at || a.created_at || 0);
+    // 打开画布不再刷新 updated_at，服务器另给 last_active_at（编辑或打开，取较晚的）
+    const activeAt = item => Number(item.last_active_at || item.updated_at || item.created_at || 0);
+    return activeAt(b) - activeAt(a);
 }
 
 function refreshSortControls(){

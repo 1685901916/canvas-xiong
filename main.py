@@ -35,6 +35,9 @@ from starlette.concurrency import run_in_threadpool
 import httpx
 import autodl_support as autodl
 import minimax_design_support as minimax_design
+import seedream_pro
+import runninghub_layers
+import novelai_support
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -308,7 +311,7 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "autodl", "minimax"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex", "autodl", "minimax", "dashscope", "novelai"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -734,6 +737,7 @@ def reload_env_globals():
         "veo3", "veo3-fast", "veo3-pro",
         "veo3.1", "veo3.1-fast", "veo3.1-quality", "veo3.1-lite",
         "sora-2", "sora-2-pro",
+        "wan3.0-video", "wan3.0-video-prime",
         "wan2.6-t2v", "wan2.6-i2v",
         "wan2.5-t2v-preview", "wan2.5-i2v-preview",
         "wan2.2-t2v-plus", "wan2.2-i2v-plus", "wan2.2-i2v-flash",
@@ -1421,6 +1425,8 @@ def normalize_provider(item):
     protocol = str(item.get("protocol") or "openai").strip().lower()
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
+    if protocol == "novelai":
+        base_url = novelai_support.validate_base_url(base_url)
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
     image_generation_endpoint = normalize_endpoint_override(item.get("image_generation_endpoint"), "文生图端口")
     image_edit_endpoint = normalize_endpoint_override(item.get("image_edit_endpoint"), "图生图/编辑端口")
@@ -1916,7 +1922,7 @@ def sync_static_html_versions():
     # 列表页/智能画布页的脚本也纳入进来——它们和 canvas.js 属于同一套画布逻辑，
     # 只跟着 VERSION 走的话，改了代码用户刷新还是拿旧缓存。
     canvas_runtime_targets = {
-        "canvas.html": ("/static/css/canvas.css", "/static/js/autodl-video.js", "/static/js/canvas.js"),
+        "canvas.html": ("/static/css/canvas.css", "/static/js/autodl-video.js", "/static/js/seedream-pro.js", "/static/js/canvas.js"),
         "canvas-list.html": ("/static/js/canvas-list.js",),
         "smart-canvas.html": ("/static/js/smart-canvas.js",),
     }
@@ -2806,7 +2812,7 @@ class AIReference(BaseModel):
     mime: str = ""
 
 class OnlineImageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
     provider_id: str = "comfly"
     model: str = ""
     account_model: str = ""
@@ -2815,6 +2821,7 @@ class OnlineImageRequest(BaseModel):
     n: int = 1
     reference_images: List[AIReference] = []
     timeout_ms: int = 0
+    seedream_options: Optional[seedream_pro.SeedreamOptions] = None
 
 class ImageTaskQueryRequest(BaseModel):
     provider_id: str = "comfly"
@@ -3151,7 +3158,7 @@ class CanvasAgentCommand(BaseModel):
     quality: str = "auto"
     duration: int = 10
     aspect_ratio: str = "9:16"
-    generate_audio: bool = False
+    generate_audio: bool = True     # 与前端视频节点默认一致：默认生成音频，用户明确关掉才不生成
     multimodal: bool = True
     use_frame_roles: bool = False
     enhance_prompt: bool = False
@@ -6368,7 +6375,7 @@ def effective_protocol(provider, model=""):
     """返回某模型实际生效的协议：优先单模型覆盖，否则用平台全局协议。"""
     base = provider_protocol(provider)
     pid = str((provider or {}).get("id") or "").strip().lower()
-    if pid in FIXED_PROTOCOL_PROVIDER_IDS:
+    if pid in FIXED_PROTOCOL_PROVIDER_IDS or base == "novelai":
         return base
     overrides = (provider or {}).get("model_protocols")
     if isinstance(overrides, dict):
@@ -8489,6 +8496,7 @@ async def wait_for_image_task(client, task_id, provider=None):
         if status in IMAGE_TASK_SUCCESS_STATUSES:
             return last_payload
         if status in {"FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}:
+            task_data = image_task_data(last_payload)
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
             reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or last_payload.get("message") or "生图任务失败"
             friendly = friendly_image_error_detail(reason, model=str(task_data.get("model") or ""))
@@ -12500,7 +12508,8 @@ def provider_has_usable_key(provider):
     if provider.get("id") == "runninghub":
         return bool(provider_env_key_value(provider["id"]) or runninghub_wallet_key_value())
     if provider.get("id") == "volcengine":
-        return bool(volcengine_access_key_value() and volcengine_secret_key_value())
+        # Ark image/video inference shares ARK_API_KEY; cloud AK/SK is for asset management.
+        return bool(volcengine_provider_api_key())
     return bool(provider_env_key_value(provider["id"]))
 
 def choose_nano_banana_provider(current_provider=None):
@@ -12906,8 +12915,29 @@ def volcengine_image_payload(ref):
         return None
     return value
 
-async def generate_volcengine_provider_image(prompt, size, model, reference_images=None, provider=None):
+async def generate_volcengine_provider_image(prompt, size, model, reference_images=None, provider=None, seedream_options=None):
     endpoint = volcengine_endpoint_url(provider)
+    if seedream_pro.is_pro(model):
+        options = seedream_options or seedream_pro.SeedreamOptions()
+        images = []
+        for ref in reference_images or []:
+            path = output_file_from_url(ref.get("url", ""))
+            if path and os.path.isfile(path):
+                try:
+                    images.append(seedream_pro.local_reference(path, options.background == "transparent"))
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+            else:
+                images.append(reference_to_data_url(ref))
+        body = seedream_pro.payload(model, prompt, size, images, options)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)) as client:
+            response = await client.post(endpoint, headers=api_headers(provider=provider), json=body)
+            response.raise_for_status()
+            raw = response.json()
+            parsed = seedream_pro.images(raw)
+            if not parsed:
+                raise HTTPException(502, f"Seedream 未返回图片：{str(raw)[:500]}")
+            return parsed[0], raw
     size = normalize_volcengine_size(size, model)
     body = {
         "model": model,
@@ -14189,6 +14219,9 @@ async def generate_runninghub_video(payload, provider):
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", account_model=""):
     provider = get_api_provider(provider_id)
     provider, model = remap_gpt_image_2_to_nano(provider, model)
+    if provider_protocol(provider) == "novelai":
+        return await novelai_support.generate(provider_env_key_value(provider["id"]),
+            provider.get("base_url"), prompt, size, model, reference_images)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_codex_provider(provider):
@@ -16902,7 +16935,7 @@ async def probe_volcengine_auto_detect(client, base_url: str, api_key: str):
 
 def classify_upstream_model(mid):
     lc = str(mid or "").lower()
-    video_keys = ["veo", "sora", "wan2", "wanx", "doubao-seedance", "doubao-1", "kling", "hailuo", "video", "t2v-", "i2v-", "s2v"]
+    video_keys = ["veo", "sora", "wan2", "wan3", "wanx", "doubao-seedance", "doubao-1", "kling", "hailuo", "video", "t2v-", "i2v-", "s2v"]
     if any(k in lc for k in video_keys):
         return "video"
     image_keys = ["banana", "image", "dalle", "dall-e", "imagen", "flux", "stable", "sdxl", "midjourney", "nano-banana", "ideogram", "fal-ai", "z-image", "qwen-image", "klein", "seedream", "doubao-seedream", "text-to-image", "image-to-image"]
@@ -16953,6 +16986,8 @@ def apply_agnes_model_defaults(base_url, grouped, ids):
 async def test_provider_connection(payload: TestConnectionPayload):
     """测试请求地址是否可用：调上游 /v1/models。验证通过时同时把模型清单按类别返回，避免再调一次拉取接口。"""
     protocol = protocol_from_payload(payload)
+    if protocol == "novelai":
+        return await novelai_support.account_status(api_key_from_payload(payload, protocol), payload.base_url)
     if protocol == "codex":
         status = await codex_status()
         payload_models = codex_models_payload(raw={"status": status})
@@ -17216,6 +17251,8 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
 async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str = "openai", image_request_mode: str = "openai"):
     """从上游模型列表端点拉取模型，并按名称做轻量分类。"""
     protocol = protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
+    if protocol == "novelai":
+        return await novelai_support.account_status(api_key, base_url)
     if protocol == "codex":
         status = await codex_status()
         payload = codex_models_payload(raw={"status": status})
@@ -17384,7 +17421,9 @@ def online_image_endpoint_info(provider, model, refs):
     family = protocol
     url = ""
     details = {}
-    if provider.get("id") == "modelscope":
+    if protocol == "novelai":
+        url = novelai_support.BASE_URL + "/ai/generate-image"
+    elif provider.get("id") == "modelscope":
         family = "modelscope"
     elif is_jimeng_provider(provider):
         family = "jimeng"
@@ -17435,6 +17474,18 @@ def resolve_online_image_request(payload: OnlineImageRequest):
         raise HTTPException(status_code=400, detail=f"{provider_name} 未配置可用 API Key，请在 API 设置中填写或切换 API。")
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
     count = max(1, min(8, int(payload.n or 1)))
+    if provider_protocol(provider) == "novelai":
+        novelai_support.validate_base_url(provider.get("base_url"))
+        novelai_support.build_payload(payload.prompt, payload.size, model, refs)
+    if provider["id"] == "volcengine" and seedream_pro.is_pro(model):
+        try:
+            seedream_pro.payload(model, payload.prompt, payload.size, refs, payload.seedream_options, count)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    elif payload.seedream_options is not None:
+        raise HTTPException(400, "Seedream 专用设置仅适用于火山引擎 Seedream 5.0 Pro。")
+    elif not payload.prompt.strip():
+        raise HTTPException(400, "请输入提示词。")
     remapped = requested_provider["id"] != provider["id"] or requested_model != model
     protocol = effective_protocol(provider, model)
     endpoint = online_image_endpoint_info(provider, model, refs)
@@ -17476,6 +17527,15 @@ def resolve_online_image_request(payload: OnlineImageRequest):
         "endpoint_host": endpoint.get("host") or "",
         "endpoint_path": endpoint.get("path") or "",
     }
+    if provider["id"] == "volcengine" and seedream_pro.is_pro(model):
+        options = (payload.seedream_options or seedream_pro.SeedreamOptions()).model_dump()
+        request_meta["seedream_options"] = options
+        resolved_meta["seedream_options"] = options
+        resolved_meta["quality"] = ""
+        resolved_meta["reference_transport"] = "full-resolution-data-url"
+        parsed_endpoint = urllib.parse.urlsplit(volcengine_endpoint_url(provider))
+        resolved_meta["endpoint_host"] = parsed_endpoint.netloc
+        resolved_meta["endpoint_path"] = parsed_endpoint.path
     if api_size != payload.size:
         resolved_meta["api_size"] = api_size
     if resolution:
@@ -17489,7 +17549,7 @@ def resolve_online_image_request(payload: OnlineImageRequest):
             resolved_meta["reference_field"] = gpt_image_2_generation_reference_fields()[0]
         elif is_nano_banana_model(model) and protocol == "openai":
             resolved_meta["reference_transport"] = "chat-data-url"
-        else:
+        elif not (provider["id"] == "volcengine" and seedream_pro.is_pro(model)):
             resolved_meta["reference_transport"] = "multipart-or-data-url"
     return {
         "provider": provider,
@@ -17520,7 +17580,13 @@ async def build_online_image_result(payload: OnlineImageRequest):
     request_size = payload.size
     image_refs = refs
     async def generate_one():
-        image_data, raw_item = await generate_ai_image(
+        pro = provider["id"] == "volcengine" and seedream_pro.is_pro(model)
+        rh_layers = provider["id"] == "runninghub" and runninghub_layers.is_layer_model(model)
+        if pro:
+            image_data, raw_item = await generate_volcengine_provider_image(
+                payload.prompt, request_size, model, image_refs, provider, payload.seedream_options)
+        else:
+            image_data, raw_item = await generate_ai_image(
             payload.prompt,
             request_size,
             payload.quality,
@@ -17530,7 +17596,10 @@ async def build_online_image_result(payload: OnlineImageRequest):
             account_model=account_model,
         )
         try:
-            image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
+            if rh_layers:
+                image_items = runninghub_layers.items_from_raw(raw_item, rewrite_runninghub_file_url)
+            else:
+                image_items = seedream_pro.images(raw_item) if pro else (extract_images(raw_item) if isinstance(raw_item, dict) else [image_data])
         except HTTPException:
             image_items = [image_data]
         local_urls = []
@@ -17539,7 +17608,30 @@ async def build_online_image_result(payload: OnlineImageRequest):
             local_url = await save_ai_image_to_output(item, prefix="online_")
             if local_url:
                 local_urls.append(local_url)
-                local_items.append(image_output_meta(local_url, item))
+                meta = image_output_meta(local_url, item)
+                if pro or rh_layers:
+                    meta.update({k: item[k] for k in ("name", "description", "z_index", "bounding_box", "output_format") if k in item})
+                local_items.append(meta)
+        if pro and payload.seedream_options and payload.seedream_options.layer_decomposition:
+            try:
+                artifact = await run_in_threadpool(seedream_pro.bundle, local_items, output_file_from_url, OUTPUT_OUTPUT_DIR, output_url_for)
+                raw_item["_layer_bundle"] = artifact
+                for item in local_items:
+                    item["layer_bundle"] = artifact
+            except Exception as exc:
+                raw_item["_layer_warning"] = f"图层已保存，但导出失败：{exc}"
+        if rh_layers:
+            # RunningHub Seedream 5.5 图层拆分：打包 PSD/预览，并把每层换成和底图同尺寸、位置对齐的透明 PNG
+            artifact = None
+            try:
+                artifact = await run_in_threadpool(seedream_pro.bundle, local_items, output_file_from_url, OUTPUT_OUTPUT_DIR, output_url_for)
+                raw_item["_layer_bundle"] = artifact
+            except Exception as exc:
+                raw_item["_layer_warning"] = f"图层已保存，但打包失败：{exc}"
+            try:
+                local_urls, local_items = await run_in_threadpool(runninghub_layers.aligned_outputs, local_items, output_file_from_url, OUTPUT_OUTPUT_DIR, output_url_for, artifact)
+            except Exception as exc:
+                raw_item["_layer_warning"] = f"图层已保存，但对齐失败：{exc}"
         return local_urls, local_items, raw_item
     try:
         generated = []
@@ -17609,7 +17701,12 @@ async def build_online_image_result(payload: OnlineImageRequest):
             "reference_images": refs,
         },
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
+        "layer_bundle": raw.get("_layer_bundle") if isinstance(raw, dict) else None,
     }
+    if payload.seedream_options:
+        result["params"]["seedream_options"] = payload.seedream_options.model_dump()
+    if isinstance(raw, dict) and raw.get("_layer_warning"):
+        result["warnings"].append(raw["_layer_warning"])
     save_to_history(result)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
@@ -17986,6 +18083,13 @@ IMAGE_PARAM_RESOLUTIONS = [
 def build_image_param_fields(engine: str, provider: dict, model: str):
     """返回某平台/引擎的图像生成参数字段定义。客户端按 type 动态渲染并回填到生成请求。
     字段 key 直接对应 OnlineImageRequest 的字段名（size/quality/n/reference_images）。"""
+    if provider_protocol(provider) == "novelai":
+        return [
+            {"key": "size", "type": "select", "label": "尺寸", "default": "1024x1024",
+             "options": [{"value": size, "label": size} for size in ["1024x1024", "832x1216", "1216x832", "512x768", "768x512"]]},
+            {"key": "n", "type": "int", "label": "数量", "options": [1, 2, 3, 4], "default": 1},
+            {"key": "_novelai_notice", "type": "notice", "label": "NovelAI V5 文字生图；23 步、引导 7。参考图暂未接入，生成消耗账户 Anlas。"},
+        ]
     gpt_auto_size = engine == "api" and is_gpt_image_2_model(model)
     image_resolutions = ([{"value": "auto", "label": "自动"}] + IMAGE_PARAM_RESOLUTIONS) if gpt_auto_size else IMAGE_PARAM_RESOLUTIONS
     size_field = {
@@ -19113,6 +19217,11 @@ class CanvasNodePatch(BaseModel):
     client_id: str = "canvas-agent"
 
 
+class CanvasNotesUpdate(BaseModel):
+    """批量写备注：{"notes": {"节点id": "备注文字"}}，空字符串表示清空。"""
+    notes: Dict[str, str] = Field(default_factory=dict)
+    client_id: str = "canvas-agent"
+
 class CanvasConnectionCreate(BaseModel):
     from_id: str = Field(alias="from", min_length=1)
     to_id: str = Field(alias="to", min_length=1)
@@ -19208,7 +19317,7 @@ def canvas_prim_build_node(nodes: List[Dict[str, Any]], payload: CanvasNodeCreat
             "aspectRatio": payload.aspectRatio or "9:16",
             "resolution": payload.resolution or "720p",
             "enhancePrompt": False, "enableUpsample": False, "watermark": False, "cameraFixed": False,
-            "generateAudio": bool(payload.generateAudio) if payload.generateAudio is not None else False,
+            "generateAudio": bool(payload.generateAudio) if payload.generateAudio is not None else True,
             "useFrameRoles": bool(payload.useFrameRoles) if payload.useFrameRoles is not None else False,
             # 与前端工厂一致：默认开全能参考，否则多张图只有第一张会被当首帧
             "multimodal": bool(payload.multimodal) if payload.multimodal is not None else True,
@@ -19434,6 +19543,74 @@ async def canvas_prim_delete_node(canvas_id: str, node_id: str, client_id: str =
     return await canvas_prim_respond(canvas_id, canvas, result, client_id)
 
 
+@app.get("/api/canvases/{canvas_id}/notes")
+async def canvas_notes_list(canvas_id: str, only: str = ""):
+    """一次读回画布上所有素材的备注和生成提示词。
+
+    页面上每个图片/视频节点都能写一句备注（node.note）；从生成结果拖到画布的素材还会
+    自动带上当时用的提示词（node.sourcePrompt）。读画布不必拉整份几 MB 的 JSON，
+    这里只回这些字段。only=note / only=prompt 可以再筛一层。
+    """
+    canvas = await run_in_threadpool(load_canvas, canvas_id, False)
+    canvas_nodes = canvas.get("nodes") or []
+    group_of = {}
+    for node in canvas_nodes:
+        if node.get("type") in ("group", "promptGroup"):
+            for item in (node.get("items") or []):
+                group_of[str(item)] = node
+    want = str(only or "").strip().lower()
+    items = []
+    for node in canvas_nodes:
+        if node.get("type") != "image":
+            continue
+        note = str(node.get("note") or "")
+        prompt = str(node.get("sourcePrompt") or "")
+        if want == "note" and not note:
+            continue
+        if want == "prompt" and not prompt:
+            continue
+        group = group_of.get(str(node.get("id"))) or {}
+        items.append({
+            "id": node.get("id"),
+            "name": node.get("name") or "",
+            "url": node.get("url") or "",
+            "kind": node.get("mediaKind") or "image",
+            "note": note,
+            "prompt": prompt,
+            "group_id": group.get("id") or "",
+            "group_title": group.get("title") or "",
+        })
+    return {"canvas_id": canvas_id, "title": canvas.get("title") or "", "count": len(items), "items": items}
+
+
+@app.post("/api/canvases/{canvas_id}/notes")
+async def canvas_notes_update(canvas_id: str, payload: CanvasNotesUpdate):
+    """批量写备注。改完照常广播增量，开着这张画布的页面立刻就能看到。"""
+    wanted = {str(k): str(v or "") for k, v in (payload.notes or {}).items()}
+    if not wanted:
+        raise HTTPException(status_code=400, detail="notes 为空")
+
+    def mutate(canvas):
+        touched = []
+        missing = []
+        for node_id, text in wanted.items():
+            node = next((n for n in canvas["nodes"] if n.get("id") == node_id), None)
+            if not node:
+                missing.append(node_id)
+                continue
+            if text:
+                node["note"] = text
+            else:
+                node.pop("note", None)
+            touched.append(node)
+        if not touched:
+            raise HTTPException(status_code=404, detail="这些节点都不存在：" + ", ".join(missing))
+        return {"nodes": touched, "updated": [n.get("id") for n in touched], "missing": missing}
+
+    canvas, result = await run_in_threadpool(canvas_prim_commit, canvas_id, mutate)
+    return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
+
+
 @app.post("/api/canvases/{canvas_id}/connections")
 async def canvas_prim_create_connection(canvas_id: str, payload: CanvasConnectionCreate):
     def mutate(canvas):
@@ -19502,6 +19679,217 @@ async def canvas_prim_attach_media(canvas_id: str, node_id: str, payload: Canvas
     return await canvas_prim_respond(canvas_id, canvas, result, payload.client_id)
 
 
+# ─────────────────────────────────────────────────────────────
+# 阿里云百炼（DashScope）视频：通义万相 wan3.0
+#   提交 POST {root}/services/aigc/video-generation/video-synthesis（头 X-DashScope-Async: enable）
+#   轮询 GET  {root}/tasks/{task_id}  → output.task_status / output.video_url（地址 24 小时有效）
+# root 是 https://<业务空间域名>/api/v1。用户在设置里填的往往是 compatible-mode/v1 那条
+# OpenAI 兼容地址（聊天用得上，协议就留 openai），视频接口不在那条路径下，这里按域名换算。
+# 参考图接口接受 base64，直接内联；参考视频/音频要公网地址，走已有的图床上传。
+# ─────────────────────────────────────────────────────────────
+DASHSCOPE_HOST_HINTS = ("maas.aliyuncs.com", "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com")
+DASHSCOPE_VIDEO_RESOLUTIONS = {"480p": "480P", "720p": "720P", "1080p": "1080P"}
+DASHSCOPE_VIDEO_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16")
+DASHSCOPE_VIDEO_MAX_IMAGES = 10
+DASHSCOPE_VIDEO_MAX_CLIPS = 5
+DASHSCOPE_VIDEO_POLL_SECONDS = 15.0     # 官方建议的查询间隔；任务通常要几分钟
+DASHSCOPE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+DASHSCOPE_DEFAULT_VIDEO_MODEL = "wan3.0-video"
+
+
+def is_dashscope_provider(provider):
+    if provider_protocol(provider) == "dashscope":
+        return True
+    host = urllib.parse.urlparse(str((provider or {}).get("base_url") or "").strip()).netloc.lower()
+    return bool(host) and any(host.endswith(hint) for hint in DASHSCOPE_HOST_HINTS)
+
+
+def dashscope_api_root(base_url: str) -> str:
+    """任何一种百炼地址（compatible-mode/v1、api/v1、裸域名）→ https://host/api/v1。"""
+    text = str(base_url or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if not re.match(r"^https?://", text):
+        text = "https://" + text
+    parsed = urllib.parse.urlparse(text)
+    if not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}/api/v1"
+
+
+def dashscope_video_resolution(value) -> str:
+    # 页面的「Auto」落到 720P：接口默认 1080P，价格高一档，要 1080 就在节点上明选
+    return DASHSCOPE_VIDEO_RESOLUTIONS.get(str(value or "").strip().lower(), "720P")
+
+
+def dashscope_video_ratio(value) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in DASHSCOPE_VIDEO_RATIOS else "adaptive"
+
+
+def dashscope_video_duration(value) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 5
+    if seconds == -1:          # 接口的「智能时长」
+        return -1
+    return max(2, min(30, seconds))
+
+
+def dashscope_error_message(response) -> str:
+    try:
+        raw = response.json()
+    except Exception:
+        raw = None
+    if isinstance(raw, dict):
+        output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+        code = str(raw.get("code") or output.get("code") or "").strip()
+        message = str(raw.get("message") or output.get("message") or "").strip()
+        if code or message:
+            return f"{code}: {message}".strip(": ").strip()
+    return (response.text or "")[:300] or f"HTTP {response.status_code}"
+
+
+async def dashscope_media_url(url: str, kind: str) -> str:
+    """图片 → base64 data URL（接口接受）；视频/音频 → 公网地址（图床）。公网/data 地址原样透传。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://", "data:")):
+        return text
+    if kind == "image":
+        path = output_file_from_url(text)
+        if not path or not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f"参考图不存在或已被删除：{text}")
+        if os.path.getsize(path) > DASHSCOPE_IMAGE_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="百炼参考图单张不能超过 20MB")
+        data_url = local_media_data_url(text)
+        if not data_url:
+            raise HTTPException(status_code=400, detail=f"参考图无法读取：{text}")
+        return data_url
+    info = await upload_local_video_to_cloud(text)
+    public_url = str((info or {}).get("url") or "").strip()
+    if not public_url:
+        raise HTTPException(status_code=502, detail=f"参考{'视频' if kind == 'video' else '音频'}上传云端失败：{text}")
+    return public_url
+
+
+def build_dashscope_video_body(payload: CanvasVideoRequest, model: str, images, videos, audios) -> Dict[str, Any]:
+    """组装 video-synthesis 请求体。images 是 [(role, url)]，videos/audios 是 [url]，地址都已可用。
+
+    接口规定首帧/尾帧和参考素材（reference_*）互斥：节点开了「首尾帧」就只送首尾帧；
+    否则全部当参考素材（全能参考），图最多 10 张、视频/音频各最多 5 段。
+    """
+    prompt = str(payload.prompt or "").strip()[:20000]
+    roles = {role for role, _ in images}
+    frame_mode = bool(roles & {"first_frame", "last_frame"}) and not payload.multimodal
+    media = []
+    if frame_mode:
+        first = next((url for role, url in images if role == "first_frame"), "") \
+            or next((url for role, url in images if role != "last_frame"), "")
+        last = next((url for role, url in images if role == "last_frame"), "")
+        if first:
+            media.append({"type": "first_frame", "url": first})
+        if last:
+            media.append({"type": "last_frame", "url": last})
+        if videos or audios:
+            raise HTTPException(status_code=400, detail="万相 3.0 的首尾帧模式不能同时带参考视频/音频；要用参考素材请切到「全能参考」")
+    else:
+        media.extend({"type": "reference_image", "url": url} for _, url in images[:DASHSCOPE_VIDEO_MAX_IMAGES])
+        media.extend({"type": "reference_video", "url": url} for url in videos[:DASHSCOPE_VIDEO_MAX_CLIPS])
+        media.extend({"type": "reference_audio", "url": url} for url in audios[:DASHSCOPE_VIDEO_MAX_CLIPS])
+    if not prompt and not media:
+        raise HTTPException(status_code=400, detail="万相 3.0 至少需要提示词或参考素材其中一项")
+    body_input: Dict[str, Any] = {}
+    if prompt:
+        body_input["prompt"] = prompt
+    if media:
+        body_input["media"] = media
+    parameters: Dict[str, Any] = {
+        "resolution": dashscope_video_resolution(payload.resolution),
+        "ratio": dashscope_video_ratio(payload.aspect_ratio),
+        "duration": dashscope_video_duration(payload.duration),
+        "audio": bool(payload.generate_audio),
+        "prompt_extend": bool(payload.enhance_prompt),
+        "watermark": bool(payload.watermark),
+    }
+    if payload.seed is not None:
+        try:
+            parameters["seed"] = int(payload.seed)
+        except (TypeError, ValueError):
+            pass
+    return {"model": model, "input": body_input, "parameters": parameters}
+
+
+async def wait_dashscope_video(client, root: str, headers: dict, task_id: str):
+    url = f"{root}/tasks/{urllib.parse.quote(str(task_id), safe='')}"
+    deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+    delay = 10.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(delay)
+        response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"百炼任务查询失败：{dashscope_error_message(response)}")
+        raw = response.json() if response.content else {}
+        output = raw.get("output") if isinstance(raw, dict) and isinstance(raw.get("output"), dict) else {}
+        status = str(output.get("task_status") or "").strip().upper()
+        if status == "SUCCEEDED":
+            video_url = str(output.get("video_url") or "").strip()
+            if not video_url:
+                raise HTTPException(status_code=502, detail="百炼视频任务成功但没有返回视频地址")
+            # 上游地址只保 24 小时，落到本地 assets/output 才算拿到
+            local_url = await save_remote_video_to_output(video_url, prefix="wan3_", category="output")
+            return local_url, raw
+        if status in {"FAILED", "CANCELED", "CANCELLED", "UNKNOWN"}:
+            code = str(output.get("code") or "").strip()
+            message = str(output.get("message") or "").strip() or "无错误详情"
+            raise HTTPException(status_code=502, detail=f"百炼视频任务{status}：{(code + ' ') if code else ''}{message}")
+        delay = DASHSCOPE_VIDEO_POLL_SECONDS
+    raise HTTPException(status_code=504, detail=f"百炼视频任务超时：{task_id}（任务本身 24 小时内仍可在百炼控制台查到）")
+
+
+async def generate_dashscope_video(payload: CanvasVideoRequest, provider):
+    provider_id = str((provider or {}).get("id") or "bailian").strip().lower()
+    provider_name = (provider or {}).get("name") or provider_id
+    api_key = provider_env_key_value(provider_id)
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未配置 {provider_name} 的 API Key，请在「API 设置」里填写（环境变量 {provider_key_env(provider_id)}）。",
+        )
+    root = dashscope_api_root((provider or {}).get("base_url") or "")
+    if not root:
+        raise HTTPException(status_code=400, detail=f"{provider_name} 未配置 Base URL（填百炼业务空间的地址即可）")
+    model = str(payload.model or "").strip() or DASHSCOPE_DEFAULT_VIDEO_MODEL
+
+    images = []
+    for ref in (payload.images or []):
+        url = str(getattr(ref, "url", "") or "").strip()
+        if not url:
+            continue
+        role = str(getattr(ref, "role", "") or "").strip().lower()
+        images.append((role, await dashscope_media_url(url, "image")))
+    videos = [await dashscope_media_url(item, "video") for item in (payload.videos or []) if str(item or "").strip()]
+    audios = [await dashscope_media_url(item, "audio") for item in (payload.audios or []) if str(item or "").strip()]
+    body = build_dashscope_video_body(payload, model, images, videos, audios)
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    submit_url = f"{root}/services/aigc/video-generation/video-synthesis"
+    timeout = httpx.Timeout(connect=20.0, read=180.0, write=180.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(submit_url, headers={**headers, "X-DashScope-Async": "enable"}, json=body)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"百炼视频接口错误：{dashscope_error_message(response)}")
+        raw = response.json() if response.content else {}
+        output = raw.get("output") if isinstance(raw, dict) and isinstance(raw.get("output"), dict) else {}
+        task_id = str(output.get("task_id") or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=502, detail=f"百炼提交成功但没有返回 task_id：{str(raw)[:300]}")
+        local_url, final_raw = await wait_dashscope_video(client, root, headers, task_id)
+    return {"videos": [local_url], "task_id": task_id, "raw": final_raw}
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
@@ -19528,6 +19916,12 @@ async def canvas_video(payload: CanvasVideoRequest):
         except httpx.HTTPError as exc:
             log_net_error(f"视频(RunningHub) 网络/TLS错误 model={payload.model}", exc)
             raise HTTPException(status_code=502, detail=f"请求 RunningHub 视频接口失败：{exc}") from exc
+    if is_dashscope_provider(provider):
+        try:
+            return await generate_dashscope_video(payload, provider)
+        except httpx.HTTPError as exc:
+            log_net_error(f"视频(百炼) 网络/TLS错误 model={payload.model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求百炼视频接口失败：{exc}") from exc
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
