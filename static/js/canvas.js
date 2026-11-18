@@ -1599,9 +1599,33 @@ function cachedNodeSize(node, el){
     const d = defaultNodeSize(node.type) || {};
     return {w:node.w || d.w || 260, h:node.h || d.h || 160};
 }
+// 视野变了但 viewport 没变（窗口缩放、标签页从后台切回来、页面刚拿到尺寸）时强制重算一次。
+function invalidateCulling(){
+    lastCullView = null;
+    scheduleCulling();
+}
+function revealAllCulledNodes(){
+    if(!nodesEl) return;
+    const revealed = [];
+    nodesEl.querySelectorAll('.node.is-culled').forEach(el => {
+        el.classList.remove('is-culled');
+        if(el.dataset.id) revealed.push(el.dataset.id);
+    });
+    if(revealed.length){
+        revealed.forEach(id => pendingRevealIds.add(id));
+        if(!revealFlushTimer) revealFlushTimer = setTimeout(flushRevealedLinks, 120);
+    }
+}
 function applyCulling(){
     if(!nodesEl || !board) return;
     const vr = currentWorldViewRect();
+    // 量不到视野（标签页在后台、窗口最小化、页面还没排版、或 viewport 坏成 NaN）时无法判断谁在视野里：
+    // 宁可全部显示，也不能按 0×0 的视野把所有节点藏起来——那样画布和小地图看起来就是一片空白。
+    if(!(vr.w > 0 && vr.h > 0) || ![vr.x, vr.y, vr.w, vr.h].every(Number.isFinite)){
+        lastCullView = null;
+        revealAllCulledNodes();
+        return;
+    }
     lastCullView = vr;
     const mx = vr.w * CULL_MARGIN_SCREENS, my = vr.h * CULL_MARGIN_SCREENS;
     const L = vr.x - mx, T = vr.y - my, R = vr.x + vr.w + mx, B = vr.y + vr.h + my;
@@ -1644,6 +1668,21 @@ function applyCulling(){
         }
     }
 }
+// 画布区域尺寸变化（窗口缩放/最大化、侧栏开合、页面从 0×0 变成正常大小）不会走 applyViewport，
+// 必须单独触发一次裁剪和小地图视野框更新，否则新露出来的区域一直是空的。
+if(typeof ResizeObserver === 'function' && board){
+    new ResizeObserver(() => {
+        invalidateCulling();
+        scheduleMinimapViewportUpdate();
+    }).observe(board);
+} else {
+    window.addEventListener('resize', () => { invalidateCulling(); scheduleMinimapViewportUpdate(); });
+}
+document.addEventListener('visibilitychange', () => {
+    if(document.hidden) return;
+    invalidateCulling();
+    scheduleMinimapRender();
+});
 // 平移/缩放只改视野框：节点多时整张小地图重建一次要几十毫秒，每帧重建会让平移明显卡顿。
 // 视野跑出小地图当前范围、或还没画过时才整张重画；节点增删/移动仍走 scheduleMinimapRender。
 function scheduleMinimapViewportUpdate(){
@@ -8124,6 +8163,9 @@ function render(){
     restoreOutputScrolls(outputScrolls);
     // 新建的节点 DOM 默认全可见：同步裁剪一次，避免下一帧把几百个节点全部排版绘制
     applyCulling();
+    // 节点整体重建后小地图必须整张重画：applyViewport 现在只挪视野框。
+    // 漏了这一步，打开画布时小地图停在「数据还没到」时画的空图上。
+    scheduleMinimapRender();
     refreshGeometryAfterLayout();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
@@ -8154,6 +8196,9 @@ function refreshNodes(ids=[]){
         }
     }
     restoreOutputScrolls(outputScrolls);
+    // 刷新后的节点 DOM 是新建的（默认可见、尺寸可能变了）：重新裁剪，小地图整张重画
+    invalidateCulling();
+    scheduleMinimapRender();
     refreshGeometryAfterLayout(uniqueIds);
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
