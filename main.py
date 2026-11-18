@@ -3137,6 +3137,13 @@ class CanvasSaveRequest(BaseModel):
     # 页面手里的旧副本再也覆盖不了别人。不给（老页面）则维持原来的整份覆盖。
     dirty_node_ids: Optional[List[str]] = None
     removed_node_ids: List[str] = Field(default_factory=list)
+    # 页面「上次和服务器对齐时」的样子（版本基准）。给了就能分清：
+    # - 服务器上已经没有、但页面基准里有的节点 = 别处删掉的，页面不能把它带回来；
+    # - 页面改过的节点如果服务器那边也改了，只用页面真正改过的字段，其余保留服务器的；
+    # - 连线按「页面新增 / 页面删除」合并，不再用页面整份旧连线覆盖。
+    base_node_ids: Optional[List[str]] = None
+    base_nodes: Optional[Dict[str, Dict[str, Any]]] = None
+    base_connection_keys: Optional[List[str]] = None
 
 class CanvasAgentCommand(BaseModel):
     action: str = ""
@@ -21768,15 +21775,95 @@ async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
     save_asset_library(lib)
     return {"library": lib, "added": len(added), "items": added}
 
+CANVAS_MEDIA_LIST_FIELDS = ("images", "generatedOutputs")
+
+
+def canvas_connection_key(conn):
+    """和页面 canvas.js 里一致：有 id 用 id，没有就用「from->to」。"""
+    if not isinstance(conn, dict):
+        return ""
+    cid = conn.get("id")
+    return str(cid) if cid else f"{conn.get('from') or ''}->{conn.get('to') or ''}"
+
+
+def _canvas_media_item_key(item):
+    url = canvas_output_url(item)
+    return url or (json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else str(item or ""))
+
+
+def merge_three_way_media_items(server_items, base_items, incoming_items):
+    """图片列表三方合并：服务器的为底，加上页面新增的、去掉页面删掉的；页面改过的条目（比如标已看）用页面的。"""
+    base_by_key = {}
+    for item in base_items or []:
+        base_by_key.setdefault(_canvas_media_item_key(item), item)
+    incoming_by_key = {}
+    for item in incoming_items or []:
+        incoming_by_key.setdefault(_canvas_media_item_key(item), item)
+    removed_by_page = set(base_by_key) - set(incoming_by_key)
+    merged, seen = [], set()
+    for item in server_items or []:
+        key = _canvas_media_item_key(item)
+        if not key or key in seen or key in removed_by_page:
+            continue
+        seen.add(key)
+        if key in incoming_by_key and key in base_by_key and incoming_by_key[key] != base_by_key[key]:
+            item = incoming_by_key[key]
+        merged.append(item)
+    for item in incoming_items or []:
+        key = _canvas_media_item_key(item)
+        # 基准里就有、服务器上却没有 = 别处删掉的，不带回来
+        if not key or key in seen or key in base_by_key:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def merge_three_way_node(server_node, base_node, incoming_node):
+    """同一个节点页面和别处都改了：页面改过的字段用页面的，页面没动的字段保持服务器的。
+
+    服务器版本和页面基准一样（没人动过）时结果就是页面版本，和以前完全一致。
+    """
+    if not isinstance(server_node, dict) or not isinstance(base_node, dict) or not isinstance(incoming_node, dict):
+        return incoming_node
+    if server_node == base_node:
+        return incoming_node
+    merged = dict(server_node)
+    for key in set(base_node) | set(incoming_node):
+        if key == "id":
+            continue
+        in_base, in_incoming = key in base_node, key in incoming_node
+        if in_base and in_incoming and base_node[key] == incoming_node[key]:
+            continue  # 页面没改这个字段
+        if not in_incoming:
+            # 页面删了这个字段：服务器那边没改过才跟着删
+            if key in merged and merged[key] == base_node.get(key):
+                merged.pop(key, None)
+            continue
+        value = incoming_node[key]
+        if key in CANVAS_MEDIA_LIST_FIELDS and isinstance(value, list) and isinstance(merged.get(key), list):
+            value = merge_three_way_media_items(merged.get(key), base_node.get(key) if isinstance(base_node.get(key), list) else [], value)
+        merged[key] = value
+    return merged
+
+
 def merge_dirty_canvas_nodes(canvas, payload):
     """按节点合并：只采用页面报为「改过」的节点，其余保持服务器上的版本。
 
     页面整份 PUT 时，它手里几秒前的旧节点会连带写回去，把别处（agent、另一个标签页）
     刚改好的东西盖掉。现在页面自己比对上次同步时的快照，只报真正动过的节点。
+
+    页面带了版本基准（base_*）时再多三道保护，防止开着很久的旧页面把新内容盖回去：
+    - 别处删掉的节点不会被页面带回来（以前清掉的 21 个标题条就是这样又回来的）；
+    - 页面改过、别处也改过的节点按字段三方合并；
+    - 连线只采用页面新增/删除的那几条，别处加的、删的都保留。
     """
     dirty = {str(i) for i in (payload.dirty_node_ids or [])}
     removed = {str(i) for i in (payload.removed_node_ids or [])}
     incoming = {str(n.get("id")): n for n in payload.nodes if isinstance(n, dict) and n.get("id")}
+    base_ids_raw = getattr(payload, "base_node_ids", None)
+    base_ids = None if base_ids_raw is None else {str(i) for i in base_ids_raw}
+    base_nodes = getattr(payload, "base_nodes", None) or {}
 
     nodes = []
     seen = set()
@@ -21785,12 +21872,47 @@ def merge_dirty_canvas_nodes(canvas, payload):
         if not nid or nid in removed:
             continue
         seen.add(nid)
-        nodes.append(incoming[nid] if nid in dirty and nid in incoming else node)
-    for nid, node in incoming.items():
-        if nid not in seen and nid not in removed:
+        if nid in dirty and nid in incoming:
+            base = base_nodes.get(nid)
+            nodes.append(merge_three_way_node(node, base, incoming[nid]) if isinstance(base, dict) else incoming[nid])
+        else:
             nodes.append(node)
+    for nid, node in incoming.items():
+        if nid in seen or nid in removed:
+            continue
+        if base_ids is not None:
+            if nid in base_ids:
+                continue  # 页面上次对齐时就有、现在服务器没有 = 别处删掉的
+        elif nid not in dirty:
+            continue  # 老页面：只收它自己新建/改过的，没动过的旧节点不能借机复活
+        nodes.append(node)
 
     known = {str(n.get("id")) for n in nodes}
+    base_conn_raw = getattr(payload, "base_connection_keys", None)
+    if base_conn_raw is not None:
+        base_keys = {str(k) for k in base_conn_raw}
+        incoming_conns = [c for c in payload.connections if isinstance(c, dict)]
+        incoming_keys = {canvas_connection_key(c) for c in incoming_conns}
+        removed_by_page = base_keys - incoming_keys
+        conns, seen_keys, seen_pairs = [], set(), set()
+
+        def add_conn(c):
+            key = canvas_connection_key(c)
+            f, t = str(c.get("from")), str(c.get("to"))
+            if not key or key in seen_keys or (f, t) in seen_pairs or f not in known or t not in known:
+                return
+            seen_keys.add(key)
+            seen_pairs.add((f, t))
+            conns.append(c)
+
+        for c in canvas.get("connections") or []:
+            if isinstance(c, dict) and canvas_connection_key(c) not in removed_by_page:
+                add_conn(c)
+        for c in incoming_conns:
+            if canvas_connection_key(c) not in base_keys:
+                add_conn(c)  # 页面新加的
+        return nodes, conns
+
     client_known = set(incoming) | removed
     conns = [c for c in payload.connections
              if str(c.get("from")) in known and str(c.get("to")) in known]
@@ -21805,7 +21927,6 @@ def merge_dirty_canvas_nodes(canvas, payload):
                 conns.append(c)
                 seen_pairs.add((f, t))
     return nodes, conns
-
 
 def apply_canvas_save(canvas_id: str, payload: CanvasSaveRequest):
     """页面保存：读 → 合并 → 存，整段持锁、跑在线程池里。返回存好的画布（含日志时带日志）。

@@ -1651,11 +1651,14 @@ function applyCulling(){
         const keep = near || pinned.has(id) || (active && el.contains(active));
         return {el, id, culled, keep};
     }).filter(Boolean);
-    // 第二遍只写：切换隐藏标记
+    // 第二遍只写：切换隐藏标记。
+    // 拖动画布期间只「显示」不「隐藏」：隐藏远处节点省不了这几帧的活，反而每次都要重排、重绘、重新分层；
+    // 松手后 endDrag 会再裁剪一次，把这期间跑远的节点藏起来。
+    const deferHide = Boolean(dragBoard);
     const revealed = [];
     plan.forEach(p => {
         if(p.keep && p.culled){ p.el.classList.remove('is-culled'); revealed.push(p.id); }
-        else if(!p.keep && !p.culled){ p.el.classList.add('is-culled'); }
+        else if(!p.keep && !p.culled && !deferHide){ p.el.classList.add('is-culled'); }
     });
     // 重新出现的节点：连线端点从「估算位置」换回真实端口位置。
     // 拖动/平移中先不量（避免逐条 getBoundingClientRect 引起卡顿），停下来后统一对准。
@@ -1698,10 +1701,16 @@ function scheduleMinimapViewportUpdate(){
         else renderMinimap();
     });
 }
-function estimatedNodeRect(n){
-    const el = nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(n.id)}"]`);
+function estimatedNodeRect(n, elById=null){
+    const el = elById ? elById.get(n.id) : nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(n.id)}"]`);
     const {w, h} = cachedNodeSize(n, el);
     return {x:n.x || 0, y:n.y || 0, w, h};
+}
+// 一次遍历拿到 id -> 节点 DOM，避免对每个节点各做一次全树 querySelector（几百个节点时是主要开销）
+function nodeElementsById(){
+    const map = new Map();
+    if(nodesEl) for(const el of nodesEl.children){ if(el.dataset?.id) map.set(el.dataset.id, el); }
+    return map;
 }
 function currentWorldViewRect(){
     const rect = board.getBoundingClientRect();
@@ -1713,8 +1722,8 @@ function currentWorldViewRect(){
         h:rect.height / scale
     };
 }
-function minimapBounds(){
-    const rects = (nodes || []).map(estimatedNodeRect);
+function minimapBounds(nodeRects=null){
+    const rects = nodeRects ? nodeRects.slice() : (nodes || []).map(n => estimatedNodeRect(n));
     rects.push(currentWorldViewRect());
     if(!rects.length) return {x:0, y:0, w:1000, h:700};
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -1747,7 +1756,9 @@ function scheduleLinksRender(){
 function renderMinimap(){
     if(!minimapContent || !minimapViewport) return;
     canvasArrangeBtn?.classList.toggle('visible', selected.size > 0);
-    const bounds = minimapBounds();
+    const elById = nodeElementsById();
+    const nodeRects = (nodes || []).map(n => estimatedNodeRect(n, elById));
+    const bounds = minimapBounds(nodeRects);
     const cw = minimapContent.clientWidth || 172;
     const ch = minimapContent.clientHeight || 110;
     const scale = Math.min(cw / bounds.w, ch / bounds.h);
@@ -1756,8 +1767,8 @@ function renderMinimap(){
     const ox = (cw - mapW) / 2;
     const oy = (ch - mapH) / 2;
     minimapState = {bounds, scale, ox, oy, cw, ch};
-    const nodeHtml = (nodes || []).map(n => {
-        const r = estimatedNodeRect(n);
+    const nodeHtml = (nodes || []).map((n, i) => {
+        const r = nodeRects[i];
         return `<div class="minimap-node ${selected.has(n.id) ? 'selected' : ''}" style="left:${ox + (r.x - bounds.x) * scale}px;top:${oy + (r.y - bounds.y) * scale}px;width:${Math.max(3, r.w * scale)}px;height:${Math.max(3, r.h * scale)}px"></div>`;
     }).join('');
     minimapContent.innerHTML = `${nodeHtml}${nodes?.length ? '' : '<div class="minimap-empty">EMPTY</div>'}<div id="minimapViewport" class="minimap-viewport"></div>`;
@@ -1768,10 +1779,14 @@ function updateMinimapViewport(){
     if(!minimapViewport || !minimapState) return;
     const r = currentWorldViewRect();
     const {bounds, scale, ox, oy} = minimapState;
-    minimapViewport.style.left = `${ox + (r.x - bounds.x) * scale}px`;
-    minimapViewport.style.top = `${oy + (r.y - bounds.y) * scale}px`;
-    minimapViewport.style.width = `${Math.max(8, r.w * scale)}px`;
-    minimapViewport.style.height = `${Math.max(8, r.h * scale)}px`;
+    // 位置用 transform（只在合成器里挪，不触发重绘）；尺寸只在缩放时才变，变了才写。
+    // 以前每帧改 left/top 会让整页重新分层（节点多时一帧几十毫秒）。
+    const s = minimapViewport.style;
+    const w = `${Math.max(8, r.w * scale)}px`, h = `${Math.max(8, r.h * scale)}px`;
+    if(s.left !== '0px') { s.left = '0px'; s.top = '0px'; }
+    if(s.width !== w) s.width = w;
+    if(s.height !== h) s.height = h;
+    s.transform = `translate(${ox + (r.x - bounds.x) * scale}px, ${oy + (r.y - bounds.y) * scale}px)`;
 }
 function minimapEventToWorld(e){
     if(!minimapState) renderMinimap();
@@ -1820,7 +1835,8 @@ function fitAllNodesViewport(){
         scheduleViewportSave();
         return;
     }
-    const rects = nodes.map(estimatedNodeRect);
+    const elById = nodeElementsById();
+    const rects = nodes.map(n => estimatedNodeRect(n, elById));
     const minX = Math.min(...rects.map(r => r.x));
     const minY = Math.min(...rects.map(r => r.y));
     const maxX = Math.max(...rects.map(r => r.x + r.w));
@@ -2197,24 +2213,52 @@ const savedNodeSignatures = new Map();
 function nodeSignature(node){
     try { return JSON.stringify(node); } catch(e){ return String(Math.random()); }
 }
-function rememberSavedNodes(list){
+// 上次和服务器对齐时的连线（key 同 mergeRemoteCanvasIntoLocalForSave：有 id 用 id，否则 from->to）。
+// 保存时一起发给服务器当「版本基准」：它据此只采用页面新增/删除的连线，别处的改动不会被旧页面盖掉。
+let savedConnectionKeys = null;
+function canvasConnectionKey(conn){
+    return conn?.id || `${conn?.from || ''}->${conn?.to || ''}`;
+}
+function rememberSavedNodes(list, connectionList){
     savedNodeSignatures.clear();
     serializableCanvasNodes(list || nodes).forEach(n => {
         if(n?.id) savedNodeSignatures.set(n.id, nodeSignature(n));
     });
+    savedConnectionKeys = new Set((connectionList || connections || []).map(canvasConnectionKey));
+}
+// 保存时附带的版本基准：上次对齐时有哪些节点、改过的节点当时是什么样、有哪些连线。
+function canvasSaveBase(dirtyIds){
+    const baseNodes = {};
+    (dirtyIds || []).forEach(id => {
+        const sig = savedNodeSignatures.get(id);
+        if(!sig) return;
+        try { baseNodes[id] = JSON.parse(sig); } catch(e){}
+    });
+    return {
+        base_node_ids:[...savedNodeSignatures.keys()],
+        base_nodes:baseNodes,
+        base_connection_keys:savedConnectionKeys ? [...savedConnectionKeys] : null
+    };
 }
 function rememberSavedNode(node){
     if(!node?.id) return;
     const [clean] = serializableCanvasNodes([node]);
     if(clean?.id) savedNodeSignatures.set(clean.id, nodeSignature(clean));
 }
-function dirtyNodeIdsFrom(payloadNodes){
+function dirtyNodeIdsFrom(payloadNodes, signatures=null){
     const dirty = [];
     payloadNodes.forEach(n => {
         if(!n?.id) return;
-        if(savedNodeSignatures.get(n.id) !== nodeSignature(n)) dirty.push(n.id);
+        const sig = signatures?.get(n.id) ?? nodeSignature(n);
+        if(savedNodeSignatures.get(n.id) !== sig) dirty.push(n.id);
     });
     return dirty;
+}
+// 保存成功后：把「这次发出去的」记成新的已保存基准（签名在发送那一刻算好）
+function rememberSentCanvasState(signatures, connectionKeys){
+    savedNodeSignatures.clear();
+    signatures.forEach((sig, id) => savedNodeSignatures.set(id, sig));
+    savedConnectionKeys = connectionKeys;
 }
 function markNodesDeleted(ids){
     (ids || []).forEach(id => { if(id) deletedNodeIds.add(id); });
@@ -2429,7 +2473,13 @@ async function saveCanvas(){
     savingCanvasNow = true;
     saveCanvasAgain = false;
     const payloadNodes = serializableCanvasNodes();
-    const dirtyIds = dirtyNodeIdsFrom(payloadNodes);
+    // 发送这一刻的签名：既用来判断谁改过，保存成功后也直接当作新的「已保存」基准
+    const payloadSignatures = new Map();
+    payloadNodes.forEach(n => { if(n?.id) payloadSignatures.set(n.id, nodeSignature(n)); });
+    const dirtyIds = dirtyNodeIdsFrom(payloadNodes, payloadSignatures);
+    const payloadConnections = connections.slice();
+    const payloadConnectionKeys = new Set(payloadConnections.map(canvasConnectionKey));
+    const saveBase = canvasSaveBase(dirtyIds);
     const payloadLogs = unsyncedCanvasLogs.slice();
     try {
         const res = await fetch(`/api/canvases/${canvas.id}`, {
@@ -2439,14 +2489,15 @@ async function saveCanvas(){
                 title:canvas.title,
                 icon:canvas.icon || '🧩',
                 nodes:payloadNodes,
-                connections,
+                connections:payloadConnections,
                 viewport,
                 logs:payloadLogs,
                 client_id:CLIENT_ID,
                 base_updated_at:Number(lastCanvasUpdatedAt || canvas.updated_at || 0),
                 // 服务器只会采用这几个节点，其余保持它自己的版本
                 dirty_node_ids:dirtyIds,
-                removed_node_ids:[...deletedNodeIds]
+                removed_node_ids:[...deletedNodeIds],
+                ...saveBase
             })
         });
         if(res.status === 409){
@@ -2486,7 +2537,9 @@ async function saveCanvas(){
         // 这批日志服务器已经合并进去了；保存期间新加的留着下次发
         const sentLogIds = new Set(payloadLogs.map(log => log?.id).filter(Boolean));
         unsyncedCanvasLogs = unsyncedCanvasLogs.filter(log => !sentLogIds.has(log?.id));
-        rememberSavedNodes();
+        // 记下「这次实际发出去的」而不是此刻的节点：保存请求在路上时用户又改的东西还没发，
+        // 若按此刻记成已保存，紧接着那次补存会认为它没改过而漏掉。
+        rememberSentCanvasState(payloadSignatures, payloadConnectionKeys);
         const data = await res.json().catch(() => ({}));
         const localViewport = {...viewport};
         if(data.canvas){
@@ -3158,6 +3211,10 @@ async function openCanvas(id){
         unsyncedCanvasLogs = [];
         nodes = canvas.nodes || [];
         connections = canvas.connections || [];
+        // 打开时就记下「服务器上的样子」。以前要等第一次保存或第一次同步才记，期间的第一次保存
+        // 会把所有节点都当成改过、整份写回去——页面开得越久，盖掉别人改动的范围越大。
+        // 放在下面那些打开时的自动修正之前：它们改过的节点照常算作改动、照常保存。
+        rememberSavedNodes(nodes, connections);
         viewport = localViewportForCanvas(canvas.id, canvas.viewport || {x:0, y:0, scale:1});
         canvas.viewport = {...viewport};
         lastCanvasUpdatedAt = Number(canvas.updated_at || 0);
@@ -3455,6 +3512,8 @@ function handleCanvasPatchMessage(data){
             if(local) rememberSavedNode(local);
         });
         removed.forEach(id => savedNodeSignatures.delete(id));
+        // 补丁带来的是服务器当前的连线：它就是新的连线基准
+        if(Array.isArray(patch.connections)) savedConnectionKeys = new Set(connections.map(canvasConnectionKey));
         if(changedIds.length) refreshNodes(changedIds);
         syncGeneratorInputs();
         refreshGeneratorInputViews();
@@ -18065,8 +18124,10 @@ function finishSelection(){
     render();
 }
 function renderSelectionHub(){
-    selectionHub.innerHTML = '';
-    selectionHub.classList.remove('open');
+    // 平移/缩放时每帧都会调到这里。classList.remove 即使 class 本来就没有也会重写 class 属性，
+    // 页面里的 Tailwind CDN 监听全页 class 变化，每次都要把上万个元素扫一遍——只在真有变化时才动 DOM。
+    if(selectionHub.firstChild) selectionHub.innerHTML = '';
+    if(selectionHub.classList.contains('open')) selectionHub.classList.remove('open');
 }
 function startSelectionLink(e, kind){
     e.preventDefault();
@@ -18713,7 +18774,10 @@ function endDrag(event=null){
     knifeNeedsRender = false;
     if(!event?.shiftKey) setKnifeMode(false);
     if(textSelectionGuard) textSelectionGuard.active = false;
-    document.body.classList.remove('canvas-node-drag', 'canvas-node-resize', 'canvas-selecting', 'canvas-board-pan');
+    // 只移除真有的（每次松开鼠标都会走到这里；无谓地重写 body 的 class 会让 Tailwind 全页重扫、全页重算样式）
+    const dragBodyClasses = ['canvas-node-drag', 'canvas-node-resize', 'canvas-selecting', 'canvas-board-pan']
+        .filter(cls => document.body.classList.contains(cls));
+    if(dragBodyClasses.length) document.body.classList.remove(...dragBodyClasses);
     window.onmousemove = null;
     window.onmouseup = null;
     const draggedGroupIds = [...nodeDragCompletedIds, ...resizeCompletedIds]
@@ -18726,7 +18790,13 @@ function endDrag(event=null){
         else if(resizeCompletedIds.length) refreshGeometryAfterLayout(resizeCompletedIds);
         else if(hadContentDrag) refreshGeometryAfterLayout();
     }
-    scheduleMinimapRender();
+    if(hadViewportDrag && !hadContentDrag && !fitted && !shouldRenderKnife && !groupMembershipChanged){
+        // 只是平移了画布：节点没变，小地图挪视野框即可；平移中推迟的「隐藏远处节点」现在补做
+        scheduleMinimapViewportUpdate();
+        invalidateCulling();
+    } else {
+        scheduleMinimapRender();
+    }
     if(hadContentDrag) scheduleSave();
     else if(hadViewportDrag) scheduleViewportSave();
     nodeDragCompletedIds = [];

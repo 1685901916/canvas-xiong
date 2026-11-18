@@ -68,7 +68,7 @@ assert.match(ratioFn, /if\(changed\) scheduleSave\(\);/, '值没变就不要保�
 assert.match(canvas, /const savedNodeSignatures = new Map\(\)/);
 assert.match(canvas, /dirty_node_ids:dirtyIds/, '保存要带上脏节点清单');
 assert.match(canvas, /removed_node_ids:\[\.\.\.deletedNodeIds\]/, '删除要显式告诉服务器');
-assert.match(canvas, /const dirtyIds = dirtyNodeIdsFrom\(payloadNodes\)/);
+assert.match(canvas, /const dirtyIds = dirtyNodeIdsFrom\(payloadNodes, payloadSignatures\)/);
 // 快照必须在三个地方对齐，否则要么整份都算脏、要么改动被漏掉。
 // 查「函数体里有没有调用」，不查两行是否相邻——别人往中间加一行注释不该让测试挂掉。
 function bodyOf(head){
@@ -80,7 +80,12 @@ function bodyOf(head){
 }
 const saveBody = bodyOf('async function saveCanvas()');
 assert.ok(saveBody.includes('clearDeletedNodeMarks()'), '保存成功后要清墓碑');
-assert.ok(saveBody.includes('rememberSavedNodes()'), '保存成功后要对齐快照');
+// 对齐的是「这次发出去的」签名（发送时算好），保存请求在路上时的新改动不能被记成已保存
+assert.ok(saveBody.includes('rememberSentCanvasState(payloadSignatures, payloadConnectionKeys)'), '保存成功后要对齐快照');
+// 保存要带上版本基准：服务器据此不复活别处删掉的节点、按字段三方合并、按增删合并连线
+assert.ok(saveBody.includes('...saveBase'), '保存要带上版本基准');
+const openBody = bodyOf('async function openCanvas(');
+assert.ok(openBody.includes('rememberSavedNodes(nodes, connections)'), '打开画布时就要记下服务器上的样子，否则第一次保存会整份覆盖');
 assert.ok(saveBody.includes('dirty_node_ids'), '保存要带上脏节点清单');
 const applyBody = bodyOf('function applyRemoteCanvasData(');
 assert.ok(applyBody.includes('rememberSavedNodes()'), '整份同步后要对齐快照');

@@ -203,6 +203,9 @@ body.canvas-board-pan * { cursor:grabbing !important; user-select:none !importan
 /* 拖动画布期间把整个 world 提升成独立合成层：平移只移动这张图层，不再每帧重绘几百个节点和图片。
    只在拖动时开启，平时不常驻，避免缩放后文字按旧倍率栅格化发糊。 */
 body.canvas-board-pan .world { will-change:transform; }
+/* 拖动画布期间节点不参与命中测试：鼠标每动一下浏览器都要在几百个节点里找「鼠标下面是谁」，
+   顺带还会触发节点的 :hover 重绘。平移由 window 上的 mousemove 处理，不需要节点响应鼠标。 */
+body.canvas-board-pan .world { pointer-events:none; }
 /* 视口裁剪：远离视野的节点不参与样式/布局/绘制（canvas.js applyCulling） */
 .node.is-culled { display:none !important; }
 .world { position:absolute; left:0; top:0; width:6000px; height:4000px; transform-origin:0 0; }
@@ -898,7 +901,7 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .minimap-content { position:relative; width:100%; height:100%; border-radius:10px; background:rgba(148,163,184,.08); overflow:hidden; }
 .minimap-node { position:absolute; border-radius:3px; background:rgba(15,23,42,.64); border:1px solid rgba(255,255,255,.32); min-width:2px; min-height:2px; }
 .minimap-node.selected { background:#111827; box-shadow:0 0 0 1px rgba(255,255,255,.7); }
-.minimap-viewport { position:absolute; border:1.5px solid #111827; background:rgba(17,24,39,.08); border-radius:5px; box-shadow:0 0 0 1px rgba(255,255,255,.75); pointer-events:none; }
+.minimap-viewport { position:absolute; left:0; top:0; will-change:transform; border:1.5px solid #111827; background:rgba(17,24,39,.08); border-radius:5px; box-shadow:0 0 0 1px rgba(255,255,255,.75); pointer-events:none; }
 .minimap-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--faint); font-size:10px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; pointer-events:none; }
 body.theme-dark .minimap-node { background:rgba(248,250,252,.7); border-color:rgba(15,23,42,.35); }
 body.theme-dark .minimap-node.selected { background:#fff; box-shadow:0 0 0 1px rgba(15,23,42,.8); }
