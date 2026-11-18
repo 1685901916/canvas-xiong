@@ -1724,7 +1724,9 @@ function currentWorldViewRect(){
 }
 function minimapBounds(nodeRects=null){
     const rects = nodeRects ? nodeRects.slice() : (nodes || []).map(n => estimatedNodeRect(n));
-    rects.push(currentWorldViewRect());
+    // 视野量不到（0×0）或坏成 NaN 时不参与计算，否则整张小地图的范围都变成 NaN、什么也画不出来
+    const view = currentWorldViewRect();
+    if(view.w > 0 && view.h > 0 && [view.x, view.y, view.w, view.h].every(Number.isFinite)) rects.push(view);
     if(!rects.length) return {x:0, y:0, w:1000, h:700};
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     rects.forEach(r => {
