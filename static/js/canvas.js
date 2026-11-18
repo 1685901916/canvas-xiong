@@ -362,10 +362,14 @@ let nodes = [];
 let connections = [];
 let viewport = {x: -1800, y: -1000, scale: 1};
 let dragNode = null;
+const linkGeomCache = new Map();
+let hoverFrame = 0;
+let pendingHoverEvent = null;
 let dragBoard = null;
 let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
+let minimapViewportQueued = false;
 let viewportDragFrame = 0;
 let pendingBoardPanEvent = null;
 let pendingMinimapDragEvent = null;
@@ -1555,7 +1559,22 @@ function screenToWorld(clientX, clientY){
 }
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
-    scheduleMinimapRender();
+    scheduleMinimapViewportUpdate();
+}
+// 平移/缩放只改视野框：节点多时整张小地图重建一次要几十毫秒，每帧重建会让平移明显卡顿。
+// 视野跑出小地图当前范围、或还没画过时才整张重画；节点增删/移动仍走 scheduleMinimapRender。
+function scheduleMinimapViewportUpdate(){
+    if(minimapViewportQueued || minimapRenderQueued) return;
+    minimapViewportQueued = true;
+    requestAnimationFrame(() => {
+        minimapViewportQueued = false;
+        if(minimapRenderQueued) return;
+        if(!minimapState){ renderMinimap(); return; }
+        const r = currentWorldViewRect(), b = minimapState.bounds;
+        const inside = r.x >= b.x && r.y >= b.y && r.x + r.w <= b.x + b.w && r.y + r.h <= b.y + b.h;
+        if(inside) updateMinimapViewport();
+        else renderMinimap();
+    });
 }
 function estimatedNodeRect(n){
     const el = nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(n.id)}"]`);
@@ -18334,7 +18353,8 @@ function startNodeDrag(e, node){
     nodeDragLastEvent = null;
     nodeDragDirtyIds = new Set([dragTarget.id, ...children.map(child => child.node?.id).filter(Boolean)]);
     nodeDragCompletedIds = [];
-    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y};
+    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y,
+        links:collectDragLinks([dragTarget.id, ...children.map(child => child.node?.id).filter(Boolean)])};
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
     window.onmouseup = endDrag;
@@ -18367,7 +18387,9 @@ function applyNodeDragFrame(){
             childEl.style.top = `${childDrag.node.y}px`;
         }
     });
-    scheduleLinksRender();
+    // 只移动和被拖节点相连的那几条线（按位移平移端点），不再每帧全量重建所有连线
+    if(dragNode.links) updateDragLinks(dragNode.links, dx, dy);
+    else scheduleLinksRender();
     renderSelectionHub();
 }
 function startNodeResize(e, node){
@@ -18837,9 +18859,14 @@ function renderLinks(){
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
         segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
     });
+    linkGeomCache.clear();
     segments.forEach(({c, a, b}) => {
         const relClass = isConnectionSelected(c) ? ' link-active' : '';
-        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link${relClass}`));
+        linkGeomCache.set(c.id, {a, b});
+        const line = pathEl(a.x, a.y, b.x, b.y, `link${relClass}`);
+        line.dataset.connectionId = c.id;
+        line.dataset.linkPart = 'line';
+        linksEl.appendChild(line);
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
@@ -18848,8 +18875,54 @@ function renderLinks(){
     }
     renderKnifeTrail();
 }
+// 拖动性能：连线端点的世界坐标缓存。renderLinks / renderConnectionParts 量一次就记下，
+// 悬停检测直接读缓存，不再每次 mousemove 对全部连线 getBoundingClientRect（节点多时整页强制重排）。
+// （linkGeomCache 声明在文件顶部 dragNode 旁边，避免初始化时先调用 renderLinks 撞上暂时性死区）
+function cachedLinkGeom(connection){
+    const hit = linkGeomCache.get(connection.id);
+    if(hit) return hit;
+    const geom = {a:portPoint(connection.from, 'out'), b:portPoint(connection.to, 'in')};
+    linkGeomCache.set(connection.id, geom);
+    return geom;
+}
+function linkCurveD(a, b){
+    const dx = Math.max(80, Math.abs(b.x - a.x) * .45);
+    return `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
+}
+// 拖动开始时只量一次「和被拖节点相连的连线」的端点；拖动过程中按位移直接改 path 的 d，零布局读取。
+function collectDragLinks(movedIds){
+    const ids = new Set(movedIds);
+    const out = [];
+    connections.forEach(c => {
+        const fromMoves = ids.has(c.from), toMoves = ids.has(c.to);
+        if(!fromMoves && !toMoves) return;
+        if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
+        const sel = `[data-connection-id="${CSS.escape(c.id)}"]`;
+        out.push({
+            c, fromMoves, toMoves,
+            a0:portPoint(c.from, 'out'), b0:portPoint(c.to, 'in'),
+            paths:[...linksEl.querySelectorAll(sel)],
+            btn:linkControlsEl.querySelector(sel)
+        });
+    });
+    return out;
+}
+function updateDragLinks(links, dx, dy){
+    (links || []).forEach(L => {
+        const a = L.fromMoves ? {x:L.a0.x + dx, y:L.a0.y + dy} : L.a0;
+        const b = L.toMoves ? {x:L.b0.x + dx, y:L.b0.y + dy} : L.b0;
+        const d = linkCurveD(a, b);
+        L.paths.forEach(p => p.setAttribute('d', d));
+        if(L.btn){
+            L.btn.style.left = `${(a.x + b.x) / 2}px`;
+            L.btn.style.top = `${(a.y + b.y) / 2}px`;
+        }
+        linkGeomCache.set(L.c.id, {a, b});
+    });
+}
 function renderConnectionParts(connection){
     const a = portPoint(connection.from, 'out'), b = portPoint(connection.to, 'in');
+    linkGeomCache.set(connection.id, {a, b});
     const path = pathEl(a.x, a.y, b.x, b.y, 'link');
     path.dataset.connectionId = connection.id;
     path.dataset.linkPart = 'line';
@@ -18923,8 +18996,7 @@ function setHoveredConnection(id){
     }
 }
 function connectionDistanceToPoint(connection, point){
-    const from = portPoint(connection.from, 'out');
-    const to = portPoint(connection.to, 'in');
+    const {a:from, b:to} = cachedLinkGeom(connection);
     let min = Infinity;
     let prev = cubicPoint(from, to, 0);
     for(let i = 1; i <= 28; i++){
@@ -19184,7 +19256,13 @@ board.onmousedown = e => {
 board.addEventListener('mousemove', e => {
     const point = screenToWorld(e.clientX, e.clientY);
     lastMouseBoard = point;
-    updateConnectionHoverFromMouse(e);
+    // 悬停检测合并到每帧最多一次（节点多时 mousemove 很密集）
+    pendingHoverEvent = e;
+    if(!hoverFrame) hoverFrame = requestAnimationFrame(() => {
+        hoverFrame = 0;
+        const ev = pendingHoverEvent; pendingHoverEvent = null;
+        if(ev) updateConnectionHoverFromMouse(ev);
+    });
     if(canvas && knifeActive && !isEditableTarget(e.target) && !dragNode && !dragBoard && !resizeNode && !tempLink){
         continueKnifeDrag(e);
     } else if(!e.shiftKey) {
